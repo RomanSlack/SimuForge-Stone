@@ -1,0 +1,18 @@
+[package]
+name = "simuforge-sim"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+simuforge-core = { path = "../core" }
+simuforge-physics = { path = "../physics" }
+simuforge-motors = { path = "../motors" }
+simuforge-material = { path = "../material" }
+simuforge-cutting = { path = "../cutting" }
+simuforge-control = { path = "../control" }
+simuforge-render = { path = "../render" }
+nalgebra = { workspace = true }
+glam = { workspace = true }
+winit = { workspace = true }
+wgpu = { workspace = true }
+pollster = "0.4"

@@ -1,0 +1,9 @@
+[package]
+name = "simuforge-control"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+simuforge-core = { path = "../core" }
+simuforge-physics = { path = "../physics" }
+nalgebra = { workspace = true }

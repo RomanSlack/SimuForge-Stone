@@ -1,0 +1,12 @@
+[package]
+name = "simuforge-render"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+simuforge-core = { path = "../core" }
+wgpu = { workspace = true }
+winit = { workspace = true }
+bytemuck = { workspace = true }
+glam = { workspace = true }
+nalgebra = { workspace = true }

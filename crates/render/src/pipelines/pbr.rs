@@ -1,0 +1,222 @@
+//! PBR metallic-roughness rendering pipeline.
+
+use crate::camera::CameraUniform;
+use crate::context::{RenderContext, DEPTH_FORMAT};
+use crate::mesh::vertex_buffer_layout;
+
+/// Light uniform data.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct LightUniform {
+    /// Directional light direction (world space, normalized).
+    pub direction: [f32; 4],
+    /// Directional light color and intensity.
+    pub color: [f32; 4],
+    /// Ambient light color and intensity.
+    pub ambient: [f32; 4],
+    /// Camera/eye position (world space).
+    pub eye_pos: [f32; 4],
+}
+
+/// Material properties for PBR.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct MaterialUniform {
+    /// Base color (RGB) + alpha.
+    pub base_color: [f32; 4],
+    /// Roughness, metallic, subsurface, padding.
+    pub params: [f32; 4],
+}
+
+impl MaterialUniform {
+    /// White marble material.
+    pub fn marble() -> Self {
+        Self {
+            base_color: [0.92, 0.91, 0.88, 1.0],
+            params: [0.3, 0.0, 0.5, 0.0], // roughness, metallic, subsurface, pad
+        }
+    }
+
+    /// Metal material (for arm links).
+    pub fn metal(color: [f32; 4]) -> Self {
+        Self {
+            base_color: color,
+            params: [0.4, 0.9, 0.0, 0.0],
+        }
+    }
+}
+
+/// PBR render pipeline and associated resources.
+pub struct PbrPipeline {
+    pub pipeline: wgpu::RenderPipeline,
+    pub camera_buffer: wgpu::Buffer,
+    pub light_buffer: wgpu::Buffer,
+    pub material_buffer: wgpu::Buffer,
+    pub bind_group_layout: wgpu::BindGroupLayout,
+    pub bind_group: wgpu::BindGroup,
+}
+
+impl PbrPipeline {
+    pub fn new(ctx: &RenderContext) -> Self {
+        let shader =
+            ctx.device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("PBR Shader"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        include_str!("../shaders/pbr.wgsl").into(),
+                    ),
+                });
+
+        let camera_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Camera Uniform"),
+            size: std::mem::size_of::<CameraUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let light_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Light Uniform"),
+            size: std::mem::size_of::<LightUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let material_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Material Uniform"),
+            size: std::mem::size_of::<MaterialUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let bind_group_layout =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("PBR Bind Group Layout"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::VERTEX
+                                | wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+
+        let bind_group = ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("PBR Bind Group"),
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: camera_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: light_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: material_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+        let pipeline_layout =
+            ctx.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("PBR Pipeline Layout"),
+                    bind_group_layouts: &[&bind_group_layout],
+                    push_constant_ranges: &[],
+                });
+
+        let pipeline =
+            ctx.device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("PBR Pipeline"),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs_main"),
+                        buffers: &[vertex_buffer_layout()],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fs_main"),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: ctx.format(),
+                            blend: Some(wgpu::BlendState::REPLACE),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        front_face: wgpu::FrontFace::Ccw,
+                        cull_mode: Some(wgpu::Face::Back),
+                        ..Default::default()
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: DEPTH_FORMAT,
+                        depth_write_enabled: true,
+                        depth_compare: wgpu::CompareFunction::Less,
+                        stencil: wgpu::StencilState::default(),
+                        bias: wgpu::DepthBiasState::default(),
+                    }),
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview: None,
+                    cache: None,
+                });
+
+        Self {
+            pipeline,
+            camera_buffer,
+            light_buffer,
+            material_buffer,
+            bind_group_layout,
+            bind_group,
+        }
+    }
+
+    /// Update camera uniform.
+    pub fn update_camera(&self, queue: &wgpu::Queue, uniform: &CameraUniform) {
+        queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(uniform));
+    }
+
+    /// Update light uniform.
+    pub fn update_light(&self, queue: &wgpu::Queue, uniform: &LightUniform) {
+        queue.write_buffer(&self.light_buffer, 0, bytemuck::bytes_of(uniform));
+    }
+
+    /// Update material uniform.
+    pub fn update_material(&self, queue: &wgpu::Queue, uniform: &MaterialUniform) {
+        queue.write_buffer(&self.material_buffer, 0, bytemuck::bytes_of(uniform));
+    }
+}

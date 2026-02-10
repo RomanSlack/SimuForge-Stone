@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/physics",
+    "crates/motors",
+    "crates/material",
+    "crates/cutting",
+    "crates/control",
+    "crates/render",
+    "crates/sim",
+]
+
+[workspace.dependencies]
+nalgebra = "0.33"
+glam = "0.29"
+bytemuck = { version = "1", features = ["derive"] }
+wgpu = "24"
+winit = "0.30"
+fast-surface-nets = "0.2"

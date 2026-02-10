@@ -1,0 +1,9 @@
+[package]
+name = "simuforge-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nalgebra = { workspace = true }
+glam = { workspace = true }
+bytemuck = { workspace = true }

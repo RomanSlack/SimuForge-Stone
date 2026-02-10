@@ -1,0 +1,99 @@
+Research Report: SimuForge-Stone Architecture
+
+  Repo State
+
+  The repo is empty — just a README, empty PLAN.md, LICENSE (Apache 2.0), and .gitignore. No code, no Cargo.toml. Clean slate.
+
+  ---
+  Recommended Tech Stack
+
+  The verdict is clear across all research: wgpu + plain Rust structs + custom physics. No engine, no ECS, no framework.
+
+  Rendering: wgpu (Vulkan backend on Ubuntu 24.04)
+
+  - v28.0, most mature Rust graphics API, massive ecosystem
+  - First-class compute shader support (needed for marching cubes if you go GPU later)
+  - Clean safe API — ~100 lines to first triangle vs ~800+ for raw Vulkan (ash)
+  - 5-10% CPU overhead vs raw Vulkan — irrelevant for your draw call count
+  - Full control over every render pass: PBR, shadow maps, SSAO, SSS — you build exactly what you need
+  - If you ever need zero overhead, wgpu-hal is an escape hatch to raw Vulkan
+
+  Why not the others:
+  - Bevy — gives you PBR free but fights you on everything custom (incremental marching cubes, SSS, compute-driven mesh). Its render world extraction architecture
+   is pain for dynamic meshes
+  - Vulkano — more verbose than wgpu for equivalent operations, pre-1.0, awkward middle ground
+  - ash — raw Vulkan, 800+ lines for a triangle. You'd spend Day 1 on boilerplate
+  - rend3 — dead (maintenance mode)
+
+  Physics: Custom from scratch
+
+  - Featherstone's ABA — ~300 lines of Rust on top of nalgebra. ABA for 7 joints runs in microseconds. No existing Rust crate implements the full algorithm
+  properly. Rapier explicitly rejected Featherstone and is designed for games, not robotics
+  - Motor/PID — trivial custom code (PID is 10 lines, stepper curve is a lookup table)
+  - Cutting forces — one-liner: force = specific_energy * chip_area * doc
+
+  Material Removal: Custom sparse octree + fast-surface-nets
+
+  - Custom octree with Sd8 leaf values, only store the narrow band around the surface (~50-200MB vs 216MB dense)
+  - CSG subtraction: walk octree, find nodes intersecting swept tool volume, update SDF
+  - fast-surface-nets crate for meshing — chunk-friendly, SIMD-accelerated, 20M tri/sec on a single core
+  - Chunk the grid into 32^3 blocks (~6859 chunks). Tool touches 1-4 chunks per frame. Sub-millisecond remesh
+  - CPU-only for v1 — at 1kHz physics with ~500mm/s feed rate, you modify a few thousand voxels per step. Trivially fast. GPU compute is a clean upgrade path via
+  wgpu if needed later
+
+  No ECS
+
+  You have 7 joints, 1 workpiece, 1 tool, 1 camera. This is not an ECS problem. Plain Rust structs are simpler, faster to compile, and easier to debug. If you
+  ever need one later, hecs is the lightest option.
+
+  ---
+  Architecture Pattern (how the pros do it)
+
+  MuJoCo, Drake, and Isaac Sim all use the same pattern:
+
+  Physics (fixed 1kHz timestep, CPU)
+      │
+      │  state snapshot (double-buffered or interpolated)
+      │
+  Render (variable ~60fps, GPU via wgpu)
+
+  Physics never blocks on rendering. Single-threaded "Fix Your Timestep" loop is sufficient for v1 — no need for threads when ABA + SDF update takes <0.1ms per
+  step.
+
+  ---
+  Key Dependencies
+  ┌───────────────────┬──────────────────────────────────────────────────────────┐
+  │       Crate       │                         Purpose                          │
+  ├───────────────────┼──────────────────────────────────────────────────────────┤
+  │ wgpu              │ Rendering + compute (Vulkan backend)                     │
+  ├───────────────────┼──────────────────────────────────────────────────────────┤
+  │ winit             │ Window creation + input                                  │
+  ├───────────────────┼──────────────────────────────────────────────────────────┤
+  │ nalgebra          │ Physics-side math (Matrix6, Isometry3, spatial vectors)  │
+  ├───────────────────┼──────────────────────────────────────────────────────────┤
+  │ glam              │ Render-side math (fast, SIMD, used by fast-surface-nets) │
+  ├───────────────────┼──────────────────────────────────────────────────────────┤
+  │ bytemuck          │ Zero-copy GPU buffer uploads                             │
+  ├───────────────────┼──────────────────────────────────────────────────────────┤
+  │ fast-surface-nets │ Chunk-based isosurface extraction from SDF               │
+  └───────────────────┴──────────────────────────────────────────────────────────┘
+  Everything else is custom. 6 dependencies for the entire project.
+
+  ---
+  Project Structure
+
+  SimuForge-Stone/
+  ├── crates/
+  │   ├── sim/            # main loop, timestep, state orchestration
+  │   ├── physics/        # Featherstone ABA, joints, arm model
+  │   ├── motors/         # stepper model, gearbox, PID
+  │   ├── material/       # sparse octree SDF, CSG subtract, dirty tracking
+  │   ├── cutting/        # force model, tool geometry
+  │   ├── control/        # IK solver, trajectory planner, G-code
+  │   └── render/         # wgpu PBR pipeline, shadow/SSAO/SSS, mesh upload
+
+  Physics side is pure, deterministic, no-GPU. Render module is the only thing touching wgpu. State flows one direction: physics produces snapshot → renderer
+  consumes it.
+
+  ---
+  Ready to write up the PLAN.md whenever you are.

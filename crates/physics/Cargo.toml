@@ -1,0 +1,8 @@
+[package]
+name = "simuforge-physics"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+simuforge-core = { path = "../core" }
+nalgebra = { workspace = true }
