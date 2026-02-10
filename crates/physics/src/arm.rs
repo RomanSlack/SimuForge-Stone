@@ -17,6 +17,9 @@ pub struct RobotArm {
     pub link_spatial_inertias: Vec<SpatialMatrix>,
     /// Mass of each link (kg).
     pub link_masses: Vec<f64>,
+    /// Reflected motor inertia at each joint (kg·m²).
+    /// I_reflected = I_rotor * gear_ratio².  Dominates link inertia for geared joints.
+    pub motor_reflected_inertias: Vec<f64>,
     /// Link names (for debug/display).
     pub link_names: Vec<String>,
 }
@@ -123,6 +126,17 @@ impl RobotArm {
             })
             .collect();
 
+        // Reflected motor inertia: I_rotor * gear_ratio²
+        // This DOMINATES link inertia (40-670x) and must be in the dynamics model.
+        let motor_reflected_inertias = vec![
+            0.002 * 100.0_f64.powi(2),  // J1: NEMA34, 100:1 → 20.0 kg·m²
+            0.002 * 100.0_f64.powi(2),  // J2: NEMA34, 100:1 → 20.0 kg·m²
+            0.002 * 100.0_f64.powi(2),  // J3: NEMA34, 100:1 → 20.0 kg·m²
+            0.0005 * 50.0_f64.powi(2),  // J4: NEMA23, 50:1 → 1.25 kg·m²
+            0.0005 * 50.0_f64.powi(2),  // J5: NEMA23, 50:1 → 1.25 kg·m²
+            0.0005 * 50.0_f64.powi(2),  // J6: NEMA23, 50:1 → 1.25 kg·m²
+        ];
+
         let link_names = vec![
             "Base/Shoulder".into(),
             "Upper Arm".into(),
@@ -137,6 +151,7 @@ impl RobotArm {
             joints,
             link_spatial_inertias,
             link_masses,
+            motor_reflected_inertias,
             link_names,
         }
     }

@@ -78,9 +78,14 @@ impl RevoluteJoint {
         self.torque + self.friction_torque() + self.limit_torque()
     }
 
+    /// Maximum joint velocity (rad/s). Safety clamp to prevent runaway.
+    const MAX_VELOCITY: f64 = 3.0; // ~172°/s — fast for an industrial arm
+
     /// Integrate joint state forward by dt given acceleration.
     pub fn integrate(&mut self, acceleration: f64, dt: f64) {
         self.velocity += acceleration * dt;
+        // Safety clamp: prevent runaway velocities
+        self.velocity = self.velocity.clamp(-Self::MAX_VELOCITY, Self::MAX_VELOCITY);
         self.angle += self.velocity * dt;
     }
 

@@ -23,9 +23,11 @@ pub struct OrbitCamera {
 impl OrbitCamera {
     pub fn new() -> Self {
         Self {
-            target: Vec3::new(0.0, 0.3, 0.0),
-            distance: 2.5,
-            yaw: 0.6,
+            // Look at midpoint between arm and workpiece.
+            // Arm at origin, workpiece center at render (0.85, -0.10, 0.0).
+            target: Vec3::new(0.45, 0.0, 0.0),
+            distance: 2.2,
+            yaw: 0.7,
             pitch: 0.35,
             fov: std::f32::consts::FRAC_PI_4,
             near: 0.01,
@@ -75,19 +77,20 @@ impl OrbitCamera {
         self.target += up * dy * self.distance * 0.002;
     }
 
-    /// Snap to look at the workpiece center (render Y-up space).
+    /// Snap to look at the workpiece (render Y-up space).
+    /// Workpiece center DH (0.85, 0, -0.10) → render (0.85, -0.10, 0.0).
     pub fn snap_to_workpiece(&mut self) {
-        self.target = Vec3::new(0.0, 0.0, 0.0);
-        self.distance = 0.6;
+        self.target = Vec3::new(0.85, -0.10, 0.0);
+        self.distance = 0.7;
         self.yaw = 0.5;
-        self.pitch = 0.25;
+        self.pitch = 0.3;
     }
 
     /// Snap to look at robot arm (render Y-up space).
     pub fn snap_to_arm(&mut self) {
-        self.target = Vec3::new(0.0, 0.5, 0.0);
-        self.distance = 2.5;
-        self.yaw = 0.8;
+        self.target = Vec3::new(0.45, 0.0, 0.0);
+        self.distance = 2.2;
+        self.yaw = 0.7;
         self.pitch = 0.35;
     }
 }

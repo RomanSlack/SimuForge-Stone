@@ -22,7 +22,7 @@ use simuforge_material::octree::OctreeSdf;
 use simuforge_motors::gearbox::Gearbox;
 use simuforge_motors::pid;
 use simuforge_motors::stepper::{MotorState, StepperMotor};
-use simuforge_physics::aba::articulated_body_algorithm;
+use simuforge_physics::aba::{articulated_body_algorithm, gravity_compensation_rnea};
 use simuforge_physics::arm::RobotArm;
 use simuforge_physics::joint::RotaryTable;
 use simuforge_render::arm_visual::{generate_cylinder, generate_sphere, generate_box};
@@ -104,6 +104,9 @@ struct SimState {
     pid_controllers: Vec<simuforge_motors::pid::PidController>,
     joint_targets: Vec<f64>,
     workpiece: OctreeSdf,
+    /// Workpiece center in DH world-space (meters).
+    /// The SDF is always centered at origin; this offset maps tool→workpiece coords.
+    workpiece_center: Vector3<f64>,
     tool: Tool,
     tool_state: ToolState,
     rotary_table: RotaryTable,
@@ -112,6 +115,11 @@ struct SimState {
     sim_time: f64,
     paused: bool,
     cutting_force_magnitude: f64,
+    /// Cartesian target point in DH world-space (meters).
+    /// The arm's IK solver tracks this point.
+    cartesian_target: Vector3<f64>,
+    /// Whether IK converged on last solve.
+    ik_converged: bool,
 }
 
 impl SimState {
@@ -147,7 +155,15 @@ impl SimState {
             pid::small_joint_pid(),
         ];
 
-        let joint_targets = vec![0.0; n];
+        // Initial joint targets: arm bent to reach toward workpiece
+        // J2=0.4 (elbow up), J3=-0.4 (forearm down) — puts tool near the cube surface
+        let mut joint_targets = vec![0.0; n];
+        joint_targets[1] = 0.4;   // J2: shoulder forward
+        joint_targets[2] = -0.4;  // J3: elbow down toward workpiece
+
+        // Set initial joint angles to match targets (start at the target pose)
+        let mut arm = arm;
+        arm.set_joint_angles(&joint_targets);
 
         // 1ft (305mm) marble block, 0.5mm resolution
         let half_extent = 0.1525; // ~6 inches = 152.5mm
@@ -156,9 +172,25 @@ impl SimState {
             0.0005, // 0.5mm
         );
 
+        // Workpiece positioned where the tool naturally reaches.
+        // At J2=0.4, J3=-0.4 the tool tip is at DH (0.861, 0.080, -0.195).
+        // Center cube at (0.85, 0, -0.10) so tool is comfortably inside.
+        // Cube spans X: 0.70..1.00, Y: -0.15..0.15, Z: -0.25..0.05
+        let workpiece_center = Vector3::new(0.85, 0.0, -0.10);
+
         let tool = Tool::ball_nose(3.0, 20.0); // 3mm radius ball nose
-        let tool_state = ToolState::new();
+        let mut tool_state = ToolState::new();
+        // Initialize frame_start_position to the current tool tip
+        // so the first frame doesn't create a huge swept path from origin.
+        let initial_tool_pos = arm.tool_position();
+        tool_state.position = initial_tool_pos;
+        tool_state.prev_position = initial_tool_pos;
+        tool_state.frame_start_position = initial_tool_pos;
+
         let rotary_table = RotaryTable::new(5.0); // 5 kg·m² inertia
+
+        // Cartesian target = initial tool tip position
+        let cartesian_target = initial_tool_pos;
 
         Self {
             arm,
@@ -167,15 +199,74 @@ impl SimState {
             pid_controllers,
             joint_targets,
             workpiece,
+            workpiece_center,
             tool,
             tool_state,
             rotary_table,
             material: MaterialProps::marble(),
-            ik_solver: IkSolver::default(),
+            ik_solver: IkSolver {
+                damping: 0.05,
+                max_iterations: 20,        // fewer per frame (runs every frame)
+                position_tolerance: 5e-4,  // 0.5mm (looser for speed)
+                orientation_tolerance: 0.1,
+                max_step: 0.15,            // ~8.6° per iteration
+            },
             sim_time: 0.0,
             paused: true,
             cutting_force_magnitude: 0.0,
+            cartesian_target,
+            ik_converged: true,
         }
+    }
+
+    /// Solve IK: update joint_targets from cartesian_target.
+    /// Uses a scratch copy of the arm so the actual joint state is untouched.
+    fn update_ik(&mut self) {
+        let mut scratch = self.arm.clone();
+        scratch.set_joint_angles(&self.joint_targets);
+        let (converged, _iters, _err) =
+            self.ik_solver.solve_position(&mut scratch, &self.cartesian_target);
+        self.ik_converged = converged;
+        self.joint_targets = scratch.joint_angles();
+    }
+
+    /// Reset arm, joint targets, velocities, PID state, and cartesian target to initial pose.
+    fn reset_to_initial(&mut self) {
+        let n = self.arm.num_joints();
+
+        // Initial joint targets: J2=0.4, J3=-0.4, rest 0
+        self.joint_targets = vec![0.0; n];
+        self.joint_targets[1] = 0.4;
+        self.joint_targets[2] = -0.4;
+
+        // Set arm angles to match and zero velocities
+        self.arm.set_joint_angles(&self.joint_targets);
+        for j in self.arm.joints.iter_mut() {
+            j.velocity = 0.0;
+            j.torque = 0.0;
+        }
+
+        // Reset PID controllers
+        for pid in &mut self.pid_controllers {
+            pid.reset();
+        }
+
+        // Reset motor states
+        for motor in &mut self.motors {
+            motor.output_torque = 0.0;
+            motor.thermal_energy = 0.0;
+        }
+
+        // Reset tool state to initial tool position
+        let initial_tool_pos = self.arm.tool_position();
+        self.tool_state.position = initial_tool_pos;
+        self.tool_state.prev_position = initial_tool_pos;
+        self.tool_state.frame_start_position = initial_tool_pos;
+
+        // Reset cartesian target
+        self.cartesian_target = initial_tool_pos;
+        self.ik_converged = true;
+        self.cutting_force_magnitude = 0.0;
     }
 
     /// Run one physics step at 1kHz.
@@ -187,8 +278,8 @@ impl SimState {
         let n = self.arm.num_joints();
         let gravity = Vector3::new(0.0, 0.0, -9.81); // DH convention: Z-up
 
-        // Gravity compensation feedforward (joint-side torques needed to hold static)
-        let grav_comp = self.arm.gravity_compensation(&gravity);
+        // Exact gravity compensation via RNEA (includes inter-joint coupling)
+        let grav_comp = gravity_compensation_rnea(&self.arm, &gravity);
 
         // PID control: compute motor torque commands
         let mut joint_torques = vec![0.0; n];
@@ -199,8 +290,9 @@ impl SimState {
                 PHYSICS_DT,
             );
 
-            // Feedforward: convert gravity comp from joint-side to motor-side
-            let grav_ff = -grav_comp[i] / (self.gearboxes[i].ratio * self.gearboxes[i].efficiency);
+            // Feedforward: grav_comp[i] is the exact joint torque to hold against gravity.
+            // Convert to motor-side: divide by gearbox amplification.
+            let grav_ff = grav_comp[i] / (self.gearboxes[i].ratio * self.gearboxes[i].efficiency);
             let total_motor_cmd = pid_output + grav_ff;
 
             // Motor torque clamping (respects speed-torque curve)
@@ -239,19 +331,32 @@ impl SimState {
     /// Material removal — called once per render frame, NOT per physics step.
     fn material_removal_step(&mut self) {
         if !self.tool_state.spindle_on {
+            self.cutting_force_magnitude = 0.0;
+            // Keep frame_start synced even with spindle off, so turning it on
+            // doesn't create a huge swept path from the old position.
+            self.tool_state.frame_start_position = self.tool_state.position;
             return;
         }
 
         // Get accumulated tool path for this frame
-        let (start, end) = match self.tool_state.begin_frame() {
+        let (start_world, end_world) = match self.tool_state.begin_frame() {
             Some(path) => path,
-            None => return, // tool didn't move enough
+            None => {
+                self.cutting_force_magnitude = 0.0;
+                return; // tool didn't move enough
+            }
         };
 
+        // Transform to workpiece-local coordinates (SDF is centered at origin)
+        let wc = self.workpiece_center;
+        let start = start_world - wc;
+        let end = end_world - wc;
+
         // Quick AABB check: is the tool anywhere near the workpiece?
-        let half = 0.1525_f64 + 0.01; // workpiece half-extent + margin
+        let half = 0.1525_f64 + 0.02; // workpiece half-extent + margin
         let tp = end;
         if tp.x.abs() > half || tp.y.abs() > half || tp.z.abs() > half {
+            self.cutting_force_magnitude = 0.0;
             return; // tool is outside workpiece region
         }
 
@@ -276,6 +381,13 @@ impl SimState {
     }
 }
 
+/// Tracks which movement keys are currently held.
+#[derive(Default)]
+struct HeldKeys {
+    w: bool, s: bool, a: bool, d: bool, q: bool, e: bool,
+    shift: bool,
+}
+
 /// Application state for winit event loop.
 struct App {
     window: Option<Arc<Window>>,
@@ -297,6 +409,7 @@ struct App {
     frame_count: u64,
     fps_timer: Instant,
     fps: f64,
+    held_keys: HeldKeys,
     // --- GPU resources for arm, ground, workpiece ---
     arm_cylinder: Option<GpuMesh>,
     arm_materials: Vec<MaterialBind>,
@@ -307,6 +420,7 @@ struct App {
     ground_mesh: Option<GpuMesh>,
     ground_material: Option<MaterialBind>,
     workpiece_material: Option<MaterialBind>,
+    target_material: Option<MaterialBind>,
 }
 
 impl App {
@@ -340,7 +454,25 @@ impl App {
             ground_mesh: None,
             ground_material: None,
             workpiece_material: None,
+            target_material: None,
+            held_keys: HeldKeys::default(),
         }
+    }
+
+    /// Apply continuous movement from held keys.
+    fn apply_held_keys(&mut self, dt: f64) {
+        if self.sim.paused {
+            return;
+        }
+        let speed = if self.held_keys.shift { 0.05 } else { 0.15 }; // m/s (50 or 150 mm/s)
+        let step = speed * dt;
+        let k = &self.held_keys;
+        if k.w { self.sim.cartesian_target.x += step; }
+        if k.s { self.sim.cartesian_target.x -= step; }
+        if k.a { self.sim.cartesian_target.y += step; }
+        if k.d { self.sim.cartesian_target.y -= step; }
+        if k.q { self.sim.cartesian_target.z += step; }
+        if k.e { self.sim.cartesian_target.z -= step; }
     }
 
     fn render(&mut self) {
@@ -370,9 +502,15 @@ impl App {
 
         // --- Upload material uniforms ---
 
-        // Workpiece: marble with coord swap as model matrix
+        // Workpiece: marble with workpiece offset + coord swap as model matrix.
+        // SDF is at origin; model matrix = coord_swap * translate(workpiece_center_dh).
         if let Some(wp) = &self.workpiece_material {
-            let mat = MaterialUniform::marble().with_model(swap.to_cols_array_2d());
+            let wc = &self.sim.workpiece_center;
+            let translate_dh = Mat4::from_translation(Vec3::new(
+                wc.x as f32, wc.y as f32, wc.z as f32,
+            ));
+            let model = swap * translate_dh;
+            let mat = MaterialUniform::marble().with_model(model.to_cols_array_2d());
             ctx.queue.write_buffer(&wp.buffer, 0, bytemuck::bytes_of(&mat));
         }
 
@@ -420,9 +558,31 @@ impl App {
                 .write_buffer(&self.joint_materials[i].buffer, 0, bytemuck::bytes_of(&mat));
         }
 
-        // Base pedestal: sits below the arm base (render_pts[0])
+        // Target point: bright sphere showing where the arm is trying to reach.
+        if let Some(tgt_mat) = &self.target_material {
+            let ct = &self.sim.cartesian_target;
+            let tgt_dh = Vec3::new(ct.x as f32, ct.y as f32, ct.z as f32);
+            let tgt_render = swap.transform_point3(tgt_dh);
+            let tgt_color = if self.sim.ik_converged {
+                [0.1, 1.0, 0.3, 1.0] // green = reachable
+            } else {
+                [1.0, 0.2, 0.1, 1.0] // red = unreachable
+            };
+            let tgt_radius = 0.012_f32; // 12mm sphere
+            let model = Mat4::from_scale_rotation_translation(
+                Vec3::splat(tgt_radius),
+                Quat::IDENTITY,
+                tgt_render,
+            );
+            let mat = MaterialUniform::metal(tgt_color)
+                .with_model(model.to_cols_array_2d());
+            ctx.queue.write_buffer(&tgt_mat.buffer, 0, bytemuck::bytes_of(&mat));
+        }
+
+        // Base pedestal: tall column from arm base down to ground.
+        // Base center at render Y = -0.13 (midpoint of 0 to -0.26).
         if let Some(base_mat) = &self.base_material {
-            let base_pos = Vec3::new(render_pts[0].x, render_pts[0].y - 0.04, render_pts[0].z);
+            let base_pos = Vec3::new(render_pts[0].x, render_pts[0].y - 0.13, render_pts[0].z);
             let model = Mat4::from_translation(base_pos);
             let mat = MaterialUniform::metal([0.15, 0.15, 0.18, 1.0])
                 .with_model(model.to_cols_array_2d());
@@ -549,7 +709,18 @@ impl App {
                 }
             }
 
-            // 5) Draw base pedestal
+            // 5) Draw target point sphere
+            if let (Some(sph), Some(tgt_mat)) = (&self.arm_sphere, &self.target_material) {
+                render_pass.set_bind_group(0, &tgt_mat.bind_group, &[]);
+                render_pass.set_vertex_buffer(0, sph.vertex_buffer.slice(..));
+                render_pass.set_index_buffer(
+                    sph.index_buffer.slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                render_pass.draw_indexed(0..sph.num_indices, 0, 0..1);
+            }
+
+            // 6) Draw base pedestal
             if let (Some(bm), Some(bmat)) = (&self.base_mesh, &self.base_material) {
                 render_pass.set_bind_group(0, &bmat.bind_group, &[]);
                 render_pass.set_vertex_buffer(0, bm.vertex_buffer.slice(..));
@@ -752,24 +923,38 @@ impl App {
         ob.text(margin, y, scale, sp_color, spindle);
         y += line_h + 8.0;
 
-        // --- Tool position ---
+        // --- Target & Tool ---
+        let ct = &self.sim.cartesian_target;
         let tp = &self.sim.tool_state.position;
-        ob.text(margin, y, scale, white, "Tool Position");
+        let ik_color = if self.sim.ik_converged { green } else { red };
+        let ik_text = if self.sim.ik_converged { "IK OK" } else { "IK FAIL" };
+
+        ob.text(margin, y, scale, white, "Target");
+        y += line_h;
+        ob.text(
+            margin, y, scale, ik_color,
+            &format!("{} X:{:.0} Y:{:.0} Z:{:.0}",
+                ik_text, ct.x * 1000.0, ct.y * 1000.0, ct.z * 1000.0),
+        );
+        y += line_h + 2.0;
+
+        ob.text(margin, y, scale, white, "Tool");
         y += line_h;
         ob.text(
             margin, y, scale, gray,
-            &format!("X:{:>6.1}mm", tp.x * 1000.0),
+            &format!("X:{:.0} Y:{:.0} Z:{:.0}",
+                tp.x * 1000.0, tp.y * 1000.0, tp.z * 1000.0),
         );
-        y += line_h;
-        ob.text(
-            margin, y, scale, gray,
-            &format!("Y:{:>6.1}mm", tp.y * 1000.0),
-        );
-        y += line_h;
-        ob.text(
-            margin, y, scale, gray,
-            &format!("Z:{:>6.1}mm", tp.z * 1000.0),
-        );
+        y += line_h + 2.0;
+
+        // Tool position relative to workpiece
+        let wc = &self.sim.workpiece_center;
+        let local = tp - wc;
+        let half = 0.1525;
+        let inside = local.x.abs() < half && local.y.abs() < half && local.z.abs() < half;
+        let inside_color = if inside { green } else { red };
+        let inside_text = if inside { "IN BLOCK" } else { "OUTSIDE" };
+        ob.text(margin, y, scale, inside_color, inside_text);
     }
 }
 
@@ -862,8 +1047,9 @@ impl ApplicationHandler for App {
             });
         }
 
-        // Base pedestal box
-        let (base_verts, base_idxs) = generate_box(0.12, 0.04, 0.12);
+        // Base pedestal: tall box from arm base (Y=0) down to ground (Y=-0.26).
+        // Half-height = 0.13, centered at Y = -0.13.
+        let (base_verts, base_idxs) = generate_box(0.10, 0.13, 0.10);
         let base_vb = ctx
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -889,9 +1075,10 @@ impl ApplicationHandler for App {
             bind_group: bbg,
         });
 
-        // Ground plane — below workpiece bottom (cube half=0.1525, so Y=-0.20 clears it)
+        // Ground plane at Y=-0.26 in render space.
+        // Cube bottom: DH Z = -0.10 - 0.1525 = -0.2525 → render Y = -0.2525.
         let gs = 3.0f32; // 3m half-extent
-        let gy = -0.20f32;
+        let gy = -0.26f32;
         let gnd_verts = vec![
             Vertex { position: [-gs, gy, -gs], normal: [0.0, 1.0, 0.0] },
             Vertex { position: [ gs, gy, -gs], normal: [0.0, 1.0, 0.0] },
@@ -931,6 +1118,13 @@ impl ApplicationHandler for App {
             bind_group: wbg,
         });
 
+        // Target point material bind group (reuses the joint sphere mesh)
+        let (tbuf, tbg) = pbr.create_material_bind_group(&ctx.device);
+        self.target_material = Some(MaterialBind {
+            buffer: tbuf,
+            bind_group: tbg,
+        });
+
         self.pbr_pipeline = Some(pbr);
         self.shadow_pipeline = Some(shadow);
         self.ssao_pipeline = Some(ssao);
@@ -940,9 +1134,11 @@ impl ApplicationHandler for App {
         self.render_ctx = Some(ctx);
         self.window = Some(window);
 
-        eprintln!("SimuForge-Stone initialized.");
-        eprintln!("Controls: SPACE=pause/resume, 1=snap workpiece, 2=snap arm, LMB=rotate, RMB=zoom, MMB=pan");
-        eprintln!("          Arrow keys=move joint targets, S=toggle spindle");
+        eprintln!("SimuForge-Stone initialized. Press SPACE to start.");
+        eprintln!("  Move tool: W/S=fwd/back  A/D=left/right  Q/E=up/down");
+        eprintln!("  Hold Shift for slow (50mm/s), normal=150mm/s");
+        eprintln!("  X=spindle  R=reset target  1/2=camera snap");
+        eprintln!("  Camera: LMB=rotate  Scroll=zoom  MMB=pan");
     }
 
     fn window_event(
@@ -972,49 +1168,61 @@ impl ApplicationHandler for App {
                 event:
                     KeyEvent {
                         logical_key,
-                        state: ElementState::Pressed,
+                        state,
                         ..
                     },
                 ..
             } => {
+                let pressed = state == ElementState::Pressed;
+
+                // Continuous movement keys (hold to move)
                 match logical_key.as_ref() {
-                    Key::Named(NamedKey::Space) => {
-                        self.sim.paused = !self.sim.paused;
-                        eprintln!(
-                            "Simulation {}",
-                            if self.sim.paused { "PAUSED" } else { "RUNNING" }
-                        );
-                    }
-                    Key::Named(NamedKey::Escape) => {
-                        event_loop.exit();
-                    }
-                    Key::Character("1") => {
-                        self.camera.snap_to_workpiece();
-                    }
-                    Key::Character("2") => {
-                        self.camera.snap_to_arm();
-                    }
-                    Key::Character("s") => {
-                        self.sim.tool_state.spindle_on = !self.sim.tool_state.spindle_on;
-                        eprintln!(
-                            "Spindle {}",
-                            if self.sim.tool_state.spindle_on { "ON" } else { "OFF" }
-                        );
-                    }
-                    Key::Named(NamedKey::ArrowUp) => {
-                        // Move J2 target up
-                        self.sim.joint_targets[1] += 0.05;
-                    }
-                    Key::Named(NamedKey::ArrowDown) => {
-                        self.sim.joint_targets[1] -= 0.05;
-                    }
-                    Key::Named(NamedKey::ArrowLeft) => {
-                        self.sim.joint_targets[0] += 0.05;
-                    }
-                    Key::Named(NamedKey::ArrowRight) => {
-                        self.sim.joint_targets[0] -= 0.05;
-                    }
+                    Key::Character("w") | Key::Character("W") => self.held_keys.w = pressed,
+                    Key::Character("s") | Key::Character("S") => self.held_keys.s = pressed,
+                    Key::Character("a") | Key::Character("A") => self.held_keys.a = pressed,
+                    Key::Character("d") | Key::Character("D") => self.held_keys.d = pressed,
+                    Key::Character("q") | Key::Character("Q") => self.held_keys.q = pressed,
+                    Key::Character("e") | Key::Character("E") => self.held_keys.e = pressed,
+                    Key::Named(NamedKey::Shift) => self.held_keys.shift = pressed,
                     _ => {}
+                }
+
+                // Single-press actions (only on press, not release)
+                if pressed {
+                    match logical_key.as_ref() {
+                        Key::Named(NamedKey::Space) => {
+                            self.sim.paused = !self.sim.paused;
+                            eprintln!(
+                                "Simulation {}",
+                                if self.sim.paused { "PAUSED" } else { "RUNNING" }
+                            );
+                        }
+                        Key::Named(NamedKey::Escape) => {
+                            event_loop.exit();
+                        }
+                        Key::Character("1") => {
+                            self.camera.snap_to_workpiece();
+                        }
+                        Key::Character("2") => {
+                            self.camera.snap_to_arm();
+                        }
+                        Key::Character("x") | Key::Character("X") => {
+                            self.sim.tool_state.spindle_on = !self.sim.tool_state.spindle_on;
+                            eprintln!(
+                                "Spindle {}",
+                                if self.sim.tool_state.spindle_on { "ON" } else { "OFF" }
+                            );
+                        }
+                        Key::Character("r") => {
+                            self.sim.cartesian_target = self.sim.arm.tool_position();
+                            eprintln!("Target reset to current tool position");
+                        }
+                        Key::Character("R") => {
+                            self.sim.reset_to_initial();
+                            eprintln!("Full reset: arm, targets, and tracker reset to initial pose");
+                        }
+                        _ => {}
+                    }
                 }
             }
 
@@ -1061,6 +1269,14 @@ impl ApplicationHandler for App {
                 let now = Instant::now();
                 let frame_time = now.duration_since(self.last_frame).as_secs_f64();
                 self.last_frame = now;
+
+                // Apply continuous key movement (smooth, frame-rate independent)
+                self.apply_held_keys(frame_time.min(MAX_FRAME_TIME));
+
+                // IK solve: update joint targets from Cartesian target (once per frame)
+                if !self.sim.paused {
+                    self.sim.update_ik();
+                }
 
                 self.accumulator += frame_time.min(MAX_FRAME_TIME);
 
