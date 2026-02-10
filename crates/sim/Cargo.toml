@@ -13,6 +13,7 @@ simuforge-control = { path = "../control" }
 simuforge-render = { path = "../render" }
 nalgebra = { workspace = true }
 glam = { workspace = true }
+bytemuck = { workspace = true }
 winit = { workspace = true }
 wgpu = { workspace = true }
 pollster = "0.4"

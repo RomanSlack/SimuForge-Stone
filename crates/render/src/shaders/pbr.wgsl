@@ -17,6 +17,7 @@ struct LightUniform {
 struct MaterialUniform {
     base_color: vec4<f32>,
     params: vec4<f32>, // roughness, metallic, subsurface, pad
+    model: mat4x4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
@@ -37,10 +38,16 @@ struct VertexOutput {
 @vertex
 fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
-    let world_pos = vec4<f32>(in.position, 1.0);
+    let world_pos = material.model * vec4<f32>(in.position, 1.0);
     out.clip_position = camera.view_proj * world_pos;
-    out.world_pos = in.position;
-    out.world_normal = normalize(in.normal);
+    out.world_pos = world_pos.xyz;
+    // Transform normal by the upper-left 3x3 of model matrix
+    let normal_matrix = mat3x3<f32>(
+        material.model[0].xyz,
+        material.model[1].xyz,
+        material.model[2].xyz,
+    );
+    out.world_normal = normalize(normal_matrix * in.normal);
     return out;
 }
 
@@ -123,6 +130,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                        sin(in.world_pos.z * 30.0) * 2.0) * 0.5 + 0.5;
         let vein_color = mix(albedo, vec3<f32>(0.75, 0.73, 0.7), vein * 0.15);
         color = mix(color, vein_color * (ambient + radiance * n_dot_l), subsurface * 0.3);
+    }
+
+    // Grid floor pattern (activated when params.w < 0)
+    if (material.params.w < 0.0) {
+        let gx = abs(fract(in.world_pos.x * 10.0 + 0.5) - 0.5);
+        let gz = abs(fract(in.world_pos.z * 10.0 + 0.5) - 0.5);
+        let line = min(gx, gz);
+        let grid_alpha = 1.0 - smoothstep(0.0, 0.025, line);
+        let grid_color = vec3<f32>(0.45, 0.47, 0.50);
+        color = mix(color, grid_color, grid_alpha * 0.6);
     }
 
     return vec4<f32>(color, 1.0);

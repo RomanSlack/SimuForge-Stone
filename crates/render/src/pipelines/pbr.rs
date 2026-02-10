@@ -18,14 +18,23 @@ pub struct LightUniform {
     pub eye_pos: [f32; 4],
 }
 
-/// Material properties for PBR.
+const IDENTITY_MAT4: [[f32; 4]; 4] = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0],
+];
+
+/// Material properties for PBR (must match MaterialUniform in pbr.wgsl).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MaterialUniform {
     /// Base color (RGB) + alpha.
     pub base_color: [f32; 4],
-    /// Roughness, metallic, subsurface, padding.
+    /// Roughness, metallic, subsurface, grid_flag.
     pub params: [f32; 4],
+    /// Model matrix (object → world).
+    pub model: [[f32; 4]; 4],
 }
 
 impl MaterialUniform {
@@ -33,7 +42,8 @@ impl MaterialUniform {
     pub fn marble() -> Self {
         Self {
             base_color: [0.92, 0.91, 0.88, 1.0],
-            params: [0.3, 0.0, 0.5, 0.0], // roughness, metallic, subsurface, pad
+            params: [0.3, 0.0, 0.5, 0.0],
+            model: IDENTITY_MAT4,
         }
     }
 
@@ -42,7 +52,23 @@ impl MaterialUniform {
         Self {
             base_color: color,
             params: [0.4, 0.9, 0.0, 0.0],
+            model: IDENTITY_MAT4,
         }
+    }
+
+    /// Ground plane material with grid flag.
+    pub fn ground() -> Self {
+        Self {
+            base_color: [0.25, 0.27, 0.30, 1.0],
+            params: [0.9, 0.0, 0.0, -1.0], // params.w < 0 triggers grid in shader
+            model: IDENTITY_MAT4,
+        }
+    }
+
+    /// Set model matrix, returning modified copy.
+    pub fn with_model(mut self, model: [[f32; 4]; 4]) -> Self {
+        self.model = model;
+        self
     }
 }
 
@@ -116,7 +142,8 @@ impl PbrPipeline {
                         },
                         wgpu::BindGroupLayoutEntry {
                             binding: 2,
-                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            visibility: wgpu::ShaderStages::VERTEX
+                                | wgpu::ShaderStages::FRAGMENT,
                             ty: wgpu::BindingType::Buffer {
                                 ty: wgpu::BufferBindingType::Uniform,
                                 has_dynamic_offset: false,
@@ -218,5 +245,38 @@ impl PbrPipeline {
     /// Update material uniform.
     pub fn update_material(&self, queue: &wgpu::Queue, uniform: &MaterialUniform) {
         queue.write_buffer(&self.material_buffer, 0, bytemuck::bytes_of(uniform));
+    }
+
+    /// Create a separate material bind group (shares camera/light buffers).
+    /// Returns (material_buffer, bind_group) so caller can update material per-frame.
+    pub fn create_material_bind_group(
+        &self,
+        device: &wgpu::Device,
+    ) -> (wgpu::Buffer, wgpu::BindGroup) {
+        let material_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Material Uniform (extra)"),
+            size: std::mem::size_of::<MaterialUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("PBR Bind Group (extra)"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.light_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: material_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        (material_buffer, bind_group)
     }
 }
