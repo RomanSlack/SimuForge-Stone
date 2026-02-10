@@ -1,0 +1,12 @@
+cargo run
+
+  Controls once the window opens:
+  - Space — pause/resume simulation
+  - Left mouse drag — orbit camera
+  - Middle mouse drag — pan camera
+  - Scroll wheel — zoom
+  - Arrow keys — move J1/J2 joint targets
+  - S — toggle spindle on/off
+  - 1 — snap camera to workpiece
+  - 2 — snap camera to robot arm
+  - Esc — quit
