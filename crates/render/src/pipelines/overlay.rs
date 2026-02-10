@@ -299,8 +299,8 @@ impl OverlayPipeline {
         let font_view = font_texture.create_view(&wgpu::TextureViewDescriptor::default());
         let font_sampler = ctx.device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Font Sampler"),
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
 

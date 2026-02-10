@@ -135,13 +135,30 @@ fn sample_neighbor(sdf: &OctreeSdf, coord: ChunkCoord, lx: i32, ly: i32, lz: i32
     }
 }
 
-/// Remesh all dirty chunks and return the meshes.
+/// Remesh dirty chunks and return the meshes.
+/// Caps at `max_per_frame` to avoid render stalls; remaining stay dirty for next frame.
 pub fn remesh_dirty(sdf: &mut OctreeSdf) -> Vec<ChunkMesh> {
-    let dirty: Vec<ChunkCoord> = sdf.take_dirty();
-    let mut meshes = Vec::with_capacity(dirty.len());
+    remesh_dirty_capped(sdf, 8)
+}
 
-    for coord in dirty {
-        if let Some(mesh) = mesh_chunk(sdf, coord) {
+/// Remesh up to `max` dirty chunks. Remaining chunks stay in the dirty set.
+pub fn remesh_dirty_capped(sdf: &mut OctreeSdf, max: usize) -> Vec<ChunkMesh> {
+    let mut meshes = Vec::with_capacity(max);
+
+    // Take only up to `max` dirty coords; leave the rest for next frame.
+    let mut count = 0;
+    let mut processed = Vec::with_capacity(max);
+    for &coord in sdf.dirty_chunks.iter() {
+        if count >= max {
+            break;
+        }
+        processed.push(coord);
+        count += 1;
+    }
+
+    for coord in &processed {
+        sdf.dirty_chunks.remove(coord);
+        if let Some(mesh) = mesh_chunk(sdf, *coord) {
             meshes.push(mesh);
         }
     }

@@ -73,22 +73,29 @@ impl PidController {
 }
 
 /// Create a PID controller tuned for a large joint (J1-J3).
+///
+/// Gains are motor-side: output feeds into motor clamp (12 Nm NEMA34)
+/// then gearbox (100:1 * 0.9 = 90× amplification).
+/// Effective joint stiffness: kp * 90 ≈ 450 Nm/rad — adequate for ~300 Nm gravity loads.
 pub fn large_joint_pid() -> PidController {
     PidController::new(
-        500.0,  // kp — stiff position tracking
-        50.0,   // ki — eliminate steady-state error
-        100.0,  // kd — damping
-        1200.0, // max output: 12 Nm * 100:1 = 1200 Nm at joint
+        5.0,  // kp — 1 rad error → 5 Nm motor → 450 Nm at joint
+        0.3,  // ki — slow integral for steady-state
+        0.8,  // kd — 1 rad/s → 0.8 Nm motor → 72 Nm damping
+        12.0, // max output: motor holding torque limit
     )
 }
 
 /// Create a PID controller tuned for a small wrist joint (J4-J6).
+///
+/// Gearbox: 50:1 * 0.9 = 45× amplification.
+/// Effective joint stiffness: kp * 45 ≈ 90 Nm/rad.
 pub fn small_joint_pid() -> PidController {
     PidController::new(
-        200.0, // kp
-        20.0,  // ki
-        40.0,  // kd
-        150.0, // max output: 3 Nm * 50:1 = 150 Nm at joint
+        2.0,  // kp — 1 rad error → 2 Nm motor → 90 Nm at joint
+        0.15, // ki
+        0.4,  // kd — 1 rad/s → 0.4 Nm motor → 18 Nm damping
+        3.0,  // max output: motor holding torque limit
     )
 }
 

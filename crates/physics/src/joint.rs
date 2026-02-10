@@ -39,11 +39,13 @@ impl RevoluteJoint {
             torque: 0.0,
             angle_min: min_deg.to_radians(),
             angle_max: max_deg.to_radians(),
-            viscous_friction: 0.1,
-            coulomb_friction: 0.5,
+            // Damping tuned for geared robot joints:
+            // Planetary gearboxes have significant viscous drag from grease + gear mesh.
+            viscous_friction: 8.0,   // Nm·s/rad — dominant damping source
+            coulomb_friction: 2.0,   // Nm — static/kinetic friction from seals+gears
             backlash: 0.0,
-            limit_stiffness: 10000.0,
-            limit_damping: 100.0,
+            limit_stiffness: 1000.0, // Nm/rad — soft spring at limits (hard clamp is backup)
+            limit_damping: 200.0,    // Nm·s/rad — absorb energy at limits
         }
     }
 
@@ -95,6 +97,15 @@ impl RevoluteJoint {
                 self.velocity = 0.0;
             }
         }
+    }
+}
+
+impl RevoluteJoint {
+    /// Set viscous and coulomb friction (builder pattern).
+    pub fn with_friction(mut self, viscous: f64, coulomb: f64) -> Self {
+        self.viscous_friction = viscous;
+        self.coulomb_friction = coulomb;
+        self
     }
 }
 

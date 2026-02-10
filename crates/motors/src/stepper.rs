@@ -19,10 +19,12 @@ pub struct StepperMotor {
 
 impl StepperMotor {
     /// Create a NEMA34-class motor.
+    /// max_speed ~80 rad/s (~760 RPM) — realistic for 48V closed-loop drive.
+    /// Through 100:1 gearbox this allows 0.8 rad/s (46°/s) joint motion with torque.
     pub fn nema34(holding_torque: f64) -> Self {
         Self {
             holding_torque,
-            max_speed: 30.0, // ~300 RPM typical for NEMA34 under load
+            max_speed: 80.0,
             shaft_velocity: 0.0,
             rotor_inertia: 0.002, // ~2000 g·cm²
             winding_resistance: 0.8,
@@ -31,10 +33,12 @@ impl StepperMotor {
     }
 
     /// Create a NEMA23-class motor.
+    /// max_speed ~120 rad/s (~1150 RPM) — lighter rotor, higher speed.
+    /// Through 50:1 gearbox this allows 2.4 rad/s (137°/s) joint motion.
     pub fn nema23(holding_torque: f64) -> Self {
         Self {
             holding_torque,
-            max_speed: 50.0, // ~480 RPM
+            max_speed: 120.0,
             shaft_velocity: 0.0,
             rotor_inertia: 0.0005,
             winding_resistance: 1.2,

@@ -158,6 +158,10 @@ pub struct ToolState {
     pub axis: Vector3<f64>,
     /// Whether the spindle is running.
     pub spindle_on: bool,
+    /// Start-of-frame position for accumulated swept path.
+    pub frame_start_position: Vector3<f64>,
+    /// Whether any material removal happened this frame.
+    pub frame_dirty: bool,
 }
 
 impl ToolState {
@@ -167,16 +171,39 @@ impl ToolState {
             prev_position: Vector3::zeros(),
             axis: Vector3::z(),
             spindle_on: false,
+            frame_start_position: Vector3::zeros(),
+            frame_dirty: false,
         }
     }
 
-    /// Update position, saving previous for swept volume.
+    /// Update position (called each physics step).
     pub fn update_position(&mut self, new_pos: Vector3<f64>) {
         self.prev_position = self.position;
         self.position = new_pos;
     }
 
-    /// Distance moved since last update.
+    /// Total displacement accumulated since frame start.
+    pub fn frame_displacement(&self) -> f64 {
+        (self.position - self.frame_start_position).norm()
+    }
+
+    /// Mark the start of a new render frame. Returns (start, end) if
+    /// the tool moved enough for material removal.
+    pub fn begin_frame(&mut self) -> Option<(Vector3<f64>, Vector3<f64>)> {
+        let disp = self.frame_displacement();
+        let start = self.frame_start_position;
+        let end = self.position;
+        self.frame_start_position = self.position;
+        self.frame_dirty = false;
+        if disp > 0.0003 {
+            // Tool moved at least 0.3mm (sub-voxel threshold)
+            Some((start, end))
+        } else {
+            None
+        }
+    }
+
+    /// Distance moved since last physics step.
     pub fn displacement(&self) -> f64 {
         (self.position - self.prev_position).norm()
     }

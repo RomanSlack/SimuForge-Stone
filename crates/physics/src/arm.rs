@@ -94,12 +94,14 @@ impl RobotArm {
         ];
 
         let joints = vec![
-            RevoluteJoint::new(-180.0, 180.0),  // J1
-            RevoluteJoint::new(-45.0, 135.0),   // J2
-            RevoluteJoint::new(-135.0, 135.0),  // J3
-            RevoluteJoint::new(-180.0, 180.0),  // J4
-            RevoluteJoint::new(-120.0, 120.0),  // J5
-            RevoluteJoint::new(-360.0, 360.0),  // J6
+            // Large joints (100:1 planetary): high friction from gearbox
+            RevoluteJoint::new(-180.0, 180.0).with_friction(10.0, 3.0),  // J1
+            RevoluteJoint::new(-45.0, 135.0).with_friction(10.0, 3.0),   // J2
+            RevoluteJoint::new(-135.0, 135.0).with_friction(8.0, 2.5),   // J3
+            // Small joints (50:1 planetary): less friction
+            RevoluteJoint::new(-180.0, 180.0).with_friction(3.0, 1.0),   // J4
+            RevoluteJoint::new(-120.0, 120.0).with_friction(3.0, 1.0),   // J5
+            RevoluteJoint::new(-360.0, 360.0).with_friction(2.0, 0.5),   // J6
         ];
 
         // Link masses (approximate for steel/aluminum arm)
@@ -171,6 +173,32 @@ impl RobotArm {
     /// Tool tip position in base frame (convenience).
     pub fn tool_position(&self) -> Vector3<f64> {
         self.forward_kinematics().translation.vector
+    }
+
+    /// Compute gravity compensation torques (motor-side).
+    ///
+    /// Returns the joint torques needed to hold the arm static against gravity.
+    /// For each joint j, sums gravity contributions from all downstream links.
+    pub fn gravity_compensation(&self, gravity: &Vector3<f64>) -> Vec<f64> {
+        let n = self.num_joints();
+        let frames = self.link_frames();
+        let mut torques = vec![0.0; n];
+
+        for i in 0..n {
+            let mass = self.link_masses[i];
+            // Approximate COM: midpoint between consecutive frames
+            let com = (frames[i].translation.vector + frames[i + 1].translation.vector) * 0.5;
+            let f_grav = mass * gravity;
+
+            // Project gravity force onto each upstream joint axis
+            for j in 0..=i {
+                let z_j = frames[j].rotation * Vector3::z();
+                let r = com - frames[j].translation.vector;
+                torques[j] += z_j.cross(&r).dot(&f_grav);
+            }
+        }
+
+        torques
     }
 }
 

@@ -143,6 +143,45 @@ pub fn generate_box(hx: f32, hy: f32, hz: f32) -> (Vec<Vertex>, Vec<u32>) {
     (vertices, indices)
 }
 
+/// Generate a UV sphere mesh centered at origin.
+pub fn generate_sphere(radius: f32, stacks: u32, slices: u32) -> (Vec<Vertex>, Vec<u32>) {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let pi = std::f32::consts::PI;
+    let tau = std::f32::consts::TAU;
+
+    for i in 0..=stacks {
+        let phi = pi * i as f32 / stacks as f32;
+        let (sin_phi, cos_phi) = phi.sin_cos();
+        for j in 0..=slices {
+            let theta = tau * j as f32 / slices as f32;
+            let (sin_theta, cos_theta) = theta.sin_cos();
+            let nx = sin_phi * cos_theta;
+            let ny = cos_phi;
+            let nz = sin_phi * sin_theta;
+            vertices.push(Vertex {
+                position: [radius * nx, radius * ny, radius * nz],
+                normal: [nx, ny, nz],
+            });
+        }
+    }
+
+    for i in 0..stacks {
+        for j in 0..slices {
+            let a = i * (slices + 1) + j;
+            let b = a + slices + 1;
+            indices.push(a);
+            indices.push(b);
+            indices.push(a + 1);
+            indices.push(b);
+            indices.push(b + 1);
+            indices.push(a + 1);
+        }
+    }
+
+    (vertices, indices)
+}
+
 /// Link visual description for the robot arm.
 pub struct ArmLinkVisual {
     pub vertices: Vec<Vertex>,

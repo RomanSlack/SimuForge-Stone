@@ -25,7 +25,7 @@ use simuforge_motors::stepper::{MotorState, StepperMotor};
 use simuforge_physics::aba::articulated_body_algorithm;
 use simuforge_physics::arm::RobotArm;
 use simuforge_physics::joint::RotaryTable;
-use simuforge_render::arm_visual::generate_cylinder;
+use simuforge_render::arm_visual::{generate_cylinder, generate_sphere, generate_box};
 use simuforge_render::camera::{CameraUniform, OrbitCamera};
 use simuforge_render::context::RenderContext;
 use simuforge_render::mesh::ChunkMeshManager;
@@ -187,6 +187,9 @@ impl SimState {
         let n = self.arm.num_joints();
         let gravity = Vector3::new(0.0, 0.0, -9.81); // DH convention: Z-up
 
+        // Gravity compensation feedforward (joint-side torques needed to hold static)
+        let grav_comp = self.arm.gravity_compensation(&gravity);
+
         // PID control: compute motor torque commands
         let mut joint_torques = vec![0.0; n];
         for i in 0..n {
@@ -196,12 +199,16 @@ impl SimState {
                 PHYSICS_DT,
             );
 
-            // Motor torque clamping
+            // Feedforward: convert gravity comp from joint-side to motor-side
+            let grav_ff = -grav_comp[i] / (self.gearboxes[i].ratio * self.gearboxes[i].efficiency);
+            let total_motor_cmd = pid_output + grav_ff;
+
+            // Motor torque clamping (respects speed-torque curve)
             self.motors[i].motor.update_velocity(
                 self.arm.joints[i].velocity,
                 self.gearboxes[i].ratio,
             );
-            let motor_torque = self.motors[i].apply_torque(pid_output, PHYSICS_DT as f64);
+            let motor_torque = self.motors[i].apply_torque(total_motor_cmd, PHYSICS_DT as f64);
 
             // Gearbox amplification
             let joint_torque = self.gearboxes[i].motor_to_joint_torque(motor_torque);
@@ -223,42 +230,49 @@ impl SimState {
         let tool_pos = tool_pose.translation.vector;
         self.tool_state.update_position(tool_pos);
 
-        // Material removal (if tool is in the workpiece region and spindle is on)
-        if self.tool_state.spindle_on && self.tool_state.displacement() > 1e-6 {
-            let tool_sdf = self
-                .tool
-                .swept_sdf(&self.tool_state.prev_position, &self.tool_state.position);
-            let (bounds_min, bounds_max) = self
-                .tool
-                .swept_bounds(&self.tool_state.prev_position, &self.tool_state.position);
-            self.workpiece.subtract(bounds_min, bounds_max, tool_sdf);
-
-            // Cutting forces
-            let feed_dir = (self.tool_state.position - self.tool_state.prev_position).normalize();
-            let force = forces::cutting_force(
-                &self.material,
-                self.tool.radius,
-                &feed_dir,
-                0.001,  // 1mm depth of cut estimate
-                0.0001, // 0.1mm feed per tooth
-                2,      // 2 flutes
-            );
-            self.cutting_force_magnitude = force.norm();
-
-            // Apply cutting force reaction to arm joints
-            // (simplified: distribute force to last 3 joints)
-            let force_torque = force.norm() * 0.01; // rough estimate
-            if n >= 3 {
-                for i in (n - 3)..n {
-                    self.arm.joints[i].torque -= force_torque;
-                }
-            }
-        }
-
         // Rotary table
         self.rotary_table.step(PHYSICS_DT);
 
         self.sim_time += PHYSICS_DT;
+    }
+
+    /// Material removal — called once per render frame, NOT per physics step.
+    fn material_removal_step(&mut self) {
+        if !self.tool_state.spindle_on {
+            return;
+        }
+
+        // Get accumulated tool path for this frame
+        let (start, end) = match self.tool_state.begin_frame() {
+            Some(path) => path,
+            None => return, // tool didn't move enough
+        };
+
+        // Quick AABB check: is the tool anywhere near the workpiece?
+        let half = 0.1525_f64 + 0.01; // workpiece half-extent + margin
+        let tp = end;
+        if tp.x.abs() > half || tp.y.abs() > half || tp.z.abs() > half {
+            return; // tool is outside workpiece region
+        }
+
+        let tool_sdf = self.tool.swept_sdf(&start, &end);
+        let (bounds_min, bounds_max) = self.tool.swept_bounds(&start, &end);
+        self.workpiece.subtract(bounds_min, bounds_max, tool_sdf);
+
+        // Cutting forces (for display)
+        let diff = end - start;
+        if diff.norm() > 1e-9 {
+            let feed_dir = diff.normalize();
+            let force = forces::cutting_force(
+                &self.material,
+                self.tool.radius,
+                &feed_dir,
+                0.001,
+                0.0001,
+                2,
+            );
+            self.cutting_force_magnitude = force.norm();
+        }
     }
 }
 
@@ -286,6 +300,10 @@ struct App {
     // --- GPU resources for arm, ground, workpiece ---
     arm_cylinder: Option<GpuMesh>,
     arm_materials: Vec<MaterialBind>,
+    arm_sphere: Option<GpuMesh>,
+    joint_materials: Vec<MaterialBind>,
+    base_mesh: Option<GpuMesh>,
+    base_material: Option<MaterialBind>,
     ground_mesh: Option<GpuMesh>,
     ground_material: Option<MaterialBind>,
     workpiece_material: Option<MaterialBind>,
@@ -315,6 +333,10 @@ impl App {
             fps: 0.0,
             arm_cylinder: None,
             arm_materials: Vec::new(),
+            arm_sphere: None,
+            joint_materials: Vec::new(),
+            base_mesh: None,
+            base_material: None,
             ground_mesh: None,
             ground_material: None,
             workpiece_material: None,
@@ -362,20 +384,49 @@ impl App {
 
         // Arm links: compute per-link model matrices from physics frames
         let frames = self.sim.arm.link_frames();
+        let mut render_pts = Vec::with_capacity(7);
+        for i in 0..7 {
+            let f = isometry_to_glam(&frames[i]);
+            render_pts.push(swap.transform_point3(Vec3::new(f.col(3).x, f.col(3).y, f.col(3).z)));
+        }
+
         for i in 0..6 {
             if i >= self.arm_materials.len() {
                 break;
             }
-            // Convert physics frame positions to render space
-            let f0 = isometry_to_glam(&frames[i]);
-            let f1 = isometry_to_glam(&frames[i + 1]);
-            let p0 = swap.transform_point3(Vec3::new(f0.col(3).x, f0.col(3).y, f0.col(3).z));
-            let p1 = swap.transform_point3(Vec3::new(f1.col(3).x, f1.col(3).y, f1.col(3).z));
-            let model = link_model(p0, p1, ARM_LINK_RADII[i]);
+            let model = link_model(render_pts[i], render_pts[i + 1], ARM_LINK_RADII[i]);
             let mat = MaterialUniform::metal(ARM_LINK_COLORS[i])
                 .with_model(model.to_cols_array_2d());
             ctx.queue
                 .write_buffer(&self.arm_materials[i].buffer, 0, bytemuck::bytes_of(&mat));
+        }
+
+        // Joint sphere materials (at each frame position)
+        let joint_sphere_radii: [f32; 7] = [0.10, 0.09, 0.08, 0.07, 0.06, 0.06, 0.05];
+        let joint_color = [0.25, 0.25, 0.30, 1.0]; // dark metallic
+        for i in 0..7 {
+            if i >= self.joint_materials.len() {
+                break;
+            }
+            let s = joint_sphere_radii[i];
+            let model = Mat4::from_scale_rotation_translation(
+                Vec3::splat(s),
+                Quat::IDENTITY,
+                render_pts[i],
+            );
+            let mat = MaterialUniform::metal(joint_color)
+                .with_model(model.to_cols_array_2d());
+            ctx.queue
+                .write_buffer(&self.joint_materials[i].buffer, 0, bytemuck::bytes_of(&mat));
+        }
+
+        // Base pedestal: sits below the arm base (render_pts[0])
+        if let Some(base_mat) = &self.base_material {
+            let base_pos = Vec3::new(render_pts[0].x, render_pts[0].y - 0.04, render_pts[0].z);
+            let model = Mat4::from_translation(base_pos);
+            let mat = MaterialUniform::metal([0.15, 0.15, 0.18, 1.0])
+                .with_model(model.to_cols_array_2d());
+            ctx.queue.write_buffer(&base_mat.buffer, 0, bytemuck::bytes_of(&mat));
         }
 
         // Remesh dirty chunks
@@ -472,7 +523,7 @@ impl App {
                 }
             }
 
-            // 3) Draw robot arm links
+            // 3) Draw robot arm links (cylinders)
             if let Some(cyl) = &self.arm_cylinder {
                 for link_mat in &self.arm_materials {
                     render_pass.set_bind_group(0, &link_mat.bind_group, &[]);
@@ -483,6 +534,30 @@ impl App {
                     );
                     render_pass.draw_indexed(0..cyl.num_indices, 0, 0..1);
                 }
+            }
+
+            // 4) Draw joint spheres
+            if let Some(sph) = &self.arm_sphere {
+                for jm in &self.joint_materials {
+                    render_pass.set_bind_group(0, &jm.bind_group, &[]);
+                    render_pass.set_vertex_buffer(0, sph.vertex_buffer.slice(..));
+                    render_pass.set_index_buffer(
+                        sph.index_buffer.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    render_pass.draw_indexed(0..sph.num_indices, 0, 0..1);
+                }
+            }
+
+            // 5) Draw base pedestal
+            if let (Some(bm), Some(bmat)) = (&self.base_mesh, &self.base_material) {
+                render_pass.set_bind_group(0, &bmat.bind_group, &[]);
+                render_pass.set_vertex_buffer(0, bm.vertex_buffer.slice(..));
+                render_pass.set_index_buffer(
+                    bm.index_buffer.slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                render_pass.draw_indexed(0..bm.num_indices, 0, 0..1);
             }
         }
 
@@ -536,11 +611,11 @@ impl App {
 
     /// Build the left-side diagnostics overlay.
     fn build_diagnostics_overlay(&self, ob: &mut OverlayBuilder, _sw: f32, sh: f32) {
-        let panel_w = 260.0f32;
-        let margin = 10.0f32;
-        let scale = 1.5f32; // text scale (1.0 = 8px glyphs)
-        let line_h = 8.0 * scale + 4.0; // line height in pixels
-        let bar_h = 12.0f32;
+        let panel_w = 220.0f32;
+        let margin = 8.0f32;
+        let scale = 1.0f32; // text scale (1.0 = 8px native glyphs, crisp)
+        let line_h = 8.0 * scale + 3.0; // line height in pixels
+        let bar_h = 8.0f32;
         let white = [1.0, 1.0, 1.0, 0.95];
         let gray = [0.7, 0.7, 0.7, 0.9];
         let green = [0.2, 0.9, 0.3, 1.0];
@@ -756,9 +831,67 @@ impl ApplicationHandler for App {
             });
         }
 
-        // Ground plane (large quad at Y=0 in render space)
+        // Unit sphere (radius=1) for joint spheres
+        let (sph_verts, sph_idxs) = generate_sphere(1.0, 12, 16);
+        let sph_vb = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Joint Sphere VB"),
+                contents: bytemuck::cast_slice(&sph_verts),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        let sph_ib = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Joint Sphere IB"),
+                contents: bytemuck::cast_slice(&sph_idxs),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+        self.arm_sphere = Some(GpuMesh {
+            vertex_buffer: sph_vb,
+            index_buffer: sph_ib,
+            num_indices: sph_idxs.len() as u32,
+        });
+
+        // Material bind groups for joint spheres (7: base + 6 joints)
+        for _ in 0..7 {
+            let (buf, bg) = pbr.create_material_bind_group(&ctx.device);
+            self.joint_materials.push(MaterialBind {
+                buffer: buf,
+                bind_group: bg,
+            });
+        }
+
+        // Base pedestal box
+        let (base_verts, base_idxs) = generate_box(0.12, 0.04, 0.12);
+        let base_vb = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Base Pedestal VB"),
+                contents: bytemuck::cast_slice(&base_verts),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        let base_ib = ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Base Pedestal IB"),
+                contents: bytemuck::cast_slice(&base_idxs),
+                usage: wgpu::BufferUsages::INDEX,
+            });
+        self.base_mesh = Some(GpuMesh {
+            vertex_buffer: base_vb,
+            index_buffer: base_ib,
+            num_indices: base_idxs.len() as u32,
+        });
+        let (bbuf, bbg) = pbr.create_material_bind_group(&ctx.device);
+        self.base_material = Some(MaterialBind {
+            buffer: bbuf,
+            bind_group: bbg,
+        });
+
+        // Ground plane — below workpiece bottom (cube half=0.1525, so Y=-0.20 clears it)
         let gs = 3.0f32; // 3m half-extent
-        let gy = -0.002f32;
+        let gy = -0.20f32;
         let gnd_verts = vec![
             Vertex { position: [-gs, gy, -gs], normal: [0.0, 1.0, 0.0] },
             Vertex { position: [ gs, gy, -gs], normal: [0.0, 1.0, 0.0] },
@@ -935,6 +1068,9 @@ impl ApplicationHandler for App {
                     self.sim.physics_step();
                     self.accumulator -= PHYSICS_DT;
                 }
+
+                // Material removal: once per frame (not per physics step)
+                self.sim.material_removal_step();
 
                 // Render
                 self.render();

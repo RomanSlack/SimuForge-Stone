@@ -256,23 +256,41 @@ impl OctreeSdf {
                     let origin = coord.world_origin(self.cell_size);
                     let mut modified = false;
 
-                    for lz in 0..CHUNK_SIZE {
-                        for ly in 0..CHUNK_SIZE {
-                            for lx in 0..CHUNK_SIZE {
+                    // Compute local voxel range that overlaps the tool bounds
+                    // to avoid iterating the full 32^3 chunk.
+                    let lx_min = ((bounds_min[0] - origin[0]) / self.cell_size)
+                        .floor().max(0.0) as usize;
+                    let ly_min = ((bounds_min[1] - origin[1]) / self.cell_size)
+                        .floor().max(0.0) as usize;
+                    let lz_min = ((bounds_min[2] - origin[2]) / self.cell_size)
+                        .floor().max(0.0) as usize;
+                    let lx_max = ((bounds_max[0] - origin[0]) / self.cell_size)
+                        .ceil().min(CHUNK_SIZE as f32) as usize;
+                    let ly_max = ((bounds_max[1] - origin[1]) / self.cell_size)
+                        .ceil().min(CHUNK_SIZE as f32) as usize;
+                    let lz_max = ((bounds_max[2] - origin[2]) / self.cell_size)
+                        .ceil().min(CHUNK_SIZE as f32) as usize;
+
+                    for lz in lz_min..lz_max {
+                        for ly in ly_min..ly_max {
+                            for lx in lx_min..lx_max {
+                                let old_q = leaf.get(lx, ly, lz);
+                                // Skip voxels already fully outside (air)
+                                if old_q >= 126 {
+                                    continue;
+                                }
+
                                 let wx = origin[0] + lx as f32 * self.cell_size;
                                 let wy = origin[1] + ly as f32 * self.cell_size;
                                 let wz = origin[2] + lz as f32 * self.cell_size;
 
                                 let tool_d = tool_sdf(wx, wy, wz);
 
-                                // Only process voxels near the tool
+                                // Only process voxels inside or near the tool surface
                                 if tool_d < self.cell_size * 2.0 {
-                                    let existing =
-                                        dequantize_sdf(leaf.get(lx, ly, lz), self.cell_size);
-                                    // CSG subtract: max(existing, -tool)
+                                    let existing = dequantize_sdf(old_q, self.cell_size);
                                     let new_val = existing.max(-tool_d);
                                     let new_q = quantize_sdf(new_val, self.cell_size);
-                                    let old_q = leaf.get(lx, ly, lz);
                                     if new_q != old_q {
                                         leaf.set(lx, ly, lz, new_q);
                                         modified = true;
@@ -284,18 +302,17 @@ impl OctreeSdf {
 
                     if modified {
                         self.dirty_chunks.insert(coord);
-                        // Also mark neighbors dirty (for seamless meshing)
-                        for dz in -1..=1_i32 {
-                            for dy in -1..=1_i32 {
-                                for dx in -1..=1_i32 {
-                                    if dx != 0 || dy != 0 || dz != 0 {
-                                        let neighbor =
-                                            ChunkCoord::new(cx + dx, cy + dy, cz + dz);
-                                        if self.chunks.contains_key(&neighbor) {
-                                            self.dirty_chunks.insert(neighbor);
-                                        }
-                                    }
-                                }
+                        // Mark 6 face-adjacent neighbors dirty (for seamless meshing).
+                        // Only face neighbors share boundary voxels.
+                        const FACE_OFFSETS: [(i32, i32, i32); 6] = [
+                            (-1, 0, 0), (1, 0, 0),
+                            (0, -1, 0), (0, 1, 0),
+                            (0, 0, -1), (0, 0, 1),
+                        ];
+                        for &(dx, dy, dz) in &FACE_OFFSETS {
+                            let neighbor = ChunkCoord::new(cx + dx, cy + dy, cz + dz);
+                            if self.chunks.contains_key(&neighbor) {
+                                self.dirty_chunks.insert(neighbor);
                             }
                         }
                     }
