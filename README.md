@@ -91,12 +91,16 @@ Total reach: ~1200 mm. Reflected motor inertia through gearboxes dominates link 
 | Key | Action |
 |-----|--------|
 | Space | Play / pause simulation |
-| W/A/S/D | Move Cartesian target forward/left/back/right (150 mm/s) |
+| W/A/S/D | Move target forward/left/back/right (150 mm/s) |
 | Q/E | Move target down/up |
-| Shift + movement | Fine mode (50 mm/s) |
+| I/K | Pitch tool orientation (tilt forward/back) |
+| J/L | Yaw tool orientation (rotate left/right) |
+| Shift + movement | Fine mode (50 mm/s position, 0.3 rad/s rotation) |
 | X | Toggle spindle on/off |
-| R | Reset target to current tool position |
+| R | Reset target to current tool pose |
 | Shift+R | Full reset: arm pose, velocities, PID state, and target |
+| 1 | Snap camera to workpiece |
+| 2 | Snap camera to arm |
 | Mouse drag | Orbit camera |
 | Scroll | Zoom |
 | Middle click drag | Pan |

@@ -1,6 +1,7 @@
 //! PID controller with anti-windup and output clamping.
 
 /// PID controller for joint position control.
+/// Uses derivative-on-measurement (not error) to prevent kick on target changes.
 #[derive(Debug, Clone)]
 pub struct PidController {
     /// Proportional gain.
@@ -15,8 +16,8 @@ pub struct PidController {
 
     /// Accumulated integral error.
     integral: f64,
-    /// Previous error (for derivative).
-    prev_error: f64,
+    /// Previous measurement (for derivative-on-measurement).
+    prev_measurement: f64,
     /// Anti-windup: max integral accumulation.
     integral_max: f64,
 }
@@ -30,12 +31,16 @@ impl PidController {
             kd,
             output_max,
             integral: 0.0,
-            prev_error: 0.0,
+            prev_measurement: 0.0,
             integral_max: output_max / ki.max(1e-6), // anti-windup limit
         }
     }
 
     /// Compute control output given target and current position.
+    ///
+    /// Uses derivative-on-measurement: D term is -kd * d(current)/dt.
+    /// This avoids derivative kick when the target changes suddenly,
+    /// producing smooth, non-bouncy motion.
     ///
     /// Returns clamped torque command.
     pub fn update(&mut self, target: f64, current: f64, dt: f64) -> f64 {
@@ -45,13 +50,13 @@ impl PidController {
         self.integral += error * dt;
         self.integral = self.integral.clamp(-self.integral_max, self.integral_max);
 
-        // Derivative (on error, with filtering)
+        // Derivative on measurement (not error) — prevents kick on target change
         let derivative = if dt > 0.0 {
-            (error - self.prev_error) / dt
+            -(current - self.prev_measurement) / dt
         } else {
             0.0
         };
-        self.prev_error = error;
+        self.prev_measurement = current;
 
         // PID output
         let output = self.kp * error + self.ki * self.integral + self.kd * derivative;
@@ -63,12 +68,7 @@ impl PidController {
     /// Reset integral and derivative state.
     pub fn reset(&mut self) {
         self.integral = 0.0;
-        self.prev_error = 0.0;
-    }
-
-    /// Current error (last computed).
-    pub fn error(&self) -> f64 {
-        self.prev_error
+        self.prev_measurement = 0.0;
     }
 }
 
@@ -77,12 +77,14 @@ impl PidController {
 /// Gains are motor-side: output feeds into motor clamp (12 Nm NEMA34)
 /// then gearbox (100:1 * 0.9 = 90× amplification).
 /// With reflected motor inertia (20 kg·m²), natural freq = sqrt(kp*90 / 20).
-/// kp=50: ω_n = sqrt(4500/20) = 15 rad/s ≈ 2.4 Hz — responsive but stable.
+/// kp=50: ω_n = sqrt(4500/20) = 15 rad/s ≈ 2.4 Hz.
+/// Critical damping: kd_eff = 2*ω_n*I = 2*15*20 = 600 → kd = 600/90 ≈ 6.7.
+/// Using kd=8 for slight overdamping (ζ ≈ 1.2) — no bounce, precise hold.
 pub fn large_joint_pid() -> PidController {
     PidController::new(
         50.0, // kp — 0.1 rad error → 5 Nm motor → 450 Nm at joint → 22 rad/s²
         2.0,  // ki — integral for steady-state (wind-up limited)
-        3.0,  // kd — 1 rad/s → 3 Nm motor → 270 Nm damping
+        8.0,  // kd — overdamped: ζ≈1.2, no oscillation
         12.0, // max output: motor holding torque limit
     )
 }
@@ -92,11 +94,13 @@ pub fn large_joint_pid() -> PidController {
 /// Gearbox: 50:1 * 0.9 = 45× amplification.
 /// Reflected inertia: 1.25 kg·m². Natural freq = sqrt(kp*45 / 1.25).
 /// kp=20: ω_n = sqrt(900/1.25) = 26.8 rad/s ≈ 4.3 Hz.
+/// Critical damping: kd_eff = 2*26.8*1.25 = 67 → kd = 67/45 ≈ 1.5.
+/// Using kd=2.5 for overdamping (ζ ≈ 1.7) — rock solid wrist.
 pub fn small_joint_pid() -> PidController {
     PidController::new(
         20.0, // kp — 0.1 rad error → 2 Nm motor → 90 Nm at joint → 72 rad/s²
         1.0,  // ki
-        1.5,  // kd — 1 rad/s → 1.5 Nm motor → 67.5 Nm damping
+        2.5,  // kd — overdamped: ζ≈1.7
         3.0,  // max output: motor holding torque limit
     )
 }

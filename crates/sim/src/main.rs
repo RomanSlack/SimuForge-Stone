@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use glam::{Mat4, Quat, Vec3, Vec4};
-use nalgebra::Vector3;
+use nalgebra::{UnitQuaternion, Vector3};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -115,9 +115,9 @@ struct SimState {
     sim_time: f64,
     paused: bool,
     cutting_force_magnitude: f64,
-    /// Cartesian target point in DH world-space (meters).
-    /// The arm's IK solver tracks this point.
-    cartesian_target: Vector3<f64>,
+    /// Cartesian target pose in DH world-space (position + orientation).
+    /// The arm's IK solver tracks this pose.
+    cartesian_target: nalgebra::Isometry3<f64>,
     /// Whether IK converged on last solve.
     ik_converged: bool,
 }
@@ -163,6 +163,8 @@ impl SimState {
 
         // Set initial joint angles to match targets (start at the target pose)
         let mut arm = arm;
+        // Tool offset: 150mm Dremel body + 20mm cutting bit = 170mm from flange to tip
+        arm.tool_offset = 0.17;
         arm.set_joint_angles(&joint_targets);
 
         // 1ft (305mm) marble block, 0.5mm resolution
@@ -172,11 +174,10 @@ impl SimState {
             0.0005, // 0.5mm
         );
 
-        // Workpiece positioned where the tool naturally reaches.
-        // At J2=0.4, J3=-0.4 the tool tip is at DH (0.861, 0.080, -0.195).
-        // Center cube at (0.85, 0, -0.10) so tool is comfortably inside.
-        // Cube spans X: 0.70..1.00, Y: -0.15..0.15, Z: -0.25..0.05
-        let workpiece_center = Vector3::new(0.85, 0.0, -0.10);
+        // Workpiece positioned where the tool tip naturally reaches.
+        // With tool_offset=0.17, at J2=0.4, J3=-0.4 the tool tip is at DH (0.86, 0.25, -0.20).
+        // Z=-0.10 keeps the block bottom at -0.2525, above ground plane at -0.26.
+        let workpiece_center = Vector3::new(0.86, 0.25, -0.10);
 
         let tool = Tool::ball_nose(3.0, 20.0); // 3mm radius ball nose
         let mut tool_state = ToolState::new();
@@ -189,8 +190,8 @@ impl SimState {
 
         let rotary_table = RotaryTable::new(5.0); // 5 kg·m² inertia
 
-        // Cartesian target = initial tool tip position
-        let cartesian_target = initial_tool_pos;
+        // Cartesian target = initial tool tip pose (position + orientation)
+        let cartesian_target = arm.forward_kinematics();
 
         Self {
             arm,
@@ -206,10 +207,10 @@ impl SimState {
             material: MaterialProps::marble(),
             ik_solver: IkSolver {
                 damping: 0.05,
-                max_iterations: 20,        // fewer per frame (runs every frame)
-                position_tolerance: 5e-4,  // 0.5mm (looser for speed)
-                orientation_tolerance: 0.1,
-                max_step: 0.15,            // ~8.6° per iteration
+                max_iterations: 50,        // 6DOF needs more iterations than position-only
+                position_tolerance: 5e-4,  // 0.5mm
+                orientation_tolerance: 0.005, // ~0.3° — must be tighter than per-frame rotation step
+                max_step: 0.2,             // ~11.5° per iteration
             },
             sim_time: 0.0,
             paused: true,
@@ -219,15 +220,24 @@ impl SimState {
         }
     }
 
-    /// Solve IK: update joint_targets from cartesian_target.
+    /// Solve IK: update joint_targets from cartesian_target (full 6DOF pose).
     /// Uses a scratch copy of the arm so the actual joint state is untouched.
+    /// Rate-limits joint target changes to prevent flopping at workspace boundaries.
     fn update_ik(&mut self) {
         let mut scratch = self.arm.clone();
         scratch.set_joint_angles(&self.joint_targets);
         let (converged, _iters, _err) =
-            self.ik_solver.solve_position(&mut scratch, &self.cartesian_target);
+            self.ik_solver.solve(&mut scratch, &self.cartesian_target);
         self.ik_converged = converged;
-        self.joint_targets = scratch.joint_angles();
+
+        // Rate-limit: max joint angle change per frame (~60fps).
+        // Prevents oscillation when IK can't fully converge at workspace boundary.
+        let max_delta = 0.05; // ~3 deg/frame → ~180 deg/s max slew rate
+        let new_angles = scratch.joint_angles();
+        for i in 0..self.joint_targets.len() {
+            let delta = new_angles[i] - self.joint_targets[i];
+            self.joint_targets[i] += delta.clamp(-max_delta, max_delta);
+        }
     }
 
     /// Reset arm, joint targets, velocities, PID state, and cartesian target to initial pose.
@@ -263,8 +273,8 @@ impl SimState {
         self.tool_state.prev_position = initial_tool_pos;
         self.tool_state.frame_start_position = initial_tool_pos;
 
-        // Reset cartesian target
-        self.cartesian_target = initial_tool_pos;
+        // Reset cartesian target (full pose)
+        self.cartesian_target = self.arm.forward_kinematics();
         self.ik_converged = true;
         self.cutting_force_magnitude = 0.0;
     }
@@ -385,6 +395,7 @@ impl SimState {
 #[derive(Default)]
 struct HeldKeys {
     w: bool, s: bool, a: bool, d: bool, q: bool, e: bool,
+    i: bool, k: bool, j: bool, l: bool,
     shift: bool,
 }
 
@@ -421,6 +432,9 @@ struct App {
     ground_material: Option<MaterialBind>,
     workpiece_material: Option<MaterialBind>,
     target_material: Option<MaterialBind>,
+    // Tool (Dremel) visual
+    tool_body_material: Option<MaterialBind>,
+    tool_tip_material: Option<MaterialBind>,
 }
 
 impl App {
@@ -455,24 +469,60 @@ impl App {
             ground_material: None,
             workpiece_material: None,
             target_material: None,
+            tool_body_material: None,
+            tool_tip_material: None,
             held_keys: HeldKeys::default(),
         }
     }
 
     /// Apply continuous movement from held keys.
+    /// Rejects moves that take the target out of the arm's reachable workspace.
     fn apply_held_keys(&mut self, dt: f64) {
         if self.sim.paused {
             return;
         }
-        let speed = if self.held_keys.shift { 0.05 } else { 0.15 }; // m/s (50 or 150 mm/s)
+
+        let any_key = self.held_keys.w || self.held_keys.s || self.held_keys.a
+            || self.held_keys.d || self.held_keys.q || self.held_keys.e
+            || self.held_keys.i || self.held_keys.k || self.held_keys.j || self.held_keys.l;
+        if !any_key {
+            return;
+        }
+
+        // Save current target in case the new one is unreachable
+        let prev_target = self.sim.cartesian_target;
+
+        let speed = if self.held_keys.shift { 0.05 } else { 0.15 }; // m/s
         let step = speed * dt;
         let k = &self.held_keys;
-        if k.w { self.sim.cartesian_target.x += step; }
-        if k.s { self.sim.cartesian_target.x -= step; }
-        if k.a { self.sim.cartesian_target.y += step; }
-        if k.d { self.sim.cartesian_target.y -= step; }
-        if k.q { self.sim.cartesian_target.z += step; }
-        if k.e { self.sim.cartesian_target.z -= step; }
+
+        // Position (WASDQE)
+        let pos = &mut self.sim.cartesian_target.translation.vector;
+        if k.w { pos.x += step; }
+        if k.s { pos.x -= step; }
+        if k.a { pos.y += step; }
+        if k.d { pos.y -= step; }
+        if k.q { pos.z += step; }
+        if k.e { pos.z -= step; }
+
+        // Orientation (IJKL)
+        let rot_speed = if self.held_keys.shift { 0.3 } else { 1.0 }; // rad/s
+        let rot_step = rot_speed * dt;
+        let rot = &mut self.sim.cartesian_target.rotation;
+        if k.i { *rot = UnitQuaternion::from_axis_angle(&Vector3::y_axis(), rot_step) * *rot; }
+        if k.k { *rot = UnitQuaternion::from_axis_angle(&Vector3::y_axis(), -rot_step) * *rot; }
+        if k.j { *rot = UnitQuaternion::from_axis_angle(&Vector3::z_axis(), rot_step) * *rot; }
+        if k.l { *rot = UnitQuaternion::from_axis_angle(&Vector3::z_axis(), -rot_step) * *rot; }
+
+        // Test if the new target position is reachable — if not, revert.
+        // Uses position-only IK with loose tolerance for a fast go/no-go check.
+        let mut test = self.sim.arm.clone();
+        test.set_joint_angles(&self.sim.joint_targets);
+        let target_pos = self.sim.cartesian_target.translation.vector;
+        let (ok, _, _) = self.sim.ik_solver.solve_position(&mut test, &target_pos);
+        if !ok {
+            self.sim.cartesian_target = prev_target;
+        }
     }
 
     fn render(&mut self) {
@@ -560,8 +610,8 @@ impl App {
 
         // Target point: bright sphere showing where the arm is trying to reach.
         if let Some(tgt_mat) = &self.target_material {
-            let ct = &self.sim.cartesian_target;
-            let tgt_dh = Vec3::new(ct.x as f32, ct.y as f32, ct.z as f32);
+            let ct_pos = &self.sim.cartesian_target.translation.vector;
+            let tgt_dh = Vec3::new(ct_pos.x as f32, ct_pos.y as f32, ct_pos.z as f32);
             let tgt_render = swap.transform_point3(tgt_dh);
             let tgt_color = if self.sim.ik_converged {
                 [0.1, 1.0, 0.3, 1.0] // green = reachable
@@ -577,6 +627,37 @@ impl App {
             let mat = MaterialUniform::metal(tgt_color)
                 .with_model(model.to_cols_array_2d());
             ctx.queue.write_buffer(&tgt_mat.buffer, 0, bytemuck::bytes_of(&mat));
+        }
+
+        // Tool (Dremel): extends from flange along its local Z-axis.
+        // Body: 150mm long, 18mm radius cylinder (gray). Tip: 20mm, 3mm radius (silver).
+        {
+            let flange_mat = isometry_to_glam(&self.sim.arm.flange_pose());
+            let tool_z_dh = Vec3::new(flange_mat.col(2).x, flange_mat.col(2).y, flange_mat.col(2).z);
+            let flange_pos_dh = Vec3::new(flange_mat.col(3).x, flange_mat.col(3).y, flange_mat.col(3).z);
+
+            // Tool body: from flange to 150mm along tool Z
+            let body_end_dh = flange_pos_dh + tool_z_dh * 0.15;
+            let body_from = swap.transform_point3(flange_pos_dh);
+            let body_to = swap.transform_point3(body_end_dh);
+
+            if let Some(tb_mat) = &self.tool_body_material {
+                let model = link_model(body_from, body_to, 0.018);
+                let mat = MaterialUniform::metal([0.35, 0.35, 0.40, 1.0])
+                    .with_model(model.to_cols_array_2d());
+                ctx.queue.write_buffer(&tb_mat.buffer, 0, bytemuck::bytes_of(&mat));
+            }
+
+            // Tool tip (cutting bit): 20mm, thin
+            let tip_end_dh = body_end_dh + tool_z_dh * 0.02;
+            let tip_to = swap.transform_point3(tip_end_dh);
+
+            if let Some(tt_mat) = &self.tool_tip_material {
+                let model = link_model(body_to, tip_to, 0.003);
+                let mat = MaterialUniform::metal([0.85, 0.85, 0.90, 1.0])
+                    .with_model(model.to_cols_array_2d());
+                ctx.queue.write_buffer(&tt_mat.buffer, 0, bytemuck::bytes_of(&mat));
+            }
         }
 
         // Base pedestal: tall column from arm base down to ground.
@@ -720,7 +801,29 @@ impl App {
                 render_pass.draw_indexed(0..sph.num_indices, 0, 0..1);
             }
 
-            // 6) Draw base pedestal
+            // 6) Draw tool body (Dremel)
+            if let (Some(cyl), Some(tb_mat)) = (&self.arm_cylinder, &self.tool_body_material) {
+                render_pass.set_bind_group(0, &tb_mat.bind_group, &[]);
+                render_pass.set_vertex_buffer(0, cyl.vertex_buffer.slice(..));
+                render_pass.set_index_buffer(
+                    cyl.index_buffer.slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                render_pass.draw_indexed(0..cyl.num_indices, 0, 0..1);
+            }
+
+            // 7) Draw tool tip
+            if let (Some(cyl), Some(tt_mat)) = (&self.arm_cylinder, &self.tool_tip_material) {
+                render_pass.set_bind_group(0, &tt_mat.bind_group, &[]);
+                render_pass.set_vertex_buffer(0, cyl.vertex_buffer.slice(..));
+                render_pass.set_index_buffer(
+                    cyl.index_buffer.slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                render_pass.draw_indexed(0..cyl.num_indices, 0, 0..1);
+            }
+
+            // 8) Draw base pedestal
             if let (Some(bm), Some(bmat)) = (&self.base_mesh, &self.base_material) {
                 render_pass.set_bind_group(0, &bmat.bind_group, &[]);
                 render_pass.set_vertex_buffer(0, bm.vertex_buffer.slice(..));
@@ -924,7 +1027,8 @@ impl App {
         y += line_h + 8.0;
 
         // --- Target & Tool ---
-        let ct = &self.sim.cartesian_target;
+        let ct_pos = &self.sim.cartesian_target.translation.vector;
+        let ct_rot = &self.sim.cartesian_target.rotation;
         let tp = &self.sim.tool_state.position;
         let ik_color = if self.sim.ik_converged { green } else { red };
         let ik_text = if self.sim.ik_converged { "IK OK" } else { "IK FAIL" };
@@ -934,7 +1038,15 @@ impl App {
         ob.text(
             margin, y, scale, ik_color,
             &format!("{} X:{:.0} Y:{:.0} Z:{:.0}",
-                ik_text, ct.x * 1000.0, ct.y * 1000.0, ct.z * 1000.0),
+                ik_text, ct_pos.x * 1000.0, ct_pos.y * 1000.0, ct_pos.z * 1000.0),
+        );
+        y += line_h;
+        // Show target orientation as Euler angles (roll/pitch/yaw)
+        let (roll, pitch, yaw): (f64, f64, f64) = ct_rot.euler_angles();
+        ob.text(
+            margin, y, scale, gray,
+            &format!("R:{:.1} P:{:.1} Y:{:.1}",
+                roll.to_degrees(), pitch.to_degrees(), yaw.to_degrees()),
         );
         y += line_h + 2.0;
 
@@ -1125,6 +1237,20 @@ impl ApplicationHandler for App {
             bind_group: tbg,
         });
 
+        // Tool body material (Dremel body — reuses arm cylinder mesh)
+        let (tb_buf, tb_bg) = pbr.create_material_bind_group(&ctx.device);
+        self.tool_body_material = Some(MaterialBind {
+            buffer: tb_buf,
+            bind_group: tb_bg,
+        });
+
+        // Tool tip material (cutting bit — reuses arm cylinder mesh)
+        let (tt_buf, tt_bg) = pbr.create_material_bind_group(&ctx.device);
+        self.tool_tip_material = Some(MaterialBind {
+            buffer: tt_buf,
+            bind_group: tt_bg,
+        });
+
         self.pbr_pipeline = Some(pbr);
         self.shadow_pipeline = Some(shadow);
         self.ssao_pipeline = Some(ssao);
@@ -1183,6 +1309,10 @@ impl ApplicationHandler for App {
                     Key::Character("d") | Key::Character("D") => self.held_keys.d = pressed,
                     Key::Character("q") | Key::Character("Q") => self.held_keys.q = pressed,
                     Key::Character("e") | Key::Character("E") => self.held_keys.e = pressed,
+                    Key::Character("i") | Key::Character("I") => self.held_keys.i = pressed,
+                    Key::Character("k") | Key::Character("K") => self.held_keys.k = pressed,
+                    Key::Character("j") | Key::Character("J") => self.held_keys.j = pressed,
+                    Key::Character("l") | Key::Character("L") => self.held_keys.l = pressed,
                     Key::Named(NamedKey::Shift) => self.held_keys.shift = pressed,
                     _ => {}
                 }
@@ -1214,8 +1344,8 @@ impl ApplicationHandler for App {
                             );
                         }
                         Key::Character("r") => {
-                            self.sim.cartesian_target = self.sim.arm.tool_position();
-                            eprintln!("Target reset to current tool position");
+                            self.sim.cartesian_target = self.sim.arm.forward_kinematics();
+                            eprintln!("Target reset to current tool pose");
                         }
                         Key::Character("R") => {
                             self.sim.reset_to_initial();

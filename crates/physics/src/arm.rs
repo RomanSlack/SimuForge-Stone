@@ -22,6 +22,9 @@ pub struct RobotArm {
     pub motor_reflected_inertias: Vec<f64>,
     /// Link names (for debug/display).
     pub link_names: Vec<String>,
+    /// Tool offset along the flange Z-axis (meters).
+    /// FK, Jacobian, and tool_position all include this offset.
+    pub tool_offset: f64,
 }
 
 impl RobotArm {
@@ -30,8 +33,24 @@ impl RobotArm {
     }
 
     /// Compute forward kinematics: returns the pose of the tool tip (end-effector)
-    /// in the base frame.
+    /// in the base frame. Includes tool_offset along the flange Z-axis.
     pub fn forward_kinematics(&self) -> Isometry3<f64> {
+        let mut t = Isometry3::identity();
+        for (i, dh) in self.dh_params.iter().enumerate() {
+            t *= dh.transform(self.joints[i].angle);
+        }
+        if self.tool_offset != 0.0 {
+            t *= Isometry3::from_parts(
+                Vector3::new(0.0, 0.0, self.tool_offset).into(),
+                nalgebra::UnitQuaternion::identity(),
+            );
+        }
+        t
+    }
+
+    /// Compute forward kinematics for the flange only (no tool offset).
+    /// Used for rendering the arm links separately from the tool.
+    pub fn flange_pose(&self) -> Isometry3<f64> {
         let mut t = Isometry3::identity();
         for (i, dh) in self.dh_params.iter().enumerate() {
             t *= dh.transform(self.joints[i].angle);
@@ -54,11 +73,13 @@ impl RobotArm {
 
     /// Compute the geometric Jacobian (6×n) in the base frame.
     /// Top 3 rows: angular velocity. Bottom 3 rows: linear velocity.
+    /// End-effector includes tool_offset (Jacobian is for the tool tip).
     pub fn jacobian(&self) -> DMatrix<f64> {
         let n = self.num_joints();
         let mut jac = DMatrix::zeros(6, n);
         let frames = self.link_frames();
-        let p_ee = frames[n].translation.vector;
+        // Use tool tip position (includes tool_offset)
+        let p_ee = self.forward_kinematics().translation.vector;
 
         for i in 0..n {
             let frame_i = &frames[i];
@@ -98,7 +119,7 @@ impl RobotArm {
 
         let joints = vec![
             // Large joints (100:1 planetary): high friction from gearbox
-            RevoluteJoint::new(-180.0, 180.0).with_friction(10.0, 3.0),  // J1
+            RevoluteJoint::new(-360.0, 360.0).with_friction(10.0, 3.0),  // J1: base, continuous rotation
             RevoluteJoint::new(-45.0, 135.0).with_friction(10.0, 3.0),   // J2
             RevoluteJoint::new(-135.0, 135.0).with_friction(8.0, 2.5),   // J3
             // Small joints (50:1 planetary): less friction
@@ -153,6 +174,7 @@ impl RobotArm {
             link_masses,
             motor_reflected_inertias,
             link_names,
+            tool_offset: 0.0, // No tool by default; sim sets this
         }
     }
 
