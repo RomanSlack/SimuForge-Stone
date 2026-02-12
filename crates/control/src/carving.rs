@@ -119,6 +119,15 @@ impl CarvingSession {
         }
     }
 
+    /// Override the starting position (use the arm's actual position instead of G-code origin).
+    pub fn set_start_position(&mut self, pos: Vector3<f64>) {
+        self.current_position = pos;
+        // Also update the first waypoint for visualization
+        if !self.waypoints.is_empty() {
+            self.waypoints[0].position = pos;
+        }
+    }
+
     pub fn pause(&mut self) {
         if self.state == CarvingState::Running {
             self.state = CarvingState::Paused;

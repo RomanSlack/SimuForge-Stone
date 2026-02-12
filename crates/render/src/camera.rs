@@ -24,8 +24,8 @@ impl OrbitCamera {
     pub fn new() -> Self {
         Self {
             // Look at midpoint between arm and workpiece.
-            // Arm at origin, workpiece center at render (0.85, -0.10, 0.0).
-            target: Vec3::new(0.45, 0.0, 0.0),
+            // Arm at origin, workpiece at render (0.65, -0.05, 0.0).
+            target: Vec3::new(0.35, 0.0, 0.0),
             distance: 2.2,
             yaw: 0.7,
             pitch: 0.35,
@@ -78,17 +78,17 @@ impl OrbitCamera {
     }
 
     /// Snap to look at the workpiece (render Y-up space).
-    /// Workpiece center DH (0.85, 0, -0.10) → render (0.85, -0.10, 0.0).
+    /// Workpiece center DH (0.65, 0, -0.05) → render (0.65, -0.05, 0.0).
     pub fn snap_to_workpiece(&mut self) {
-        self.target = Vec3::new(0.85, -0.10, 0.0);
-        self.distance = 0.7;
+        self.target = Vec3::new(0.65, -0.05, 0.0);
+        self.distance = 0.6;
         self.yaw = 0.5;
-        self.pitch = 0.3;
+        self.pitch = 0.5;
     }
 
-    /// Snap to look at robot arm (render Y-up space).
+    /// Snap to look at robot arm + workpiece (render Y-up space).
     pub fn snap_to_arm(&mut self) {
-        self.target = Vec3::new(0.45, 0.0, 0.0);
+        self.target = Vec3::new(0.35, 0.0, 0.0);
         self.distance = 2.2;
         self.yaw = 0.7;
         self.pitch = 0.35;

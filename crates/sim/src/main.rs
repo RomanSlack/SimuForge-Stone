@@ -173,16 +173,15 @@ impl SimState {
             pid::small_joint_pid(),
         ];
 
-        // Initial joint targets: arm bent to reach toward workpiece
-        // J2=0.4 (elbow up), J3=-0.4 (forearm down) — puts tool near the cube surface
+        // Initial joint targets: arm positioned to reach workpiece from above
         let mut joint_targets = vec![0.0; n];
-        joint_targets[1] = 0.4;   // J2: shoulder forward
-        joint_targets[2] = -0.4;  // J3: elbow down toward workpiece
+        joint_targets[1] = 0.6;   // J2: shoulder raised
+        joint_targets[2] = -0.6;  // J3: elbow bent down
 
         // Set initial joint angles to match targets (start at the target pose)
         let mut arm = arm;
-        // Tool offset: 150mm Dremel body + 20mm cutting bit = 170mm from flange to tip
-        arm.tool_offset = 0.17;
+        // Tool offset: 150mm Dremel body + 25mm cutting bit = 175mm from flange to tip
+        arm.tool_offset = 0.175;
         arm.set_joint_angles(&joint_targets);
 
         // 1ft (305mm) marble block, 0.5mm resolution
@@ -192,12 +191,11 @@ impl SimState {
             0.0005, // 0.5mm
         );
 
-        // Workpiece positioned where the tool tip naturally reaches.
-        // With tool_offset=0.17, at J2=0.4, J3=-0.4 the tool tip is at DH (0.86, 0.25, -0.20).
-        // Z=-0.10 keeps the block bottom at -0.2525, above ground plane at -0.26.
-        let workpiece_center = Vector3::new(0.86, 0.25, -0.10);
+        // Workpiece positioned for natural top-down milling posture.
+        // At (0.65, 0, -0.05): top at Z=0.1025, the arm reaches forward naturally.
+        let workpiece_center = Vector3::new(0.65, 0.0, -0.05);
 
-        let tool = Tool::ball_nose(3.0, 20.0); // 3mm radius ball nose
+        let tool = Tool::ball_nose(8.0, 25.0); // 8mm radius ball nose, 25mm cutting length
         let mut tool_state = ToolState::new();
         // Initialize frame_start_position to the current tool tip
         // so the first frame doesn't create a huge swept path from origin.
@@ -264,10 +262,10 @@ impl SimState {
     fn reset_to_initial(&mut self) {
         let n = self.arm.num_joints();
 
-        // Initial joint targets: J2=0.4, J3=-0.4, rest 0
+        // Initial joint targets: J2=0.6, J3=-0.6, rest 0
         self.joint_targets = vec![0.0; n];
-        self.joint_targets[1] = 0.4;
-        self.joint_targets[2] = -0.4;
+        self.joint_targets[1] = 0.6;
+        self.joint_targets[2] = -0.6;
 
         // Set arm angles to match and zero velocities
         self.arm.set_joint_angles(&self.joint_targets);
@@ -360,13 +358,87 @@ impl SimState {
 
     /// Load a G-code file into a carving session and switch to carving mode.
     fn load_gcode(&mut self, path: &str) -> Result<(), String> {
-        // Tool orientation: tool points down in DH Z-up space (negative Z)
-        let tool_orientation = nalgebra::UnitQuaternion::from_axis_angle(
-            &Vector3::y_axis(),
-            std::f64::consts::PI,
+        // G-code origin = top-center of workpiece (Z=0 is the surface).
+        let half_extent = 0.1525;
+        let workpiece_top_center = Vector3::new(
+            self.workpiece_center.x,
+            self.workpiece_center.y,
+            self.workpiece_center.z + half_extent,
         );
 
-        let session = CarvingSession::load_file(path, self.workpiece_center, tool_orientation)?;
+        // --- Analytically-determined tool-down configuration ---
+        // Tool Z = (cos(J2+J3), 0, -sin(J2+J3)) when J5=±π/2 with matching J4.
+        // Tool pointing down (Z = 0,0,-1) requires J2+J3 = π/2.
+        //
+        // Two equivalent configs exist for tool-down:
+        //   A) J4=0,  J5=+π/2 → wrist folds BACKWARD (ugly)
+        //   B) J4=π,  J5=-π/2 → wrist extends FORWARD (natural)
+        // We use config B for a natural "reach over, tool hangs down" posture.
+        //
+        // Horizontal reach ≈ 0.5*cos(J2) when J2+J3=π/2 (link3 goes vertical).
+        // For workpiece at x=0.65: cos(J2) = 0.65/0.5 → J2 is beyond acos range,
+        // BUT the wrist assembly (d5=0.3m) extends forward adding ~0.3m of reach.
+        // So effective reach = 0.5*cos(J2) + 0.3 ≈ 0.65 → cos(J2) = 0.7, J2 ≈ 0.795 rad.
+        let pi = std::f64::consts::PI;
+        let pi2 = std::f64::consts::FRAC_PI_2;
+        let j2_init = 0.795_f64; // ~45.6°, horizontal reach with forward wrist ≈ 0.65m
+        let j3_init = pi2 - j2_init; // ~44.4°, ensures J2+J3=π/2 for tool-down
+        let good_joints = vec![0.0, j2_init, j3_init, pi, -pi2, 0.0];
+
+        // Set arm to this configuration and get the natural tool-down orientation via FK
+        self.arm.set_joint_angles(&good_joints);
+        let fk_pose = self.arm.forward_kinematics();
+        let tool_orientation = fk_pose.rotation;
+        let tool_z = fk_pose.rotation * Vector3::z();
+        eprintln!(
+            "Tool-down config: J2={:.1}° J3={:.1}° J5={:.1}° → tool Z=({:.3},{:.3},{:.3})",
+            j2_init.to_degrees(), j3_init.to_degrees(), pi2.to_degrees(),
+            tool_z.x, tool_z.y, tool_z.z,
+        );
+
+        // Now use IK to fine-tune the position to exactly above the workpiece center,
+        // using this good config as the seed (IK should converge quickly and stay clean).
+        let start_pos = Vector3::new(
+            workpiece_top_center.x,
+            workpiece_top_center.y,
+            workpiece_top_center.z + 0.015, // 15mm above surface
+        );
+        let target_pose = nalgebra::Isometry3::from_parts(
+            nalgebra::Translation3::from(start_pos),
+            tool_orientation,
+        );
+
+        let (ok, _, _) = self.ik_solver.solve(&mut self.arm, &target_pose);
+        if ok {
+            let angles = self.arm.joint_angles();
+            eprintln!(
+                "IK converged: J1={:.1}° J2={:.1}° J3={:.1}° J4={:.1}° J5={:.1}° J6={:.1}°",
+                angles[0].to_degrees(), angles[1].to_degrees(), angles[2].to_degrees(),
+                angles[3].to_degrees(), angles[4].to_degrees(), angles[5].to_degrees(),
+            );
+            self.joint_targets = angles;
+        } else {
+            // IK didn't converge — keep the analytical config (close enough)
+            eprintln!("IK did not converge, using analytical tool-down config directly");
+            self.joint_targets = good_joints;
+        }
+
+        // Snap arm state
+        for j in self.arm.joints.iter_mut() {
+            j.velocity = 0.0;
+        }
+        let tool_pos = self.arm.tool_position();
+        self.tool_state.position = tool_pos;
+        self.tool_state.prev_position = tool_pos;
+        self.tool_state.frame_start_position = tool_pos;
+        for pid in &mut self.pid_controllers {
+            pid.reset();
+        }
+        self.cartesian_target = target_pose;
+
+        let mut session = CarvingSession::load_file(path, workpiece_top_center, tool_orientation)?;
+        session.set_start_position(self.arm.tool_position());
+
         eprintln!(
             "Loaded G-code: {} waypoints, estimated {:.1}s",
             session.waypoints.len(),
@@ -726,7 +798,7 @@ impl App {
         }
 
         // Tool (Dremel): extends from flange along its local Z-axis.
-        // Body: 150mm long, 18mm radius cylinder (gray). Tip: 20mm, 3mm radius (silver).
+        // Body: 150mm long, 18mm radius cylinder (gray). Tip: 25mm, 8mm radius (silver).
         {
             let flange_mat = isometry_to_glam(&self.sim.arm.flange_pose());
             let tool_z_dh = Vec3::new(flange_mat.col(2).x, flange_mat.col(2).y, flange_mat.col(2).z);
@@ -744,12 +816,12 @@ impl App {
                 ctx.queue.write_buffer(&tb_mat.buffer, 0, bytemuck::bytes_of(&mat));
             }
 
-            // Tool tip (cutting bit): 20mm, thin
-            let tip_end_dh = body_end_dh + tool_z_dh * 0.02;
+            // Tool tip (cutting bit): 25mm long, 8mm radius
+            let tip_end_dh = body_end_dh + tool_z_dh * 0.025;
             let tip_to = swap.transform_point3(tip_end_dh);
 
             if let Some(tt_mat) = &self.tool_tip_material {
-                let model = link_model(body_to, tip_to, 0.003);
+                let model = link_model(body_to, tip_to, 0.008);
                 let mat = MaterialUniform::metal([0.85, 0.85, 0.90, 1.0])
                     .with_model(model.to_cols_array_2d());
                 ctx.queue.write_buffer(&tt_mat.buffer, 0, bytemuck::bytes_of(&mat));

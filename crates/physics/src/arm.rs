@@ -280,4 +280,5 @@ mod tests {
         let frames = arm.link_frames();
         assert_eq!(frames.len(), 7); // base + 6 links
     }
+
 }
