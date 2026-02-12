@@ -8,3 +8,4 @@ simuforge-core = { path = "../core" }
 glam = { workspace = true }
 bytemuck = { workspace = true }
 fast-surface-nets = { workspace = true }
+rayon = { workspace = true }

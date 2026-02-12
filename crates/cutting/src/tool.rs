@@ -61,7 +61,10 @@ impl Tool {
     /// Compute the SDF of the tool swept volume between two positions.
     /// Returns a closure suitable for OctreeSdf::subtract().
     ///
-    /// Positions are in world space (meters).
+    /// - BallNose: capsule SDF (sphere swept along path)
+    /// - FlatEnd: vertical cylinder swept along path (full radius at all depths)
+    ///
+    /// Positions are in world space (meters). Tool axis is Z-up (DH convention).
     pub fn swept_sdf(
         &self,
         start: &Vector3<f64>,
@@ -74,9 +77,21 @@ impl Tool {
         let by = end.y as f32;
         let bz = end.z as f32;
         let r = self.radius as f32;
+        let tool_type = self.tool_type;
+        let cl = self.cutting_length as f32;
 
         move |px: f32, py: f32, pz: f32| -> f32 {
-            simuforge_material_sdf_capsule(px, py, pz, ax, ay, az, bx, by, bz, r)
+            match tool_type {
+                ToolType::BallNose => {
+                    simuforge_material_sdf_capsule(px, py, pz, ax, ay, az, bx, by, bz, r)
+                }
+                ToolType::FlatEnd => {
+                    sdf_swept_cylinder(px, py, pz, ax, ay, az, bx, by, bz, r, cl)
+                }
+                ToolType::TaperedBall { .. } => {
+                    simuforge_material_sdf_capsule(px, py, pz, ax, ay, az, bx, by, bz, r)
+                }
+            }
         }
     }
 
@@ -93,10 +108,15 @@ impl Tool {
             (start.y.min(end.y) as f32) - pad,
             (start.z.min(end.z) as f32) - pad,
         ];
+        // For FlatEnd, the cylinder extends upward by cutting_length from the tip
+        let z_extra = match self.tool_type {
+            ToolType::FlatEnd => self.cutting_length as f32,
+            _ => 0.0,
+        };
         let max = [
             (start.x.max(end.x) as f32) + pad,
             (start.y.max(end.y) as f32) + pad,
-            (start.z.max(end.z) as f32) + pad,
+            (start.z.max(end.z) as f32) + pad + z_extra,
         ];
         (min, max)
     }
@@ -147,6 +167,57 @@ fn simuforge_material_sdf_capsule(
     (cx * cx + cy * cy + cz * cz).sqrt() - radius
 }
 
+/// Swept cylinder SDF for flat-end mills.
+///
+/// The tool is a vertical cylinder (radius R, height = cutting_length) with its
+/// flat bottom at the tool tip position. The cylinder extends upward (+Z) from the tip.
+/// When swept between positions A and B, any point inside the union of all cylinder
+/// positions along the path returns a negative value.
+fn sdf_swept_cylinder(
+    px: f32, py: f32, pz: f32,
+    ax: f32, ay: f32, az: f32,
+    bx: f32, by: f32, bz: f32,
+    radius: f32,
+    cutting_length: f32,
+) -> f32 {
+    // Find closest point on line segment AB (same projection as capsule)
+    let pax = px - ax;
+    let pay = py - ay;
+    let paz = pz - az;
+    let bax = bx - ax;
+    let bay = by - ay;
+    let baz = bz - az;
+
+    let ba_dot = bax * bax + bay * bay + baz * baz;
+    let t = if ba_dot > 1e-12 {
+        ((pax * bax + pay * bay + paz * baz) / ba_dot).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    // Closest point on the swept path
+    let cx = ax + t * bax;
+    let cy = ay + t * bay;
+    let cz = az + t * baz;
+
+    // Horizontal distance (XY plane) — full radius at all depths
+    let dx = px - cx;
+    let dy = py - cy;
+    let horiz = (dx * dx + dy * dy).sqrt() - radius;
+
+    // Vertical distance: cylinder from cz (tip) to cz + cutting_length (top)
+    let z_center = cz + cutting_length * 0.5;
+    let z_half = cutting_length * 0.5;
+    let vert = (pz - z_center).abs() - z_half;
+
+    // Proper SDF: Euclidean distance outside corners, max inside
+    if horiz > 0.0 && vert > 0.0 {
+        (horiz * horiz + vert * vert).sqrt()
+    } else {
+        horiz.max(vert)
+    }
+}
+
 /// Tool position and orientation state.
 #[derive(Debug, Clone)]
 pub struct ToolState {
@@ -189,16 +260,18 @@ impl ToolState {
 
     /// Mark the start of a new render frame. Returns (start, end) if
     /// the tool moved enough for material removal.
+    /// Small displacements accumulate across frames until the threshold is reached.
     pub fn begin_frame(&mut self) -> Option<(Vector3<f64>, Vector3<f64>)> {
         let disp = self.frame_displacement();
-        let start = self.frame_start_position;
-        let end = self.position;
-        self.frame_start_position = self.position;
         self.frame_dirty = false;
-        if disp > 0.0003 {
-            // Tool moved at least 0.3mm (sub-voxel threshold)
+        if disp > 0.0001 {
+            // Tool moved at least 0.1mm — perform cut and reset accumulator
+            let start = self.frame_start_position;
+            let end = self.position;
+            self.frame_start_position = self.position;
             Some((start, end))
         } else {
+            // Below threshold — keep frame_start_position so movement accumulates
             None
         }
     }

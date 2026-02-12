@@ -18,3 +18,4 @@ bytemuck = { version = "1", features = ["derive"] }
 wgpu = "24"
 winit = "0.30"
 fast-surface-nets = "0.2"
+rayon = "1"

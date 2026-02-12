@@ -3,9 +3,11 @@
 use crate::octree::{ChunkCoord, LeafData, OctreeSdf, CHUNK_SIZE};
 use fast_surface_nets::ndshape::{ConstShape, ConstShape3u32};
 use fast_surface_nets::{surface_nets, SurfaceNetsBuffer};
+use std::cell::RefCell;
 
 /// Padded chunk size for surface nets (need +2 for boundary sampling).
 const PADDED: u32 = CHUNK_SIZE as u32 + 2;
+const PADDED_TOTAL: usize = (PADDED * PADDED * PADDED) as usize;
 
 type PaddedShape = ConstShape3u32<PADDED, PADDED, PADDED>;
 
@@ -26,56 +28,81 @@ impl ChunkMesh {
     }
 }
 
+/// Thread-local reusable buffers to avoid per-call heap allocation.
+struct MeshBuffers {
+    grid: Vec<f32>,
+    sn_buffer: SurfaceNetsBuffer,
+}
+
+impl MeshBuffers {
+    fn new() -> Self {
+        Self {
+            grid: vec![1.0f32; PADDED_TOTAL],
+            sn_buffer: SurfaceNetsBuffer::default(),
+        }
+    }
+}
+
+thread_local! {
+    static BUFFERS: RefCell<MeshBuffers> = RefCell::new(MeshBuffers::new());
+}
+
 /// Mesh a single chunk from the octree, producing positions, normals, and indices.
 ///
 /// Returns None if the chunk has no surface (fully inside or outside).
 pub fn mesh_chunk(sdf: &OctreeSdf, coord: ChunkCoord) -> Option<ChunkMesh> {
     let leaf = sdf.chunks.get(&coord)?;
 
-    // Build padded SDF grid: PADDED^3
-    // We need 1 extra voxel on each side from neighboring chunks.
-    let mut grid = vec![1.0f32; (PADDED * PADDED * PADDED) as usize];
+    BUFFERS.with(|bufs| {
+        let mut bufs = bufs.borrow_mut();
+        let MeshBuffers { grid, sn_buffer } = &mut *bufs;
 
-    fill_padded_grid(sdf, coord, leaf, &mut grid);
+        // Reset grid to "outside" default
+        grid.fill(1.0f32);
 
-    // Run surface nets
-    let mut buffer = SurfaceNetsBuffer::default();
-    surface_nets(
-        &grid,
-        &PaddedShape {},
-        [0; 3],
-        [PADDED - 1; 3],
-        &mut buffer,
-    );
+        fill_padded_grid(sdf, coord, leaf, grid);
 
-    if buffer.positions.is_empty() {
-        return None;
-    }
+        // Run surface nets (internally calls reset() on sn_buffer to clear+reuse)
+        surface_nets(
+            grid,
+            &PaddedShape {},
+            [0; 3],
+            [PADDED - 1; 3],
+            sn_buffer,
+        );
 
-    // Transform positions from grid-local to world-space
-    let origin = coord.world_origin(sdf.cell_size);
-    let cs = sdf.cell_size;
+        if sn_buffer.positions.is_empty() {
+            return None;
+        }
 
-    let positions: Vec<[f32; 3]> = buffer
-        .positions
-        .iter()
-        .map(|p| {
-            [
-                origin[0] + (p[0] - 1.0) * cs, // -1 for padding offset
-                origin[1] + (p[1] - 1.0) * cs,
-                origin[2] + (p[2] - 1.0) * cs,
-            ]
+        // Transform positions from grid-local to world-space
+        let origin = coord.world_origin(sdf.cell_size);
+        let cs = sdf.cell_size;
+
+        let positions: Vec<[f32; 3]> = sn_buffer
+            .positions
+            .iter()
+            .map(|p| {
+                [
+                    origin[0] + (p[0] - 1.0) * cs, // -1 for padding offset
+                    origin[1] + (p[1] - 1.0) * cs,
+                    origin[2] + (p[2] - 1.0) * cs,
+                ]
+            })
+            .collect();
+
+        // Take ownership via swap to avoid clone — buffer gets cleared on next call anyway.
+        let mut normals = Vec::new();
+        std::mem::swap(&mut normals, &mut sn_buffer.normals);
+        let mut indices = Vec::new();
+        std::mem::swap(&mut indices, &mut sn_buffer.indices);
+
+        Some(ChunkMesh {
+            coord,
+            positions,
+            normals,
+            indices,
         })
-        .collect();
-
-    let normals: Vec<[f32; 3]> = buffer.normals.clone();
-    let indices: Vec<u32> = buffer.indices.clone();
-
-    Some(ChunkMesh {
-        coord,
-        positions,
-        normals,
-        indices,
     })
 }
 

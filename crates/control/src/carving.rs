@@ -39,6 +39,8 @@ pub struct CarvingSession {
     /// Fixed tool orientation (tool-down for 3-axis milling).
     pub tool_orientation: UnitQuaternion<f64>,
     pub spindle_on: bool,
+    /// Whether the current segment is a rapid move (G0) — no cutting during rapids.
+    pub is_rapid: bool,
     pub elapsed_time: f64,
     pub estimated_total_time: f64,
 }
@@ -99,6 +101,7 @@ impl CarvingSession {
             workpiece_offset,
             tool_orientation,
             spindle_on: false,
+            is_rapid: true,
             elapsed_time: 0.0,
             estimated_total_time: total_time,
         })
@@ -159,6 +162,7 @@ impl CarvingSession {
         self.current_position = self.workpiece_offset;
         self.state = CarvingState::Idle;
         self.spindle_on = false;
+        self.is_rapid = true;
         self.elapsed_time = 0.0;
     }
 
@@ -228,6 +232,9 @@ impl CarvingSession {
                 Some(t) => t,
                 None => return false,
             };
+
+            // Detect rapid moves (feed rate matches rapid_rate)
+            self.is_rapid = (feed_rate - self.gcode.rapid_rate).abs() < 1e-6;
 
             let world_target = target_pos + self.workpiece_offset;
             let dist = (world_target - self.current_position).norm();

@@ -18,6 +18,7 @@ use simuforge_control::ik::IkSolver;
 use simuforge_core::{isometry_to_glam, Vertex};
 use simuforge_cutting::forces::{self, MaterialProps};
 use simuforge_cutting::tool::{Tool, ToolState};
+use simuforge_material::async_mesher::AsyncMesher;
 use simuforge_material::mesher;
 use simuforge_material::octree::OctreeSdf;
 use simuforge_motors::gearbox::Gearbox;
@@ -195,7 +196,7 @@ impl SimState {
         // At (0.65, 0, -0.05): top at Z=0.1025, the arm reaches forward naturally.
         let workpiece_center = Vector3::new(0.65, 0.0, -0.05);
 
-        let tool = Tool::ball_nose(8.0, 25.0); // 8mm radius ball nose, 25mm cutting length
+        let tool = Tool::flat_end(8.0, 25.0); // 8mm radius flat end mill, 25mm cutting length
         let mut tool_state = ToolState::new();
         // Initialize frame_start_position to the current tool tip
         // so the first frame doesn't create a huge swept path from origin.
@@ -238,14 +239,25 @@ impl SimState {
         }
     }
 
-    /// Solve IK: update joint_targets from cartesian_target (full 6DOF pose).
-    /// Uses a scratch copy of the arm so the actual joint state is untouched.
+    /// Solve IK: update joint_targets from cartesian_target.
+    /// In carving mode, uses position-only IK (3DOF) — the arm finds its own
+    /// natural orientation, avoiding the orientation-fight that causes bobbing.
+    /// In manual mode, uses full 6DOF pose IK so the user can control orientation.
     /// Rate-limits joint target changes to prevent flopping at workspace boundaries.
     fn update_ik(&mut self) {
         let mut scratch = self.arm.clone();
         scratch.set_joint_angles(&self.joint_targets);
-        let (converged, _iters, _err) =
-            self.ik_solver.solve(&mut scratch, &self.cartesian_target);
+
+        let converged = if self.mode == SimMode::Carving {
+            // Position-only IK: no orientation constraint → smooth tracking
+            let target_pos = self.cartesian_target.translation.vector;
+            let (ok, _, _) = self.ik_solver.solve_position(&mut scratch, &target_pos);
+            ok
+        } else {
+            // Full 6DOF IK: user controls orientation via IJKL keys
+            let (ok, _, _) = self.ik_solver.solve(&mut scratch, &self.cartesian_target);
+            ok
+        };
         self.ik_converged = converged;
 
         // Rate-limit: max joint angle change per frame (~60fps).
@@ -366,64 +378,66 @@ impl SimState {
             self.workpiece_center.z + half_extent,
         );
 
-        // --- Analytically-determined tool-down configuration ---
-        // Tool Z = (cos(J2+J3), 0, -sin(J2+J3)) when J5=±π/2 with matching J4.
-        // Tool pointing down (Z = 0,0,-1) requires J2+J3 = π/2.
-        //
-        // Two equivalent configs exist for tool-down:
-        //   A) J4=0,  J5=+π/2 → wrist folds BACKWARD (ugly)
-        //   B) J4=π,  J5=-π/2 → wrist extends FORWARD (natural)
-        // We use config B for a natural "reach over, tool hangs down" posture.
-        //
-        // Horizontal reach ≈ 0.5*cos(J2) when J2+J3=π/2 (link3 goes vertical).
-        // For workpiece at x=0.65: cos(J2) = 0.65/0.5 → J2 is beyond acos range,
-        // BUT the wrist assembly (d5=0.3m) extends forward adding ~0.3m of reach.
-        // So effective reach = 0.5*cos(J2) + 0.3 ≈ 0.65 → cos(J2) = 0.7, J2 ≈ 0.795 rad.
-        let pi = std::f64::consts::PI;
+        // --- Position-only IK pre-positioning ---
+        // Use position-only IK with high-J5 seeds. The arm finds its own natural
+        // orientation to reach above the workpiece. No orientation fighting.
         let pi2 = std::f64::consts::FRAC_PI_2;
-        let j2_init = 0.795_f64; // ~45.6°, horizontal reach with forward wrist ≈ 0.65m
-        let j3_init = pi2 - j2_init; // ~44.4°, ensures J2+J3=π/2 for tool-down
-        let good_joints = vec![0.0, j2_init, j3_init, pi, -pi2, 0.0];
 
-        // Set arm to this configuration and get the natural tool-down orientation via FK
-        self.arm.set_joint_angles(&good_joints);
-        let fk_pose = self.arm.forward_kinematics();
-        let tool_orientation = fk_pose.rotation;
-        let tool_z = fk_pose.rotation * Vector3::z();
-        eprintln!(
-            "Tool-down config: J2={:.1}° J3={:.1}° J5={:.1}° → tool Z=({:.3},{:.3},{:.3})",
-            j2_init.to_degrees(), j3_init.to_degrees(), pi2.to_degrees(),
-            tool_z.x, tool_z.y, tool_z.z,
-        );
-
-        // Now use IK to fine-tune the position to exactly above the workpiece center,
-        // using this good config as the seed (IK should converge quickly and stay clean).
+        // Desired position: 15mm above workpiece top center
         let start_pos = Vector3::new(
             workpiece_top_center.x,
             workpiece_top_center.y,
-            workpiece_top_center.z + 0.015, // 15mm above surface
-        );
-        let target_pose = nalgebra::Isometry3::from_parts(
-            nalgebra::Translation3::from(start_pos),
-            tool_orientation,
+            workpiece_top_center.z + 0.015,
         );
 
-        let (ok, _, _) = self.ik_solver.solve(&mut self.arm, &target_pose);
-        if ok {
-            let angles = self.arm.joint_angles();
-            eprintln!(
-                "IK converged: J1={:.1}° J2={:.1}° J3={:.1}° J4={:.1}° J5={:.1}° J6={:.1}°",
-                angles[0].to_degrees(), angles[1].to_degrees(), angles[2].to_degrees(),
-                angles[3].to_degrees(), angles[4].to_degrees(), angles[5].to_degrees(),
-            );
-            self.joint_targets = angles;
-        } else {
-            // IK didn't converge — keep the analytical config (close enough)
-            eprintln!("IK did not converge, using analytical tool-down config directly");
-            self.joint_targets = good_joints;
+        // IK seeds: various J2/J3/J5 combos. Position-only IK lets the arm
+        // find whatever orientation is natural from these starting poses.
+        let seeds: &[[f64; 6]] = &[
+            [0.0, 0.6, 0.2, 0.0, pi2, 0.0],
+            [0.0, 0.5, 0.3, 0.0, pi2, 0.0],
+            [0.0, 0.7, 0.1, 0.0, pi2, 0.0],
+            [0.0, 0.4, 0.4, 0.0, pi2, 0.0],
+            [0.0, 0.8, 0.0, 0.0, pi2, 0.0],
+            [0.0, 0.3, 0.5, 0.0, pi2, 0.0],
+            [0.0, 0.6, 0.2, 0.0, 1.2, 0.0],
+            [0.0, 0.5, 0.3, 0.0, 1.0, 0.0],
+        ];
+
+        let mut best_angles: Option<Vec<f64>> = None;
+        let mut best_err = f64::MAX;
+        for seed in seeds {
+            let mut scratch = self.arm.clone();
+            scratch.set_joint_angles(&seed.to_vec());
+            let (ok, _, final_err) = self.ik_solver.solve_position(&mut scratch, &start_pos);
+            if ok && final_err < best_err {
+                best_err = final_err;
+                best_angles = Some(scratch.joint_angles());
+            }
         }
 
-        // Snap arm state
+        if let Some(angles) = best_angles {
+            self.arm.set_joint_angles(&angles);
+            self.joint_targets = angles.clone();
+            let fk = self.arm.forward_kinematics();
+            let tool_z = fk.rotation * Vector3::z();
+            eprintln!(
+                "IK positioned (err={:.2}mm): J2={:.1}° J3={:.1}° J4={:.1}° J5={:.1}° tool_Z=({:.2},{:.2},{:.2})",
+                best_err * 1000.0,
+                angles[1].to_degrees(), angles[2].to_degrees(),
+                angles[3].to_degrees(), angles[4].to_degrees(),
+                tool_z.x, tool_z.y, tool_z.z,
+            );
+        } else {
+            eprintln!("Warning: IK did not converge from any seed, using current pose");
+        }
+
+        // Use the arm's actual FK orientation for the carving session.
+        // Position-only IK during carving means orientation doesn't matter much,
+        // but the session still needs a consistent orientation for the Isometry3 targets.
+        let converged_fk = self.arm.forward_kinematics();
+        let tool_orientation = converged_fk.rotation;
+
+        // Snap arm state cleanly (zero velocity, reset PIDs)
         for j in self.arm.joints.iter_mut() {
             j.velocity = 0.0;
         }
@@ -434,7 +448,9 @@ impl SimState {
         for pid in &mut self.pid_controllers {
             pid.reset();
         }
-        self.cartesian_target = target_pose;
+        // Set cartesian_target to the arm's ACTUAL pose (not the desired one)
+        // so there's zero initial error → no flailing.
+        self.cartesian_target = converged_fk;
 
         let mut session = CarvingSession::load_file(path, workpiece_top_center, tool_orientation)?;
         session.set_start_position(self.arm.tool_position());
@@ -451,10 +467,17 @@ impl SimState {
 
     /// Material removal — called once per render frame, NOT per physics step.
     fn material_removal_step(&mut self) {
+        // Don't cut when spindle is off
         if !self.tool_state.spindle_on {
             self.cutting_force_magnitude = 0.0;
-            // Keep frame_start synced even with spindle off, so turning it on
-            // doesn't create a huge swept path from the old position.
+            self.tool_state.frame_start_position = self.tool_state.position;
+            return;
+        }
+
+        // Don't cut during rapid moves (G0) — spindle spins but tool is repositioning
+        let is_rapid = self.carving.as_ref().map_or(false, |s| s.is_rapid);
+        if is_rapid {
+            self.cutting_force_magnitude = 0.0;
             self.tool_state.frame_start_position = self.tool_state.position;
             return;
         }
@@ -550,6 +573,8 @@ struct App {
     line_pipeline: Option<LinePipeline>,
     speed_multiplier: f64,
     gcode_path: Option<String>,
+    // Background meshing
+    async_mesher: AsyncMesher,
 }
 
 impl App {
@@ -590,6 +615,7 @@ impl App {
             speed_multiplier: 1.0,
             gcode_path: None,
             held_keys: HeldKeys::default(),
+            async_mesher: AsyncMesher::new(0),
         }
     }
 
@@ -838,9 +864,12 @@ impl App {
             ctx.queue.write_buffer(&base_mat.buffer, 0, bytemuck::bytes_of(&mat));
         }
 
-        // Remesh dirty chunks
-        let meshes = mesher::remesh_dirty(&mut self.sim.workpiece);
-        for mesh in &meshes {
+        // Upload completed meshes from background workers.
+        // Also do a small sync remesh pass for any remaining dirty chunks
+        // (handles initial startup before async has spun up).
+        let async_meshes = self.async_mesher.poll_completed();
+        let sync_meshes = mesher::remesh_dirty_capped(&mut self.sim.workpiece, 2);
+        for mesh in async_meshes.iter().chain(sync_meshes.iter()) {
             let coord = (mesh.coord.x, mesh.coord.y, mesh.coord.z);
             self.chunk_meshes.upload_chunk(
                 &ctx.device,
@@ -1785,6 +1814,9 @@ impl ApplicationHandler for App {
 
                 // Material removal: once per frame (not per physics step)
                 self.sim.material_removal_step();
+
+                // Submit dirty chunks for background meshing
+                self.async_mesher.submit_dirty(&mut self.sim.workpiece);
 
                 // Render
                 self.render();

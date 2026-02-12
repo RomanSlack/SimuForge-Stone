@@ -255,6 +255,9 @@ impl OctreeSdf {
 
                     let origin = coord.world_origin(self.cell_size);
                     let mut modified = false;
+                    // Track which chunk boundary faces are actually touched by modifications.
+                    // Only dirty the neighbor if its shared face had voxels changed.
+                    let mut touched_faces = [false; 6]; // -x, +x, -y, +y, -z, +z
 
                     // Compute local voxel range that overlaps the tool bounds
                     // to avoid iterating the full 32^3 chunk.
@@ -271,6 +274,7 @@ impl OctreeSdf {
                     let lz_max = ((bounds_max[2] - origin[2]) / self.cell_size)
                         .ceil().min(CHUNK_SIZE as f32) as usize;
 
+                    let last = CHUNK_SIZE - 1;
                     for lz in lz_min..lz_max {
                         for ly in ly_min..ly_max {
                             for lx in lx_min..lx_max {
@@ -294,6 +298,12 @@ impl OctreeSdf {
                                     if new_q != old_q {
                                         leaf.set(lx, ly, lz, new_q);
                                         modified = true;
+                                        if lx == 0    { touched_faces[0] = true; }
+                                        if lx == last  { touched_faces[1] = true; }
+                                        if ly == 0    { touched_faces[2] = true; }
+                                        if ly == last  { touched_faces[3] = true; }
+                                        if lz == 0    { touched_faces[4] = true; }
+                                        if lz == last  { touched_faces[5] = true; }
                                     }
                                 }
                             }
@@ -302,17 +312,19 @@ impl OctreeSdf {
 
                     if modified {
                         self.dirty_chunks.insert(coord);
-                        // Mark 6 face-adjacent neighbors dirty (for seamless meshing).
-                        // Only face neighbors share boundary voxels.
+                        // Only dirty face-adjacent neighbors whose shared boundary
+                        // actually had voxels modified.
                         const FACE_OFFSETS: [(i32, i32, i32); 6] = [
                             (-1, 0, 0), (1, 0, 0),
                             (0, -1, 0), (0, 1, 0),
                             (0, 0, -1), (0, 0, 1),
                         ];
-                        for &(dx, dy, dz) in &FACE_OFFSETS {
-                            let neighbor = ChunkCoord::new(cx + dx, cy + dy, cz + dz);
-                            if self.chunks.contains_key(&neighbor) {
-                                self.dirty_chunks.insert(neighbor);
+                        for (i, &(dx, dy, dz)) in FACE_OFFSETS.iter().enumerate() {
+                            if touched_faces[i] {
+                                let neighbor = ChunkCoord::new(cx + dx, cy + dy, cz + dz);
+                                if self.chunks.contains_key(&neighbor) {
+                                    self.dirty_chunks.insert(neighbor);
+                                }
                             }
                         }
                     }
