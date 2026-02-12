@@ -13,6 +13,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
+use simuforge_control::carving::{CarvingSession, CarvingState};
 use simuforge_control::ik::IkSolver;
 use simuforge_core::{isometry_to_glam, Vertex};
 use simuforge_cutting::forces::{self, MaterialProps};
@@ -34,6 +35,7 @@ use simuforge_render::pipelines::shadow::ShadowPipeline;
 use simuforge_render::pipelines::ssao::SsaoPipeline;
 use simuforge_render::pipelines::sss::SssPipeline;
 use simuforge_render::pipelines::composite::CompositePipeline;
+use simuforge_render::pipelines::line::{LinePipeline, LineVertex};
 use simuforge_render::pipelines::overlay::{OverlayBuilder, OverlayPipeline};
 
 /// Coordinate swap: DH Z-up physics → Y-up renderer.
@@ -94,6 +96,18 @@ const ARM_LINK_COLORS: [[f32; 4]; 6] = [
 const PHYSICS_DT: f64 = 1.0 / 1000.0;
 /// Maximum accumulated time before clamping (prevent spiral of death).
 const MAX_FRAME_TIME: f64 = 0.05;
+/// Maximum physics steps per frame (prevents spiral of death at high speed).
+const MAX_PHYSICS_STEPS_PER_FRAME: u32 = 2000;
+
+/// Simulation mode: manual keyboard control or automated G-code carving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SimMode {
+    Manual,
+    Carving,
+}
+
+/// Speed multiplier presets for carving.
+const SPEED_PRESETS: &[f64] = &[0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0];
 
 /// Full simulation state.
 #[allow(dead_code)]
@@ -120,6 +134,10 @@ struct SimState {
     cartesian_target: nalgebra::Isometry3<f64>,
     /// Whether IK converged on last solve.
     ik_converged: bool,
+    /// Carving session (loaded G-code program).
+    carving: Option<CarvingSession>,
+    /// Current mode: Manual or Carving.
+    mode: SimMode,
 }
 
 impl SimState {
@@ -217,6 +235,8 @@ impl SimState {
             cutting_force_magnitude: 0.0,
             cartesian_target,
             ik_converged: true,
+            carving: None,
+            mode: SimMode::Manual,
         }
     }
 
@@ -338,6 +358,25 @@ impl SimState {
         self.sim_time += PHYSICS_DT;
     }
 
+    /// Load a G-code file into a carving session and switch to carving mode.
+    fn load_gcode(&mut self, path: &str) -> Result<(), String> {
+        // Tool orientation: tool points down in DH Z-up space (negative Z)
+        let tool_orientation = nalgebra::UnitQuaternion::from_axis_angle(
+            &Vector3::y_axis(),
+            std::f64::consts::PI,
+        );
+
+        let session = CarvingSession::load_file(path, self.workpiece_center, tool_orientation)?;
+        eprintln!(
+            "Loaded G-code: {} waypoints, estimated {:.1}s",
+            session.waypoints.len(),
+            session.estimated_total_time
+        );
+        self.carving = Some(session);
+        self.mode = SimMode::Carving;
+        Ok(())
+    }
+
     /// Material removal — called once per render frame, NOT per physics step.
     fn material_removal_step(&mut self) {
         if !self.tool_state.spindle_on {
@@ -435,6 +474,10 @@ struct App {
     // Tool (Dremel) visual
     tool_body_material: Option<MaterialBind>,
     tool_tip_material: Option<MaterialBind>,
+    // Carving / toolpath visualization
+    line_pipeline: Option<LinePipeline>,
+    speed_multiplier: f64,
+    gcode_path: Option<String>,
 }
 
 impl App {
@@ -471,6 +514,9 @@ impl App {
             target_material: None,
             tool_body_material: None,
             tool_tip_material: None,
+            line_pipeline: None,
+            speed_multiplier: 1.0,
+            gcode_path: None,
             held_keys: HeldKeys::default(),
         }
     }
@@ -523,6 +569,56 @@ impl App {
         if !ok {
             self.sim.cartesian_target = prev_target;
         }
+    }
+
+    /// Initialize the line pipeline (for toolpath visualization).
+    fn init_line_pipeline(&mut self) {
+        if self.line_pipeline.is_some() {
+            return; // already initialized
+        }
+        if let (Some(ctx), Some(pbr)) = (&self.render_ctx, &self.pbr_pipeline) {
+            self.line_pipeline = Some(LinePipeline::new(ctx, &pbr.camera_buffer));
+        }
+    }
+
+    /// Build line vertices from the carving session's waypoints.
+    /// Colors: yellow=rapid, cyan=pending cut, green=completed.
+    fn build_toolpath_lines(&self) -> Vec<LineVertex> {
+        let session = match &self.sim.carving {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+
+        let swap = coord_swap_matrix();
+        let completed = session.progress_counts().0;
+        let mut vertices = Vec::with_capacity(session.waypoints.len() * 2);
+
+        for i in 0..session.waypoints.len().saturating_sub(1) {
+            let wp0 = &session.waypoints[i];
+            let wp1 = &session.waypoints[i + 1];
+
+            // Transform from DH to render space
+            let p0_dh = glam::Vec3::new(wp0.position.x as f32, wp0.position.y as f32, wp0.position.z as f32);
+            let p1_dh = glam::Vec3::new(wp1.position.x as f32, wp1.position.y as f32, wp1.position.z as f32);
+            let p0 = swap.transform_point3(p0_dh);
+            let p1 = swap.transform_point3(p1_dh);
+
+            let color = if i < completed {
+                // Completed
+                [0.2, 0.9, 0.3, 1.0]
+            } else if wp1.is_rapid {
+                // Rapid (pending)
+                [1.0, 0.9, 0.2, 0.7]
+            } else {
+                // Cutting (pending)
+                [0.2, 0.7, 1.0, 0.8]
+            };
+
+            vertices.push(LineVertex { position: [p0.x, p0.y, p0.z], color });
+            vertices.push(LineVertex { position: [p1.x, p1.y, p1.z], color });
+        }
+
+        vertices
     }
 
     fn render(&mut self) {
@@ -835,6 +931,41 @@ impl App {
             }
         }
 
+        // --- Toolpath line pass ---
+        // Build line vertices before borrowing the pipeline mutably
+        let line_verts = self.build_toolpath_lines();
+        if let Some(line_pipe) = &mut self.line_pipeline {
+            if !line_verts.is_empty() {
+                line_pipe.upload(&ctx.queue, &line_verts);
+            }
+            if line_pipe.num_vertices > 0 {
+                let mut line_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Line Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &ctx.depth_texture,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    ..Default::default()
+                });
+                line_pass.set_pipeline(&line_pipe.pipeline);
+                line_pass.set_bind_group(0, &line_pipe.bind_group, &[]);
+                line_pass.set_vertex_buffer(0, line_pipe.vertex_buffer.slice(..));
+                line_pass.draw(0..line_pipe.num_vertices, 0..1);
+            }
+        }
+
         // --- Overlay pass (2D diagnostics panel) ---
         let overlay_idx_count = if let Some(overlay) = &self.overlay_pipeline {
             let size = ctx.config.width as f32;
@@ -910,12 +1041,73 @@ impl App {
         ob.text(margin, y, 2.0, white, "SimuForge-Stone");
         y += 8.0 * 2.0 + 8.0;
 
-        // Status
-        let status_color = if self.sim.paused { yellow } else { green };
-        let status_text = if self.sim.paused { "PAUSED" } else { "RUNNING" };
-        ob.rect(margin, y, 10.0, 10.0, status_color);
-        ob.text(margin + 16.0, y, scale, status_color, status_text);
-        y += line_h + 4.0;
+        // Mode indicator
+        let mode_color = match self.sim.mode {
+            SimMode::Manual => cyan,
+            SimMode::Carving => orange,
+        };
+        let mode_text = match self.sim.mode {
+            SimMode::Manual => "MANUAL",
+            SimMode::Carving => "CARVING",
+        };
+        ob.rect(margin, y, 10.0, 10.0, mode_color);
+        ob.text(margin + 16.0, y, scale, mode_color, mode_text);
+        y += line_h;
+
+        // Status / carving state
+        if self.sim.mode == SimMode::Carving {
+            if let Some(session) = &self.sim.carving {
+                let state_color = match session.state {
+                    CarvingState::Idle => gray,
+                    CarvingState::Running => green,
+                    CarvingState::Paused => yellow,
+                    CarvingState::Complete => cyan,
+                };
+                let state_text = match session.state {
+                    CarvingState::Idle => "IDLE",
+                    CarvingState::Running => "RUNNING",
+                    CarvingState::Paused => "PAUSED",
+                    CarvingState::Complete => "COMPLETE",
+                };
+                ob.text(margin + 16.0, y, scale, state_color, state_text);
+                y += line_h;
+
+                // Speed multiplier
+                let speed_color = if (self.speed_multiplier - 1.0).abs() < 0.01 { gray } else { yellow };
+                ob.text(margin, y, scale, speed_color,
+                    &format!("Speed: {}x", self.speed_multiplier));
+                y += line_h;
+
+                // Progress bar
+                let (done, total) = session.progress_counts();
+                let prog = session.progress();
+                ob.text(margin, y, scale, white,
+                    &format!("Progress: {:.0}% ({}/{})", prog * 100.0, done, total));
+                y += line_h;
+
+                // Progress bar visual
+                let bar_x = margin;
+                let bar_y = y;
+                let bar_w = panel_w - margin * 2.0;
+                ob.rect(bar_x, bar_y, bar_w, bar_h, bar_bg);
+                ob.rect(bar_x, bar_y, bar_w * prog as f32, bar_h, green);
+                y += bar_h + 2.0;
+
+                // ETA
+                let eta = session.eta();
+                if eta > 0.0 && session.state == CarvingState::Running {
+                    ob.text(margin, y, scale, gray,
+                        &format!("ETA: {:.0}s", eta / self.speed_multiplier));
+                    y += line_h;
+                }
+            }
+        } else {
+            let status_color = if self.sim.paused { yellow } else { green };
+            let status_text = if self.sim.paused { "PAUSED" } else { "RUNNING" };
+            ob.text(margin + 16.0, y, scale, status_color, status_text);
+            y += line_h;
+        }
+        y += 4.0;
 
         // FPS
         ob.text(margin, y, scale, gray, &format!("FPS:  {:.0}", self.fps));
@@ -1260,10 +1452,22 @@ impl ApplicationHandler for App {
         self.render_ctx = Some(ctx);
         self.window = Some(window);
 
+        // Auto-load G-code if specified via CLI
+        if let Some(path) = &self.gcode_path.clone() {
+            match self.sim.load_gcode(path) {
+                Ok(()) => {
+                    self.init_line_pipeline();
+                    eprintln!("G-code loaded. Press Space to start carving.");
+                }
+                Err(e) => eprintln!("Failed to load G-code: {}", e),
+            }
+        }
+
         eprintln!("SimuForge-Stone initialized. Press SPACE to start.");
         eprintln!("  Move tool: W/S=fwd/back  A/D=left/right  Q/E=up/down");
         eprintln!("  Hold Shift for slow (50mm/s), normal=150mm/s");
         eprintln!("  X=spindle  R=reset target  1/2=camera snap");
+        eprintln!("  G=load gcode  M=manual mode  +/-=speed  Shift+R=full reset");
         eprintln!("  Camera: LMB=rotate  Scroll=zoom  MMB=pan");
     }
 
@@ -1321,11 +1525,24 @@ impl ApplicationHandler for App {
                 if pressed {
                     match logical_key.as_ref() {
                         Key::Named(NamedKey::Space) => {
-                            self.sim.paused = !self.sim.paused;
-                            eprintln!(
-                                "Simulation {}",
-                                if self.sim.paused { "PAUSED" } else { "RUNNING" }
-                            );
+                            if self.sim.mode == SimMode::Carving {
+                                // Toggle carving session start/pause
+                                if let Some(session) = &mut self.sim.carving {
+                                    session.toggle();
+                                    match session.state {
+                                        CarvingState::Running => eprintln!("Carving RUNNING"),
+                                        CarvingState::Paused => eprintln!("Carving PAUSED"),
+                                        CarvingState::Idle => eprintln!("Carving IDLE"),
+                                        CarvingState::Complete => eprintln!("Carving COMPLETE"),
+                                    }
+                                }
+                            } else {
+                                self.sim.paused = !self.sim.paused;
+                                eprintln!(
+                                    "Simulation {}",
+                                    if self.sim.paused { "PAUSED" } else { "RUNNING" }
+                                );
+                            }
                         }
                         Key::Named(NamedKey::Escape) => {
                             event_loop.exit();
@@ -1348,8 +1565,59 @@ impl ApplicationHandler for App {
                             eprintln!("Target reset to current tool pose");
                         }
                         Key::Character("R") => {
+                            // Full reset including carving session
                             self.sim.reset_to_initial();
-                            eprintln!("Full reset: arm, targets, and tracker reset to initial pose");
+                            if let Some(session) = &mut self.sim.carving {
+                                session.reset();
+                            }
+                            self.speed_multiplier = 1.0;
+                            eprintln!("Full reset: arm, targets, carving session reset");
+                        }
+                        Key::Character("g") | Key::Character("G") => {
+                            // Load G-code file
+                            if let Some(path) = &self.gcode_path.clone() {
+                                match self.sim.load_gcode(path) {
+                                    Ok(()) => {
+                                        self.init_line_pipeline();
+                                        eprintln!("G-code loaded, press Space to start carving");
+                                    }
+                                    Err(e) => eprintln!("Failed to load G-code: {}", e),
+                                }
+                            } else {
+                                eprintln!("No G-code file specified. Pass path as CLI argument.");
+                            }
+                        }
+                        Key::Character("m") | Key::Character("M") => {
+                            // Switch to manual mode
+                            self.sim.mode = SimMode::Manual;
+                            self.sim.paused = true;
+                            eprintln!("Switched to MANUAL mode");
+                        }
+                        Key::Character("+") | Key::Character("=") => {
+                            // Speed up
+                            let current_idx = SPEED_PRESETS.iter()
+                                .position(|&s| (s - self.speed_multiplier).abs() < 0.01)
+                                .unwrap_or_else(|| {
+                                    SPEED_PRESETS.iter()
+                                        .position(|&s| s > self.speed_multiplier)
+                                        .unwrap_or(SPEED_PRESETS.len() - 1)
+                                });
+                            let next_idx = (current_idx + 1).min(SPEED_PRESETS.len() - 1);
+                            self.speed_multiplier = SPEED_PRESETS[next_idx];
+                            eprintln!("Speed: {}x", self.speed_multiplier);
+                        }
+                        Key::Character("-") => {
+                            // Slow down
+                            let current_idx = SPEED_PRESETS.iter()
+                                .position(|&s| (s - self.speed_multiplier).abs() < 0.01)
+                                .unwrap_or_else(|| {
+                                    SPEED_PRESETS.iter()
+                                        .rposition(|&s| s < self.speed_multiplier)
+                                        .unwrap_or(0)
+                                });
+                            let next_idx = if current_idx > 0 { current_idx - 1 } else { 0 };
+                            self.speed_multiplier = SPEED_PRESETS[next_idx];
+                            eprintln!("Speed: {}x", self.speed_multiplier);
                         }
                         _ => {}
                     }
@@ -1400,19 +1668,47 @@ impl ApplicationHandler for App {
                 let frame_time = now.duration_since(self.last_frame).as_secs_f64();
                 self.last_frame = now;
 
-                // Apply continuous key movement (smooth, frame-rate independent)
-                self.apply_held_keys(frame_time.min(MAX_FRAME_TIME));
+                let clamped_frame_time = frame_time.min(MAX_FRAME_TIME);
+
+                // Carving mode: advance the carving session and set targets
+                if self.sim.mode == SimMode::Carving {
+                    if let Some(session) = &mut self.sim.carving {
+                        if session.state == CarvingState::Running {
+                            let scaled_dt = clamped_frame_time * self.speed_multiplier;
+                            if let Some(target) = session.step(scaled_dt) {
+                                self.sim.cartesian_target = target;
+                            }
+                            self.sim.tool_state.spindle_on = session.spindle_on;
+                            self.sim.paused = false;
+                        }
+                    }
+                } else {
+                    // Manual mode: apply continuous key movement
+                    self.apply_held_keys(clamped_frame_time);
+                }
 
                 // IK solve: update joint targets from Cartesian target (once per frame)
                 if !self.sim.paused {
                     self.sim.update_ik();
                 }
 
-                self.accumulator += frame_time.min(MAX_FRAME_TIME);
+                // Scale physics accumulator by speed multiplier in carving mode
+                let physics_dt_budget = if self.sim.mode == SimMode::Carving {
+                    clamped_frame_time * self.speed_multiplier
+                } else {
+                    clamped_frame_time
+                };
+                self.accumulator += physics_dt_budget;
 
-                while self.accumulator >= PHYSICS_DT {
+                let mut steps = 0u32;
+                while self.accumulator >= PHYSICS_DT && steps < MAX_PHYSICS_STEPS_PER_FRAME {
                     self.sim.physics_step();
                     self.accumulator -= PHYSICS_DT;
+                    steps += 1;
+                }
+                // Drain excess to prevent spiral of death
+                if self.accumulator > PHYSICS_DT * 10.0 {
+                    self.accumulator = 0.0;
                 }
 
                 // Material removal: once per frame (not per physics step)
@@ -1435,9 +1731,17 @@ impl ApplicationHandler for App {
 fn main() {
     eprintln!("Starting SimuForge-Stone...");
 
+    let args: Vec<String> = std::env::args().collect();
+    let gcode_path = args.get(1).cloned();
+
+    if let Some(ref path) = gcode_path {
+        eprintln!("G-code file: {}", path);
+    }
+
     let event_loop = EventLoop::new().expect("Failed to create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let mut app = App::new();
+    app.gcode_path = gcode_path;
     event_loop.run_app(&mut app).expect("Event loop error");
 }

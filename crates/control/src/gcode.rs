@@ -196,6 +196,20 @@ impl GCodeInterpreter {
         self.current >= self.commands.len()
     }
 
+    /// Peek at the current command without advancing.
+    pub fn peek_command(&self) -> Option<&GCommand> {
+        self.commands.get(self.current)
+    }
+
+    /// Load a G-code program from a file path.
+    pub fn load_file(path: &str) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("Failed to read G-code file '{}': {}", path, e))?;
+        let mut interp = Self::new();
+        interp.parse(&text);
+        Ok(interp)
+    }
+
     /// Reset to beginning of program.
     pub fn reset(&mut self) {
         self.current = 0;
