@@ -186,22 +186,24 @@ impl CarvingSession {
             ));
         }
 
-        // Current segment complete — load next
-        if !self.load_next_segment() {
-            self.state = CarvingState::Complete;
-            return None;
-        }
+        // Current segment complete — keep loading until we find one with nonzero duration
+        // or the program ends. This handles high-speed or short segments that complete instantly.
+        loop {
+            if !self.load_next_segment() {
+                self.state = CarvingState::Complete;
+                return None;
+            }
 
-        // Step the newly loaded segment
-        if let Some(pos) = self.planner.step(dt) {
-            self.current_position = pos;
-            Some(Isometry3::from_parts(
-                nalgebra::Translation3::from(pos),
-                self.tool_orientation,
-            ))
-        } else {
-            self.state = CarvingState::Complete;
-            None
+            // Step with 0 dt to get the start position of the new segment
+            // (actual time advancement happens on the next call)
+            if let Some(pos) = self.planner.step(0.0) {
+                self.current_position = pos;
+                return Some(Isometry3::from_parts(
+                    nalgebra::Translation3::from(pos),
+                    self.tool_orientation,
+                ));
+            }
+            // Segment completed immediately (zero-length slipped through) — try next
         }
     }
 

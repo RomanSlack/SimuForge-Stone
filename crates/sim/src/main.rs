@@ -39,6 +39,9 @@ use simuforge_render::pipelines::composite::CompositePipeline;
 use simuforge_render::pipelines::line::{LinePipeline, LineVertex};
 use simuforge_render::pipelines::overlay::{OverlayBuilder, OverlayPipeline};
 
+mod config;
+use config::SimConfig;
+
 /// Coordinate swap: DH Z-up physics → Y-up renderer.
 fn coord_swap_matrix() -> Mat4 {
     Mat4::from_cols(
@@ -97,9 +100,6 @@ const ARM_LINK_COLORS: [[f32; 4]; 6] = [
 const PHYSICS_DT: f64 = 1.0 / 1000.0;
 /// Maximum accumulated time before clamping (prevent spiral of death).
 const MAX_FRAME_TIME: f64 = 0.05;
-/// Maximum physics steps per frame (prevents spiral of death at high speed).
-const MAX_PHYSICS_STEPS_PER_FRAME: u32 = 2000;
-
 /// Simulation mode: manual keyboard control or automated G-code carving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SimMode {
@@ -108,7 +108,7 @@ enum SimMode {
 }
 
 /// Speed multiplier presets for carving.
-const SPEED_PRESETS: &[f64] = &[0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0];
+const SPEED_PRESETS: &[f64] = &[0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0];
 
 /// Full simulation state.
 #[allow(dead_code)]
@@ -122,6 +122,8 @@ struct SimState {
     /// Workpiece center in DH world-space (meters).
     /// The SDF is always centered at origin; this offset maps tool→workpiece coords.
     workpiece_center: Vector3<f64>,
+    /// Workpiece half-extent (meters). The block is a cube of side = 2 * half_extent.
+    workpiece_half_extent: f64,
     tool: Tool,
     tool_state: ToolState,
     rotary_table: RotaryTable,
@@ -139,10 +141,12 @@ struct SimState {
     carving: Option<CarvingSession>,
     /// Current mode: Manual or Carving.
     mode: SimMode,
+    /// Arm must be within this distance of target before cutting begins (m).
+    tracking_threshold: f64,
 }
 
 impl SimState {
-    fn new() -> Self {
+    fn new(cfg: &SimConfig) -> Self {
         let arm = RobotArm::default_6dof();
         let n = arm.num_joints();
 
@@ -181,22 +185,25 @@ impl SimState {
 
         // Set initial joint angles to match targets (start at the target pose)
         let mut arm = arm;
-        // Tool offset: 150mm Dremel body + 25mm cutting bit = 175mm from flange to tip
-        arm.tool_offset = 0.175;
+        arm.tool_offset = cfg.tool_offset;
         arm.set_joint_angles(&joint_targets);
 
-        // 1ft (305mm) marble block, 0.5mm resolution
-        let half_extent = 0.1525; // ~6 inches = 152.5mm
+        let he = cfg.workpiece_half_extent;
         let workpiece = OctreeSdf::new_block(
-            [half_extent, half_extent, half_extent],
-            0.0005, // 0.5mm
+            [he as f32, he as f32, he as f32],
+            cfg.workpiece_resolution as f32,
         );
 
-        // Workpiece positioned for natural top-down milling posture.
-        // At (0.65, 0, -0.05): top at Z=0.1025, the arm reaches forward naturally.
-        let workpiece_center = Vector3::new(0.65, 0.0, -0.05);
+        let workpiece_center = Vector3::new(
+            cfg.workpiece_center[0],
+            cfg.workpiece_center[1],
+            cfg.workpiece_center[2],
+        );
 
-        let tool = Tool::flat_end(8.0, 25.0); // 8mm radius flat end mill, 25mm cutting length
+        let tool = match cfg.tool_type.as_str() {
+            "ball_nose" => Tool::ball_nose(cfg.tool_radius_mm, cfg.tool_cutting_length_mm),
+            _ => Tool::flat_end(cfg.tool_radius_mm, cfg.tool_cutting_length_mm),
+        };
         let mut tool_state = ToolState::new();
         // Initialize frame_start_position to the current tool tip
         // so the first frame doesn't create a huge swept path from origin.
@@ -210,6 +217,13 @@ impl SimState {
         // Cartesian target = initial tool tip pose (position + orientation)
         let cartesian_target = arm.forward_kinematics();
 
+        eprintln!(
+            "Config: tool={}({:.1}mm), workpiece=({:.2},{:.2},{:.2}), speed={}x",
+            cfg.tool_type, cfg.tool_radius_mm,
+            cfg.workpiece_center[0], cfg.workpiece_center[1], cfg.workpiece_center[2],
+            cfg.default_speed,
+        );
+
         Self {
             arm,
             motors,
@@ -218,16 +232,17 @@ impl SimState {
             joint_targets,
             workpiece,
             workpiece_center,
+            workpiece_half_extent: he,
             tool,
             tool_state,
             rotary_table,
             material: MaterialProps::marble(),
             ik_solver: IkSolver {
                 damping: 0.05,
-                max_iterations: 50,        // 6DOF needs more iterations than position-only
-                position_tolerance: 5e-4,  // 0.5mm
-                orientation_tolerance: 0.005, // ~0.3° — must be tighter than per-frame rotation step
-                max_step: 0.2,             // ~11.5° per iteration
+                max_iterations: 50,
+                position_tolerance: 5e-4,
+                orientation_tolerance: 0.005,
+                max_step: 0.2,
             },
             sim_time: 0.0,
             paused: true,
@@ -236,6 +251,7 @@ impl SimState {
             ik_converged: true,
             carving: None,
             mode: SimMode::Manual,
+            tracking_threshold: cfg.tracking_threshold,
         }
     }
 
@@ -371,7 +387,7 @@ impl SimState {
     /// Load a G-code file into a carving session and switch to carving mode.
     fn load_gcode(&mut self, path: &str) -> Result<(), String> {
         // G-code origin = top-center of workpiece (Z=0 is the surface).
-        let half_extent = 0.1525;
+        let half_extent = self.workpiece_half_extent;
         let workpiece_top_center = Vector3::new(
             self.workpiece_center.x,
             self.workpiece_center.y,
@@ -482,6 +498,22 @@ impl SimState {
             return;
         }
 
+        // Don't cut if the arm is still catching up from a rapid repositioning.
+        // At higher speeds the carving session races ahead of arm physics —
+        // the session may already be on a cutting segment while the arm is
+        // still moving to the start position.
+        if self.mode == SimMode::Carving {
+            let target_pos = self.cartesian_target.translation.vector;
+            let actual_pos = self.tool_state.position;
+            let tracking_error = (target_pos - actual_pos).norm();
+            if tracking_error > self.tracking_threshold {
+                // Arm too far from target — still repositioning, don't cut
+                self.cutting_force_magnitude = 0.0;
+                self.tool_state.frame_start_position = self.tool_state.position;
+                return;
+            }
+        }
+
         // Get accumulated tool path for this frame
         let (start_world, end_world) = match self.tool_state.begin_frame() {
             Some(path) => path,
@@ -497,7 +529,7 @@ impl SimState {
         let end = end_world - wc;
 
         // Quick AABB check: is the tool anywhere near the workpiece?
-        let half = 0.1525_f64 + 0.02; // workpiece half-extent + margin
+        let half = self.workpiece_half_extent + 0.02; // workpiece half-extent + margin
         let tp = end;
         if tp.x.abs() > half || tp.y.abs() > half || tp.z.abs() > half {
             self.cutting_force_magnitude = 0.0;
@@ -572,13 +604,17 @@ struct App {
     // Carving / toolpath visualization
     line_pipeline: Option<LinePipeline>,
     speed_multiplier: f64,
+    max_physics_steps: u32,
     gcode_path: Option<String>,
     // Background meshing
     async_mesher: AsyncMesher,
+    // Config-derived visual params
+    tool_radius_m: f64,
+    tool_cutting_length_m: f64,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(cfg: &SimConfig) -> Self {
         Self {
             window: None,
             render_ctx: None,
@@ -590,7 +626,7 @@ impl App {
             overlay_pipeline: None,
             camera: OrbitCamera::new(),
             chunk_meshes: ChunkMeshManager::new(),
-            sim: SimState::new(),
+            sim: SimState::new(cfg),
             last_frame: Instant::now(),
             accumulator: 0.0,
             mouse_pressed: false,
@@ -612,10 +648,13 @@ impl App {
             tool_body_material: None,
             tool_tip_material: None,
             line_pipeline: None,
-            speed_multiplier: 1.0,
+            speed_multiplier: cfg.default_speed,
+            max_physics_steps: cfg.max_physics_steps,
             gcode_path: None,
             held_keys: HeldKeys::default(),
             async_mesher: AsyncMesher::new(0),
+            tool_radius_m: cfg.tool_radius_mm * 0.001,
+            tool_cutting_length_m: cfg.tool_cutting_length_mm * 0.001,
         }
     }
 
@@ -842,12 +881,12 @@ impl App {
                 ctx.queue.write_buffer(&tb_mat.buffer, 0, bytemuck::bytes_of(&mat));
             }
 
-            // Tool tip (cutting bit): 25mm long, 8mm radius
-            let tip_end_dh = body_end_dh + tool_z_dh * 0.025;
+            // Tool tip (cutting bit): visual matches config
+            let tip_end_dh = body_end_dh + tool_z_dh * self.tool_cutting_length_m as f32;
             let tip_to = swap.transform_point3(tip_end_dh);
 
             if let Some(tt_mat) = &self.tool_tip_material {
-                let model = link_model(body_to, tip_to, 0.008);
+                let model = link_model(body_to, tip_to, self.tool_radius_m as f32);
                 let mat = MaterialUniform::metal([0.85, 0.85, 0.90, 1.0])
                     .with_model(model.to_cols_array_2d());
                 ctx.queue.write_buffer(&tt_mat.buffer, 0, bytemuck::bytes_of(&mat));
@@ -1355,7 +1394,7 @@ impl App {
         // Tool position relative to workpiece
         let wc = &self.sim.workpiece_center;
         let local = tp - wc;
-        let half = 0.1525;
+        let half = self.sim.workpiece_half_extent;
         let inside = local.x.abs() < half && local.y.abs() < half && local.z.abs() < half;
         let inside_color = if inside { green } else { red };
         let inside_text = if inside { "IN BLOCK" } else { "OUTSIDE" };
@@ -1802,7 +1841,7 @@ impl ApplicationHandler for App {
                 self.accumulator += physics_dt_budget;
 
                 let mut steps = 0u32;
-                while self.accumulator >= PHYSICS_DT && steps < MAX_PHYSICS_STEPS_PER_FRAME {
+                while self.accumulator >= PHYSICS_DT && steps < self.max_physics_steps {
                     self.sim.physics_step();
                     self.accumulator -= PHYSICS_DT;
                     steps += 1;
@@ -1842,10 +1881,13 @@ fn main() {
         eprintln!("G-code file: {}", path);
     }
 
+    // Load config from config.toml (falls back to defaults if missing)
+    let cfg = SimConfig::from_file(std::path::Path::new("config.toml"));
+
     let event_loop = EventLoop::new().expect("Failed to create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    let mut app = App::new();
+    let mut app = App::new(&cfg);
     app.gcode_path = gcode_path;
     event_loop.run_app(&mut app).expect("Event loop error");
 }

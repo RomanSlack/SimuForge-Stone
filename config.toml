@@ -1,0 +1,31 @@
+# SimuForge-Stone Configuration
+# Edit these values and restart to apply.
+
+[tool]
+# Tool type: "flat_end" or "ball_nose"
+type = "flat_end"
+# Cutting radius (mm)
+radius_mm = 5.0
+# Cutting length (mm)
+cutting_length_mm = 25.0
+# Tool offset from flange to tip (m) — Dremel body + bit
+tool_offset = 0.175
+
+[workpiece]
+# Workpiece center in DH coordinates (meters)
+center_x = 0.65
+center_y = 0.0
+center_z = -0.05
+# Half-extent of the cube (meters). 0.1525 = ~6 inches = 305mm cube
+half_extent = 0.1525
+# Octree voxel resolution (meters). Smaller = finer detail but more memory.
+resolution = 0.0005
+
+[carving]
+# Default speed multiplier (1.0 = realtime)
+default_speed = 5.0
+# Maximum physics steps per frame (higher = better tracking at high speed)
+max_physics_steps = 5000
+# Tracking error threshold (m) — arm must be within this distance of
+# target before cutting begins. Prevents spurious cuts during repositioning.
+tracking_threshold = 0.01
