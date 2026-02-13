@@ -142,6 +142,8 @@ struct SimState {
     mode: SimMode,
     /// Arm must be within this distance of target before cutting begins (m).
     tracking_threshold: f64,
+    /// Orientation weight for IK during carving (0.0=position-only, 1.0=full 6DOF).
+    orientation_weight: f64,
 }
 
 impl SimState {
@@ -251,6 +253,7 @@ impl SimState {
             carving: None,
             mode: SimMode::Manual,
             tracking_threshold: cfg.tracking_threshold,
+            orientation_weight: cfg.orientation_weight,
         }
     }
 
@@ -264,9 +267,10 @@ impl SimState {
         scratch.set_joint_angles(&self.joint_targets);
 
         let converged = if self.mode == SimMode::Carving {
-            // Position-only IK: no orientation constraint → smooth tracking
-            let target_pos = self.cartesian_target.translation.vector;
-            let (ok, _, _) = self.ik_solver.solve_position(&mut scratch, &target_pos);
+            // Weighted IK: gentle orientation bias keeps tool pointing down
+            let (ok, _, _) = self.ik_solver.solve_weighted(
+                &mut scratch, &self.cartesian_target, self.orientation_weight,
+            );
             ok
         } else {
             // Full 6DOF IK: user controls orientation via IJKL keys
@@ -396,10 +400,11 @@ impl SimState {
             self.workpiece_center.z + half_extent,
         );
 
-        // --- Position-only IK pre-positioning ---
-        // Use position-only IK with high-J5 seeds. The arm finds its own natural
-        // orientation to reach above the workpiece. No orientation fighting.
+        // --- Weighted IK pre-positioning with tool-down orientation ---
+        // Rx(π) = tool Z pointing downward in DH frame.
+        let pi = std::f64::consts::PI;
         let pi2 = std::f64::consts::FRAC_PI_2;
+        let tool_down = UnitQuaternion::from_axis_angle(&Vector3::x_axis(), pi);
 
         // Desired position: 15mm above workpiece top center
         let start_pos = Vector3::new(
@@ -407,18 +412,19 @@ impl SimState {
             workpiece_top_center.y,
             workpiece_top_center.z + 0.015,
         );
+        let start_target = nalgebra::Isometry3::from_parts(
+            nalgebra::Translation3::from(start_pos),
+            tool_down,
+        );
 
-        // IK seeds: various J2/J3/J5 combos. Position-only IK lets the arm
-        // find whatever orientation is natural from these starting poses.
+        // IK seeds: J2+J3 ≈ π/2 for tool-straight-down.
+        // Backward wrist (J5=+π/2) is primary for x<0.8.
         let seeds: &[[f64; 6]] = &[
-            [0.0, 0.6, 0.2, 0.0, pi2, 0.0],
-            [0.0, 0.5, 0.3, 0.0, pi2, 0.0],
-            [0.0, 0.7, 0.1, 0.0, pi2, 0.0],
-            [0.0, 0.4, 0.4, 0.0, pi2, 0.0],
-            [0.0, 0.8, 0.0, 0.0, pi2, 0.0],
-            [0.0, 0.3, 0.5, 0.0, pi2, 0.0],
-            [0.0, 0.6, 0.2, 0.0, 1.2, 0.0],
-            [0.0, 0.5, 0.3, 0.0, 1.0, 0.0],
+            [0.0, 1.0, 0.57, 0.0, pi2, 0.0],
+            [0.0, 0.9, 0.67, 0.0, pi2, 0.0],
+            [0.0, 0.8, 0.77, 0.0, pi2, 0.0],
+            [0.0, 1.1, 0.47, 0.0, pi2, 0.0],
+            [0.0, 1.0, 0.57, pi, -pi2, 0.0], // forward wrist variant
         ];
 
         let mut best_angles: Option<Vec<f64>> = None;
@@ -426,7 +432,10 @@ impl SimState {
         for seed in seeds {
             let mut scratch = self.arm.clone();
             scratch.set_joint_angles(&seed.to_vec());
-            let (ok, _, final_err) = self.ik_solver.solve_position(&mut scratch, &start_pos);
+            // Stronger orientation weight for pre-positioning (arm is stationary)
+            let (ok, _, final_err) = self.ik_solver.solve_weighted(
+                &mut scratch, &start_target, 0.5,
+            );
             if ok && final_err < best_err {
                 best_err = final_err;
                 best_angles = Some(scratch.joint_angles());
@@ -526,9 +535,12 @@ impl SimState {
         };
 
         // Transform to workpiece-local coordinates (SDF is centered at origin)
+        // Apply inverse rotary table rotation so tool path maps to SDF local frame
         let wc = self.workpiece_center;
-        let start = start_world - wc;
-        let end = end_world - wc;
+        let angle = self.rotary_table.angle;
+        let rot_inv = nalgebra::Rotation3::from_axis_angle(&Vector3::x_axis(), -angle);
+        let start = rot_inv * (start_world - wc);
+        let end = rot_inv * (end_world - wc);
 
         // Quick AABB check: is the tool anywhere near the workpiece?
         let half = self.workpiece_half_extent + 0.02; // workpiece half-extent + margin
@@ -818,7 +830,9 @@ impl App {
         let translate_dh = Mat4::from_translation(Vec3::new(
             wc.x as f32, wc.y as f32, wc.z as f32,
         ));
-        let workpiece_model = swap * translate_dh;
+        let table_angle = self.sim.rotary_table.angle as f32;
+        let rot_a = Mat4::from_axis_angle(Vec3::X, table_angle);
+        let workpiece_model = swap * translate_dh * rot_a;
 
         // Arm link frames → render-space positions
         let frames = self.sim.arm.link_frames();
@@ -2105,11 +2119,22 @@ impl ApplicationHandler for App {
                 if self.sim.mode == SimMode::Carving {
                     if let Some(session) = &mut self.sim.carving {
                         if session.state == CarvingState::Running {
+                            // Drive rotary table toward A-axis target with PD control
+                            let a_target = session.a_axis_target;
+                            let a_err = a_target - self.sim.rotary_table.angle;
+                            self.sim.rotary_table.torque =
+                                200.0 * a_err - 40.0 * self.sim.rotary_table.velocity;
+
+                            // Gate carving during table rotation: if error > ~1°, pause session
+                            let table_settled = a_err.abs() < 0.02;
+
                             let scaled_dt = clamped_frame_time * self.speed_multiplier;
-                            if let Some(target) = session.step(scaled_dt) {
-                                self.sim.cartesian_target = target;
+                            if table_settled {
+                                if let Some(target) = session.step(scaled_dt) {
+                                    self.sim.cartesian_target = target;
+                                }
                             }
-                            self.sim.tool_state.spindle_on = session.spindle_on;
+                            self.sim.tool_state.spindle_on = session.spindle_on && table_settled;
                             self.sim.paused = false;
                         }
                     }

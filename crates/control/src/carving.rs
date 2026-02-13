@@ -43,6 +43,8 @@ pub struct CarvingSession {
     pub is_rapid: bool,
     pub elapsed_time: f64,
     pub estimated_total_time: f64,
+    /// A-axis (rotary table) target angle in radians from G-code.
+    pub a_axis_target: f64,
 }
 
 impl CarvingSession {
@@ -104,6 +106,7 @@ impl CarvingSession {
             is_rapid: true,
             elapsed_time: 0.0,
             estimated_total_time: total_time,
+            a_axis_target: 0.0,
         })
     }
 
@@ -164,6 +167,7 @@ impl CarvingSession {
         self.spindle_on = false;
         self.is_rapid = true;
         self.elapsed_time = 0.0;
+        self.a_axis_target = 0.0;
     }
 
     /// Advance the carving by dt seconds. Returns the next Cartesian target pose, or None when complete.
@@ -230,10 +234,11 @@ impl CarvingSession {
             }
 
             // Get next motion target
-            let (target_pos, feed_rate, _a) = match self.gcode.next_target() {
+            let (target_pos, feed_rate, a) = match self.gcode.next_target() {
                 Some(t) => t,
                 None => return false,
             };
+            self.a_axis_target = a;
 
             // Detect rapid moves (feed rate matches rapid_rate)
             self.is_rapid = (feed_rate - self.gcode.rapid_rate).abs() < 1e-6;

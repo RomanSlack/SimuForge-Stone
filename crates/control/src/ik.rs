@@ -100,6 +100,59 @@ impl IkSolver {
         (false, self.max_iterations, final_error)
     }
 
+    /// Solve IK with weighted orientation bias.
+    /// `orientation_weight` of 0.0 = position-only, 1.0 = full 6DOF.
+    /// Returns (converged, iterations, position_error).
+    pub fn solve_weighted(
+        &self,
+        arm: &mut RobotArm,
+        target: &Isometry3<f64>,
+        orientation_weight: f64,
+    ) -> (bool, u32, f64) {
+        let w = orientation_weight.clamp(0.0, 1.0);
+
+        for iter in 0..self.max_iterations {
+            let current = arm.forward_kinematics();
+            let error = pose_error(&current, target);
+
+            let pos_err = Vector3::new(error[3], error[4], error[5]).norm();
+            let rot_err = Vector3::new(error[0], error[1], error[2]).norm();
+
+            // Convergence: position uses standard tolerance; orientation relaxed
+            let ori_tol = if w > 1e-9 {
+                self.orientation_tolerance / w
+            } else {
+                f64::MAX // no orientation constraint
+            };
+            if pos_err < self.position_tolerance && rot_err < ori_tol {
+                return (true, iter, pos_err);
+            }
+
+            let jac = arm.jacobian();
+
+            // Weight the orientation rows (0..3) of both Jacobian and error
+            let mut weighted_jac = jac.clone();
+            let mut weighted_error = DVector::from_column_slice(error.as_slice());
+            for row in 0..3 {
+                for col in 0..weighted_jac.ncols() {
+                    weighted_jac[(row, col)] *= w;
+                }
+                weighted_error[row] *= w;
+            }
+
+            let dq = self.damped_least_squares_rect(&weighted_jac, &weighted_error);
+
+            for (i, joint) in arm.joints.iter_mut().enumerate() {
+                let step = dq[i].clamp(-self.max_step, self.max_step);
+                joint.angle += step;
+                joint.angle = joint.angle.clamp(joint.angle_min, joint.angle_max);
+            }
+        }
+
+        let final_pos_err = (target.translation.vector - arm.tool_position()).norm();
+        (false, self.max_iterations, final_pos_err)
+    }
+
     /// Damped least-squares pseudoinverse: dq = J^T (J J^T + λ²I)^{-1} e
     fn damped_least_squares(
         &self,
@@ -163,6 +216,50 @@ mod tests {
             error,
             converged,
             iters
+        );
+    }
+
+    #[test]
+    fn test_ik_weighted_orientation_bias() {
+        use nalgebra::{Isometry3, Translation3, UnitQuaternion};
+
+        let solver = IkSolver {
+            max_iterations: 200,
+            position_tolerance: 1e-3,
+            max_step: 0.2,
+            ..IkSolver::default()
+        };
+
+        // Tool-down target: Rx(π) means tool Z points down (-Z in DH)
+        let target_pos = Vector3::new(0.5, 0.0, 0.3);
+        let tool_down = UnitQuaternion::from_axis_angle(&Vector3::x_axis(), std::f64::consts::PI);
+        let target = Isometry3::from_parts(Translation3::from(target_pos), tool_down);
+
+        // First solve position-only to get close, then refine with orientation
+        let mut arm = RobotArm::default_6dof();
+        let seed = [0.0, 0.8, 0.3, 0.0, std::f64::consts::FRAC_PI_2, 0.0];
+        arm.set_joint_angles(&seed.to_vec());
+
+        // Position-only first to get into workspace
+        let pos_solver = IkSolver { max_iterations: 50, ..solver.clone() };
+        pos_solver.solve_position(&mut arm, &target_pos);
+
+        // Then refine with orientation weight
+        let (_, _, pos_err) = solver.solve_weighted(&mut arm, &target, 0.2);
+
+        assert!(
+            pos_err < 0.01,
+            "Weighted IK position error too large: {:.4}m",
+            pos_err
+        );
+
+        // Check tool Z has a significant downward component (negative Z in DH)
+        let fk = arm.forward_kinematics();
+        let tool_z = fk.rotation * Vector3::z();
+        assert!(
+            tool_z.z < 0.0,
+            "Tool Z should have downward component, got ({:.2},{:.2},{:.2})",
+            tool_z.x, tool_z.y, tool_z.z
         );
     }
 }
