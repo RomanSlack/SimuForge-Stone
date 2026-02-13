@@ -6,6 +6,12 @@ use crate::mesh::vertex_buffer_layout;
 /// Shadow map resolution.
 pub const SHADOW_MAP_SIZE: u32 = 2048;
 
+/// Maximum number of shadow-casting objects per frame.
+pub const MAX_SHADOW_OBJECTS: usize = 32;
+
+/// Uniform buffer offset alignment (conservative value matching wgpu default limits).
+const UNIFORM_ALIGNMENT: usize = 256;
+
 /// Shadow map pipeline and resources.
 pub struct ShadowPipeline {
     pub pipeline: wgpu::RenderPipeline,
@@ -62,9 +68,12 @@ impl ShadowPipeline {
             ..Default::default()
         });
 
+        // Dynamic uniform buffer: holds up to MAX_SHADOW_OBJECTS matrices, each
+        // aligned to UNIFORM_ALIGNMENT bytes. This allows per-object shadow matrices
+        // within a single render pass using dynamic offsets.
         let light_matrix_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Light Matrix"),
-            size: std::mem::size_of::<LightMatrixUniform>() as u64,
+            label: Some("Shadow Light Matrices"),
+            size: (MAX_SHADOW_OBJECTS * UNIFORM_ALIGNMENT) as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -78,8 +87,8 @@ impl ShadowPipeline {
                         visibility: wgpu::ShaderStages::VERTEX,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
+                            has_dynamic_offset: true,
+                            min_binding_size: wgpu::BufferSize::new(64), // mat4x4<f32>
                         },
                         count: None,
                     }],
@@ -92,7 +101,11 @@ impl ShadowPipeline {
                 layout: &bind_group_layout,
                 entries: &[wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: light_matrix_buffer.as_entire_binding(),
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &light_matrix_buffer,
+                        offset: 0,
+                        size: wgpu::BufferSize::new(64), // one mat4x4<f32>
+                    }),
                 }],
             });
 
@@ -164,7 +177,22 @@ impl ShadowPipeline {
         proj * view
     }
 
-    pub fn update_light_matrix(&self, queue: &wgpu::Queue, matrix: &LightMatrixUniform) {
-        queue.write_buffer(&self.light_matrix_buffer, 0, bytemuck::bytes_of(matrix));
+    /// Upload an array of pre-multiplied `light_vp * model` matrices for shadow rendering.
+    /// Each matrix is placed at UNIFORM_ALIGNMENT intervals for dynamic offset access.
+    pub fn upload_matrices(&self, queue: &wgpu::Queue, matrices: &[glam::Mat4]) {
+        assert!(matrices.len() <= MAX_SHADOW_OBJECTS);
+        let mut data = vec![0u8; matrices.len() * UNIFORM_ALIGNMENT];
+        for (i, m) in matrices.iter().enumerate() {
+            let cols = m.to_cols_array_2d();
+            let bytes = bytemuck::bytes_of(&cols);
+            let offset = i * UNIFORM_ALIGNMENT;
+            data[offset..offset + 64].copy_from_slice(bytes);
+        }
+        queue.write_buffer(&self.light_matrix_buffer, 0, &data);
+    }
+
+    /// Dynamic offset for the i-th shadow object.
+    pub fn dynamic_offset(index: usize) -> u32 {
+        (index * UNIFORM_ALIGNMENT) as u32
     }
 }

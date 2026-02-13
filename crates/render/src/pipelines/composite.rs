@@ -57,7 +57,7 @@ impl CompositePipeline {
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                     label: Some("Composite Bind Group Layout"),
                     entries: &[
-                        // Scene color texture
+                        // Scene color texture (SSS output)
                         wgpu::BindGroupLayoutEntry {
                             binding: 0,
                             visibility: wgpu::ShaderStages::FRAGMENT,
@@ -85,6 +85,17 @@ impl CompositePipeline {
                                 ty: wgpu::BufferBindingType::Uniform,
                                 has_dynamic_offset: false,
                                 min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        // SSAO texture
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
                             },
                             count: None,
                         },
@@ -135,5 +146,42 @@ impl CompositePipeline {
             params_buffer,
             bind_group_layout,
         }
+    }
+
+    /// Create a bind group for the composite pass.
+    pub fn create_bind_group(
+        &self,
+        device: &wgpu::Device,
+        scene_view: &wgpu::TextureView,
+        ssao_view: &wgpu::TextureView,
+        sampler: &wgpu::Sampler,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Composite Bind Group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(scene_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(ssao_view),
+                },
+            ],
+        })
+    }
+
+    /// Update composite parameters.
+    pub fn update_params(&self, queue: &wgpu::Queue, params: &CompositeParams) {
+        queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(params));
     }
 }

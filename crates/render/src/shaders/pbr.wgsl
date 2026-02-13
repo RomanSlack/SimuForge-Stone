@@ -20,9 +20,15 @@ struct MaterialUniform {
     model: mat4x4<f32>,
 };
 
+// Group 0: per-material uniforms
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
 @group(0) @binding(1) var<uniform> light: LightUniform;
 @group(0) @binding(2) var<uniform> material: MaterialUniform;
+
+// Group 1: shadow map resources
+@group(1) @binding(0) var shadow_map: texture_depth_2d;
+@group(1) @binding(1) var shadow_sampler: sampler_comparison;
+@group(1) @binding(2) var<uniform> shadow_light_vp: mat4x4<f32>;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
@@ -75,6 +81,33 @@ fn fresnel_schlick(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
     return f0 + (1.0 - f0) * pow(clamp(1.0 - cos_theta, 0.0, 1.0), 5.0);
 }
 
+// 4-tap PCF shadow sampling
+fn compute_shadow(world_pos: vec3<f32>) -> f32 {
+    let light_space = shadow_light_vp * vec4<f32>(world_pos, 1.0);
+    let ndc = light_space.xyz / light_space.w;
+
+    // UV in shadow map: NDC [-1,1] → UV [0,1], flip Y
+    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, -ndc.y * 0.5 + 0.5);
+
+    // Outside shadow map bounds → no shadow
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z < 0.0 || ndc.z > 1.0) {
+        return 1.0;
+    }
+
+    let current_depth = ndc.z;
+    let texel_size = 1.0 / 2048.0;
+
+    // 2x2 PCF filter
+    var shadow = 0.0;
+    shadow += textureSampleCompare(shadow_map, shadow_sampler, uv + vec2(-0.5, -0.5) * texel_size, current_depth);
+    shadow += textureSampleCompare(shadow_map, shadow_sampler, uv + vec2( 0.5, -0.5) * texel_size, current_depth);
+    shadow += textureSampleCompare(shadow_map, shadow_sampler, uv + vec2(-0.5,  0.5) * texel_size, current_depth);
+    shadow += textureSampleCompare(shadow_map, shadow_sampler, uv + vec2( 0.5,  0.5) * texel_size, current_depth);
+    shadow = shadow * 0.25;
+
+    return shadow;
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let albedo = material.base_color.rgb;
@@ -110,10 +143,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let diffuse = kd * albedo / 3.14159265;
 
     let radiance = light.color.rgb * light.color.w;
-    let lo = (diffuse + specular) * radiance * n_dot_l;
 
-    // Ambient
-    let ambient = light.ambient.rgb * light.ambient.w * albedo;
+    // Shadow factor (1.0 = fully lit, 0.0 = fully shadowed)
+    let shadow = compute_shadow(in.world_pos);
+
+    let lo = (diffuse + specular) * radiance * n_dot_l * shadow;
+
+    // Ambient with subtle hemisphere: slightly brighter from above
+    let hemisphere = dot(n, vec3(0.0, 1.0, 0.0)) * 0.5 + 0.5;
+    let ambient_factor = mix(0.7, 1.0, hemisphere);
+    let ambient = light.ambient.rgb * light.ambient.w * albedo * ambient_factor;
 
     var color = ambient + lo;
 
@@ -129,7 +168,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let vein = sin(in.world_pos.x * 40.0 + in.world_pos.y * 20.0 +
                        sin(in.world_pos.z * 30.0) * 2.0) * 0.5 + 0.5;
         let vein_color = mix(albedo, vec3<f32>(0.75, 0.73, 0.7), vein * 0.15);
-        color = mix(color, vein_color * (ambient + radiance * n_dot_l), subsurface * 0.3);
+        color = mix(color, vein_color * (ambient + radiance * n_dot_l * shadow), subsurface * 0.3);
     }
 
     // Grid floor pattern (activated when params.w < 0)
@@ -137,10 +176,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let gx = abs(fract(in.world_pos.x * 10.0 + 0.5) - 0.5);
         let gz = abs(fract(in.world_pos.z * 10.0 + 0.5) - 0.5);
         let line = min(gx, gz);
-        let grid_alpha = 1.0 - smoothstep(0.0, 0.025, line);
-        let grid_color = vec3<f32>(0.45, 0.47, 0.50);
-        color = mix(color, grid_color, grid_alpha * 0.6);
+        let grid_alpha = 1.0 - smoothstep(0.0, 0.02, line);
+        let grid_color = vec3<f32>(0.35, 0.38, 0.42);
+        color = mix(color, grid_color, grid_alpha * 0.5);
+
+        // Fade grid at distance for cleaner look
+        let dist = length(in.world_pos.xz - camera.eye_pos.xz);
+        let fade = 1.0 - smoothstep(1.0, 4.0, dist);
+        color = mix(albedo * ambient_factor * light.ambient.w * light.ambient.rgb, color, fade);
     }
 
+    // Output linear HDR (no tone mapping — composite pass handles that)
     return vec4<f32>(color, 1.0);
 }

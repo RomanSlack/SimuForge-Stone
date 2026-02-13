@@ -12,6 +12,7 @@ pub struct RenderContext {
     pub config: wgpu::SurfaceConfiguration,
     pub size: winit::dpi::PhysicalSize<u32>,
     pub depth_texture: wgpu::TextureView,
+    pub hdr_texture: wgpu::TextureView,
 }
 
 impl RenderContext {
@@ -69,6 +70,7 @@ impl RenderContext {
         surface.configure(&device, &config);
 
         let depth_texture = create_depth_texture(&device, &config);
+        let hdr_texture = create_hdr_texture(&device, &config);
 
         Self {
             instance,
@@ -78,6 +80,7 @@ impl RenderContext {
             config,
             size,
             depth_texture,
+            hdr_texture,
         }
     }
 
@@ -89,6 +92,7 @@ impl RenderContext {
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
             self.depth_texture = create_depth_texture(&self.device, &self.config);
+            self.hdr_texture = create_hdr_texture(&self.device, &self.config);
         }
     }
 
@@ -106,6 +110,9 @@ impl RenderContext {
 /// Depth texture format used throughout the renderer.
 pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
+/// HDR offscreen texture format (linear, no sRGB).
+pub const HDR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
+
 /// Create a depth texture matching the surface config dimensions.
 pub fn create_depth_texture(
     device: &wgpu::Device,
@@ -122,6 +129,28 @@ pub fn create_depth_texture(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+/// Create an HDR offscreen texture matching the surface config dimensions.
+pub fn create_hdr_texture(
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+) -> wgpu::TextureView {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("HDR Texture"),
+        size: wgpu::Extent3d {
+            width: config.width.max(1),
+            height: config.height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: HDR_FORMAT,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     });

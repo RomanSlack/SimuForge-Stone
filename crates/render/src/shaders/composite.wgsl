@@ -10,6 +10,7 @@ struct CompositeParams {
 @group(0) @binding(0) var scene_tex: texture_2d<f32>;
 @group(0) @binding(1) var tex_sampler: sampler;
 @group(0) @binding(2) var<uniform> params: CompositeParams;
+@group(0) @binding(3) var ssao_tex: texture_2d<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -38,7 +39,18 @@ fn aces_tonemap(color: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    var color = textureSample(scene_tex, tex_sampler, in.uv).rgb;
+    let scene = textureSample(scene_tex, tex_sampler, in.uv);
+
+    // Discard sky pixels (HDR pass outputs alpha=0 where no geometry was drawn)
+    if (scene.a < 0.01) {
+        discard;
+    }
+
+    var color = scene.rgb;
+
+    // Apply SSAO
+    let ao = textureSample(ssao_tex, tex_sampler, in.uv).r;
+    color = color * mix(1.0, ao, params.ssao_strength);
 
     // Apply exposure
     color = color * params.exposure;

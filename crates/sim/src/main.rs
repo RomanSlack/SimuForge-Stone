@@ -33,13 +33,13 @@ use simuforge_render::context::RenderContext;
 use simuforge_render::mesh::ChunkMeshManager;
 use simuforge_render::pipelines::pbr::{LightUniform, MaterialUniform, PbrPipeline};
 use simuforge_render::pipelines::shadow::ShadowPipeline;
-use simuforge_render::pipelines::ssao::SsaoPipeline;
-use simuforge_render::pipelines::sss::SssPipeline;
-use simuforge_render::pipelines::composite::CompositePipeline;
+use simuforge_render::pipelines::ssao::{SsaoPipeline, SsaoParams};
+use simuforge_render::pipelines::sss::{SssPipeline, SssParams};
+use simuforge_render::pipelines::composite::{CompositePipeline, CompositeParams};
 use simuforge_render::pipelines::line::{LinePipeline, LineVertex};
-use simuforge_render::pipelines::overlay::{OverlayBuilder, OverlayPipeline};
 
 mod config;
+mod ui;
 use config::SimConfig;
 
 /// Coordinate swap: DH Z-up physics → Y-up renderer.
@@ -86,14 +86,14 @@ struct MaterialBind {
 /// Robot arm link radii for rendering (scaled up for visibility).
 const ARM_LINK_RADII: [f32; 6] = [0.08, 0.07, 0.06, 0.05, 0.05, 0.04];
 
-/// Arm link colors [R, G, B, A].
+/// Arm link colors [R, G, B, A] — industrial robot palette.
 const ARM_LINK_COLORS: [[f32; 4]; 6] = [
-    [0.3, 0.3, 0.35, 1.0],  // J1: dark gray (base)
-    [0.8, 0.4, 0.1, 1.0],   // J2: orange (upper arm)
-    [0.8, 0.4, 0.1, 1.0],   // J3: orange (forearm)
-    [0.2, 0.2, 0.25, 1.0],  // J4: dark (wrist 1)
-    [0.2, 0.2, 0.25, 1.0],  // J5: dark (wrist 2)
-    [0.6, 0.6, 0.65, 1.0],  // J6: light gray (flange)
+    [0.15, 0.15, 0.17, 1.0],  // J1: anthracite (base)
+    [0.85, 0.35, 0.05, 1.0],  // J2: industrial orange (upper arm)
+    [0.85, 0.35, 0.05, 1.0],  // J3: industrial orange (forearm)
+    [0.15, 0.15, 0.17, 1.0],  // J4: anthracite (wrist 1)
+    [0.15, 0.15, 0.17, 1.0],  // J5: anthracite (wrist 2)
+    [0.55, 0.55, 0.58, 1.0],  // J6: brushed aluminum (flange)
 ];
 
 /// Physics timestep: 1kHz.
@@ -574,7 +574,10 @@ struct App {
     ssao_pipeline: Option<SsaoPipeline>,
     sss_pipeline: Option<SssPipeline>,
     composite_pipeline: Option<CompositePipeline>,
-    overlay_pipeline: Option<OverlayPipeline>,
+    // egui immediate-mode GUI
+    egui_ctx: egui::Context,
+    egui_state: Option<egui_winit::State>,
+    egui_renderer: Option<egui_wgpu::Renderer>,
     camera: OrbitCamera,
     chunk_meshes: ChunkMeshManager,
     sim: SimState,
@@ -601,6 +604,12 @@ struct App {
     // Tool (Dremel) visual
     tool_body_material: Option<MaterialBind>,
     tool_tip_material: Option<MaterialBind>,
+    // Post-processing resources
+    post_sampler: Option<wgpu::Sampler>,
+    depth_sampler: Option<wgpu::Sampler>,
+    ssao_bind_group: Option<wgpu::BindGroup>,
+    sss_bind_group: Option<wgpu::BindGroup>,
+    composite_bind_group: Option<wgpu::BindGroup>,
     // Carving / toolpath visualization
     line_pipeline: Option<LinePipeline>,
     speed_multiplier: f64,
@@ -611,6 +620,9 @@ struct App {
     // Config-derived visual params
     tool_radius_m: f64,
     tool_cutting_length_m: f64,
+    // Cached toolpath line vertices (rebuilt only when progress changes)
+    cached_line_verts: Vec<LineVertex>,
+    cached_line_progress: usize,
 }
 
 impl App {
@@ -623,7 +635,9 @@ impl App {
             ssao_pipeline: None,
             sss_pipeline: None,
             composite_pipeline: None,
-            overlay_pipeline: None,
+            egui_ctx: egui::Context::default(),
+            egui_state: None,
+            egui_renderer: None,
             camera: OrbitCamera::new(),
             chunk_meshes: ChunkMeshManager::new(),
             sim: SimState::new(cfg),
@@ -647,6 +661,11 @@ impl App {
             target_material: None,
             tool_body_material: None,
             tool_tip_material: None,
+            post_sampler: None,
+            depth_sampler: None,
+            ssao_bind_group: None,
+            sss_bind_group: None,
+            composite_bind_group: None,
             line_pipeline: None,
             speed_multiplier: cfg.default_speed,
             max_physics_steps: cfg.max_physics_steps,
@@ -655,6 +674,8 @@ impl App {
             async_mesher: AsyncMesher::new(0),
             tool_radius_m: cfg.tool_radius_mm * 0.001,
             tool_cutting_length_m: cfg.tool_cutting_length_mm * 0.001,
+            cached_line_verts: Vec::new(),
+            cached_line_progress: usize::MAX, // force rebuild on first use
         }
     }
 
@@ -774,36 +795,26 @@ impl App {
         let cam_uniform = CameraUniform::from_camera(&self.camera, ctx.aspect());
         pbr.update_camera(&ctx.queue, &cam_uniform);
 
-        // Update light (Y-up render space)
+        // Update light — warm key light from upper-right, cool ambient fill
+        let light_dir = Vec3::new(-0.5, -0.7, -0.4);
         let light = LightUniform {
-            direction: [-0.4, -0.8, -0.3, 0.0],
-            color: [1.0, 0.98, 0.95, 3.0],
-            ambient: [0.6, 0.65, 0.7, 0.35],
+            direction: [light_dir.x, light_dir.y, light_dir.z, 0.0],
+            color: [1.0, 0.96, 0.90, 3.5],
+            ambient: [0.5, 0.55, 0.65, 0.30],
             eye_pos: cam_uniform.eye_pos,
         };
         pbr.update_light(&ctx.queue, &light);
 
-        // --- Upload material uniforms ---
+        // --- Compute model matrices for all objects ---
 
-        // Workpiece: marble with workpiece offset + coord swap as model matrix.
-        // SDF is at origin; model matrix = coord_swap * translate(workpiece_center_dh).
-        if let Some(wp) = &self.workpiece_material {
-            let wc = &self.sim.workpiece_center;
-            let translate_dh = Mat4::from_translation(Vec3::new(
-                wc.x as f32, wc.y as f32, wc.z as f32,
-            ));
-            let model = swap * translate_dh;
-            let mat = MaterialUniform::marble().with_model(model.to_cols_array_2d());
-            ctx.queue.write_buffer(&wp.buffer, 0, bytemuck::bytes_of(&mat));
-        }
+        // Workpiece model matrix: coord_swap * translate(workpiece_center)
+        let wc = &self.sim.workpiece_center;
+        let translate_dh = Mat4::from_translation(Vec3::new(
+            wc.x as f32, wc.y as f32, wc.z as f32,
+        ));
+        let workpiece_model = swap * translate_dh;
 
-        // Ground plane: identity model (already in render space)
-        if let Some(gnd) = &self.ground_material {
-            let mat = MaterialUniform::ground();
-            ctx.queue.write_buffer(&gnd.buffer, 0, bytemuck::bytes_of(&mat));
-        }
-
-        // Arm links: compute per-link model matrices from physics frames
+        // Arm link frames → render-space positions
         let frames = self.sim.arm.link_frames();
         let mut render_pts = Vec::with_capacity(7);
         for i in 0..7 {
@@ -811,103 +822,141 @@ impl App {
             render_pts.push(swap.transform_point3(Vec3::new(f.col(3).x, f.col(3).y, f.col(3).z)));
         }
 
+        // Arm link model matrices
+        let mut arm_models = Vec::with_capacity(6);
         for i in 0..6 {
-            if i >= self.arm_materials.len() {
-                break;
-            }
-            let model = link_model(render_pts[i], render_pts[i + 1], ARM_LINK_RADII[i]);
-            let mat = MaterialUniform::metal(ARM_LINK_COLORS[i])
-                .with_model(model.to_cols_array_2d());
-            ctx.queue
-                .write_buffer(&self.arm_materials[i].buffer, 0, bytemuck::bytes_of(&mat));
+            arm_models.push(link_model(render_pts[i], render_pts[i + 1], ARM_LINK_RADII[i]));
         }
 
-        // Joint sphere materials (at each frame position)
+        // Joint sphere model matrices
         let joint_sphere_radii: [f32; 7] = [0.10, 0.09, 0.08, 0.07, 0.06, 0.06, 0.05];
-        let joint_color = [0.25, 0.25, 0.30, 1.0]; // dark metallic
+        let mut joint_models = Vec::with_capacity(7);
         for i in 0..7 {
-            if i >= self.joint_materials.len() {
-                break;
-            }
-            let s = joint_sphere_radii[i];
-            let model = Mat4::from_scale_rotation_translation(
-                Vec3::splat(s),
+            joint_models.push(Mat4::from_scale_rotation_translation(
+                Vec3::splat(joint_sphere_radii[i]),
                 Quat::IDENTITY,
                 render_pts[i],
-            );
-            let mat = MaterialUniform::metal(joint_color)
-                .with_model(model.to_cols_array_2d());
-            ctx.queue
-                .write_buffer(&self.joint_materials[i].buffer, 0, bytemuck::bytes_of(&mat));
+            ));
         }
 
-        // Target point: bright sphere showing where the arm is trying to reach.
+        // Tool models
+        let flange_mat = isometry_to_glam(&self.sim.arm.flange_pose());
+        let tool_z_dh = Vec3::new(flange_mat.col(2).x, flange_mat.col(2).y, flange_mat.col(2).z);
+        let flange_pos_dh = Vec3::new(flange_mat.col(3).x, flange_mat.col(3).y, flange_mat.col(3).z);
+        let body_end_dh = flange_pos_dh + tool_z_dh * 0.15;
+        let body_from = swap.transform_point3(flange_pos_dh);
+        let body_to = swap.transform_point3(body_end_dh);
+        let tool_body_model = link_model(body_from, body_to, 0.018);
+
+        let tip_end_dh = body_end_dh + tool_z_dh * self.tool_cutting_length_m as f32;
+        let tip_to = swap.transform_point3(tip_end_dh);
+        let tool_tip_model = link_model(body_to, tip_to, self.tool_radius_m as f32);
+
+        // Base model
+        let base_pos = Vec3::new(render_pts[0].x, render_pts[0].y - 0.13, render_pts[0].z);
+        let base_model = Mat4::from_translation(base_pos);
+
+        // Target sphere model
+        let ct_pos = &self.sim.cartesian_target.translation.vector;
+        let tgt_dh = Vec3::new(ct_pos.x as f32, ct_pos.y as f32, ct_pos.z as f32);
+        let tgt_render = swap.transform_point3(tgt_dh);
+        let tgt_radius = 0.012_f32;
+        let target_model = Mat4::from_scale_rotation_translation(
+            Vec3::splat(tgt_radius),
+            Quat::IDENTITY,
+            tgt_render,
+        );
+
+        // --- Upload material uniforms ---
+        if let Some(wp) = &self.workpiece_material {
+            let mat = MaterialUniform::marble().with_model(workpiece_model.to_cols_array_2d());
+            ctx.queue.write_buffer(&wp.buffer, 0, bytemuck::bytes_of(&mat));
+        }
+        if let Some(gnd) = &self.ground_material {
+            let mat = MaterialUniform::ground();
+            ctx.queue.write_buffer(&gnd.buffer, 0, bytemuck::bytes_of(&mat));
+        }
+        let joint_color = [0.12, 0.12, 0.14, 1.0];
+        for i in 0..6 {
+            if i < self.arm_materials.len() {
+                let mat = MaterialUniform::metal(ARM_LINK_COLORS[i])
+                    .with_model(arm_models[i].to_cols_array_2d());
+                ctx.queue.write_buffer(&self.arm_materials[i].buffer, 0, bytemuck::bytes_of(&mat));
+            }
+        }
+        for i in 0..7 {
+            if i < self.joint_materials.len() {
+                let mat = MaterialUniform::metal(joint_color)
+                    .with_model(joint_models[i].to_cols_array_2d());
+                ctx.queue.write_buffer(&self.joint_materials[i].buffer, 0, bytemuck::bytes_of(&mat));
+            }
+        }
         if let Some(tgt_mat) = &self.target_material {
-            let ct_pos = &self.sim.cartesian_target.translation.vector;
-            let tgt_dh = Vec3::new(ct_pos.x as f32, ct_pos.y as f32, ct_pos.z as f32);
-            let tgt_render = swap.transform_point3(tgt_dh);
             let tgt_color = if self.sim.ik_converged {
-                [0.1, 1.0, 0.3, 1.0] // green = reachable
+                [0.1, 1.0, 0.3, 1.0]
             } else {
-                [1.0, 0.2, 0.1, 1.0] // red = unreachable
+                [1.0, 0.2, 0.1, 1.0]
             };
-            let tgt_radius = 0.012_f32; // 12mm sphere
-            let model = Mat4::from_scale_rotation_translation(
-                Vec3::splat(tgt_radius),
-                Quat::IDENTITY,
-                tgt_render,
-            );
             let mat = MaterialUniform::metal(tgt_color)
-                .with_model(model.to_cols_array_2d());
+                .with_model(target_model.to_cols_array_2d());
             ctx.queue.write_buffer(&tgt_mat.buffer, 0, bytemuck::bytes_of(&mat));
         }
-
-        // Tool (Dremel): extends from flange along its local Z-axis.
-        // Body: 150mm long, 18mm radius cylinder (gray). Tip: 25mm, 8mm radius (silver).
-        {
-            let flange_mat = isometry_to_glam(&self.sim.arm.flange_pose());
-            let tool_z_dh = Vec3::new(flange_mat.col(2).x, flange_mat.col(2).y, flange_mat.col(2).z);
-            let flange_pos_dh = Vec3::new(flange_mat.col(3).x, flange_mat.col(3).y, flange_mat.col(3).z);
-
-            // Tool body: from flange to 150mm along tool Z
-            let body_end_dh = flange_pos_dh + tool_z_dh * 0.15;
-            let body_from = swap.transform_point3(flange_pos_dh);
-            let body_to = swap.transform_point3(body_end_dh);
-
-            if let Some(tb_mat) = &self.tool_body_material {
-                let model = link_model(body_from, body_to, 0.018);
-                let mat = MaterialUniform::metal([0.35, 0.35, 0.40, 1.0])
-                    .with_model(model.to_cols_array_2d());
-                ctx.queue.write_buffer(&tb_mat.buffer, 0, bytemuck::bytes_of(&mat));
-            }
-
-            // Tool tip (cutting bit): visual matches config
-            let tip_end_dh = body_end_dh + tool_z_dh * self.tool_cutting_length_m as f32;
-            let tip_to = swap.transform_point3(tip_end_dh);
-
-            if let Some(tt_mat) = &self.tool_tip_material {
-                let model = link_model(body_to, tip_to, self.tool_radius_m as f32);
-                let mat = MaterialUniform::metal([0.85, 0.85, 0.90, 1.0])
-                    .with_model(model.to_cols_array_2d());
-                ctx.queue.write_buffer(&tt_mat.buffer, 0, bytemuck::bytes_of(&mat));
-            }
+        if let Some(tb_mat) = &self.tool_body_material {
+            let mat = MaterialUniform::metal([0.35, 0.35, 0.40, 1.0])
+                .with_model(tool_body_model.to_cols_array_2d());
+            ctx.queue.write_buffer(&tb_mat.buffer, 0, bytemuck::bytes_of(&mat));
         }
-
-        // Base pedestal: tall column from arm base down to ground.
-        // Base center at render Y = -0.13 (midpoint of 0 to -0.26).
+        if let Some(tt_mat) = &self.tool_tip_material {
+            let mat = MaterialUniform::metal([0.85, 0.85, 0.90, 1.0])
+                .with_model(tool_tip_model.to_cols_array_2d());
+            ctx.queue.write_buffer(&tt_mat.buffer, 0, bytemuck::bytes_of(&mat));
+        }
         if let Some(base_mat) = &self.base_material {
-            let base_pos = Vec3::new(render_pts[0].x, render_pts[0].y - 0.13, render_pts[0].z);
-            let model = Mat4::from_translation(base_pos);
             let mat = MaterialUniform::metal([0.15, 0.15, 0.18, 1.0])
-                .with_model(model.to_cols_array_2d());
+                .with_model(base_model.to_cols_array_2d());
             ctx.queue.write_buffer(&base_mat.buffer, 0, bytemuck::bytes_of(&mat));
         }
 
+        // --- Shadow setup ---
+        let light_vp = ShadowPipeline::compute_light_matrix(light_dir.normalize(), 2.0);
+        pbr.update_shadow_light_vp(&ctx.queue, &light_vp);
+
+        // Collect shadow matrices: light_vp * model for each shadow caster
+        // Order: workpiece, arm links (6), joint spheres (7), tool body, tool tip, base
+        let mut shadow_matrices = Vec::with_capacity(16);
+        shadow_matrices.push(light_vp * workpiece_model); // 0: workpiece
+        for i in 0..6 {
+            shadow_matrices.push(light_vp * arm_models[i]); // 1-6: arm links
+        }
+        for i in 0..7 {
+            shadow_matrices.push(light_vp * joint_models[i]); // 7-13: joint spheres
+        }
+        shadow_matrices.push(light_vp * tool_body_model); // 14: tool body
+        shadow_matrices.push(light_vp * tool_tip_model);  // 15: tool tip
+        shadow_matrices.push(light_vp * base_model);      // 16: base
+
+        if let Some(shadow) = &self.shadow_pipeline {
+            shadow.upload_matrices(&ctx.queue, &shadow_matrices);
+        }
+
+        // --- Update SSAO params with current projection ---
+        if let Some(ssao) = &self.ssao_pipeline {
+            ssao.update_params(&ctx.queue, &SsaoParams {
+                proj: cam_uniform.proj,
+                radius: 0.5,
+                bias: 0.025,
+                intensity: 1.5,
+                _pad: 0.0,
+            });
+        }
+
         // Upload completed meshes from background workers.
-        // Also do a small sync remesh pass for any remaining dirty chunks
-        // (handles initial startup before async has spun up).
         let async_meshes = self.async_mesher.poll_completed();
-        let sync_meshes = mesher::remesh_dirty_capped(&mut self.sim.workpiece, 2);
+        let sync_meshes = if self.sim.workpiece.dirty_chunks.is_empty() {
+            Vec::new()
+        } else {
+            mesher::remesh_dirty_capped(&mut self.sim.workpiece, 2)
+        };
         for mesh in async_meshes.iter().chain(sync_meshes.iter()) {
             let coord = (mesh.coord.x, mesh.coord.y, mesh.coord.z);
             self.chunk_meshes.upload_chunk(
@@ -920,7 +969,7 @@ impl App {
             );
         }
 
-        // Begin render pass
+        // --- Begin rendering ---
         let output = match ctx.surface.get_current_texture() {
             Ok(t) => t,
             Err(wgpu::SurfaceError::Lost) => return,
@@ -944,20 +993,111 @@ impl App {
                 label: Some("Render Encoder"),
             });
 
-        // Main PBR pass
+        // ====== Pass 1: Sky clear → swapchain ======
         {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("PBR Pass"),
+            let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Sky Clear"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.12,
-                            g: 0.14,
-                            b: 0.18,
-                            a: 1.0,
+                            r: 0.06, g: 0.07, b: 0.12, a: 1.0,
                         }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+        }
+
+        // ====== Pass 2: Shadow depth → shadow texture (Clear) ======
+        if let Some(shadow) = &self.shadow_pipeline {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Shadow Pass"),
+                color_attachments: &[],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &shadow.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                ..Default::default()
+            });
+            pass.set_pipeline(&shadow.pipeline);
+
+            let mut si = 0usize; // shadow matrix index
+
+            // Workpiece chunks (all share same model matrix at index 0)
+            pass.set_bind_group(0, &shadow.bind_group, &[ShadowPipeline::dynamic_offset(si)]);
+            for mesh in self.chunk_meshes.meshes.values() {
+                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..mesh.num_indices, 0, 0..1);
+            }
+            si += 1;
+
+            // Arm links (6)
+            if let Some(cyl) = &self.arm_cylinder {
+                for i in 0..6 {
+                    pass.set_bind_group(0, &shadow.bind_group, &[ShadowPipeline::dynamic_offset(si + i)]);
+                    pass.set_vertex_buffer(0, cyl.vertex_buffer.slice(..));
+                    pass.set_index_buffer(cyl.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..cyl.num_indices, 0, 0..1);
+                }
+            }
+            si += 6;
+
+            // Joint spheres (7)
+            if let Some(sph) = &self.arm_sphere {
+                for i in 0..7 {
+                    pass.set_bind_group(0, &shadow.bind_group, &[ShadowPipeline::dynamic_offset(si + i)]);
+                    pass.set_vertex_buffer(0, sph.vertex_buffer.slice(..));
+                    pass.set_index_buffer(sph.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..sph.num_indices, 0, 0..1);
+                }
+            }
+            si += 7;
+
+            // Tool body
+            if let Some(cyl) = &self.arm_cylinder {
+                pass.set_bind_group(0, &shadow.bind_group, &[ShadowPipeline::dynamic_offset(si)]);
+                pass.set_vertex_buffer(0, cyl.vertex_buffer.slice(..));
+                pass.set_index_buffer(cyl.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..cyl.num_indices, 0, 0..1);
+            }
+            si += 1;
+
+            // Tool tip
+            if let Some(cyl) = &self.arm_cylinder {
+                pass.set_bind_group(0, &shadow.bind_group, &[ShadowPipeline::dynamic_offset(si)]);
+                pass.set_vertex_buffer(0, cyl.vertex_buffer.slice(..));
+                pass.set_index_buffer(cyl.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..cyl.num_indices, 0, 0..1);
+            }
+            si += 1;
+
+            // Base pedestal
+            if let Some(bm) = &self.base_mesh {
+                pass.set_bind_group(0, &shadow.bind_group, &[ShadowPipeline::dynamic_offset(si)]);
+                pass.set_vertex_buffer(0, bm.vertex_buffer.slice(..));
+                pass.set_index_buffer(bm.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..bm.num_indices, 0, 0..1);
+            }
+        }
+
+        // ====== Pass 3: PBR → HDR texture (Clear to transparent) + depth (Clear) ======
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("PBR Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &ctx.hdr_texture,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -973,8 +1113,9 @@ impl App {
             });
 
             render_pass.set_pipeline(&pbr.pipeline);
+            render_pass.set_bind_group(1, &pbr.shadow_bind_group, &[]);
 
-            // 1) Draw ground plane
+            // 1) Ground plane
             if let (Some(gnd_mesh), Some(gnd_mat)) =
                 (&self.ground_mesh, &self.ground_material)
             {
@@ -987,7 +1128,7 @@ impl App {
                 render_pass.draw_indexed(0..gnd_mesh.num_indices, 0, 0..1);
             }
 
-            // 2) Draw workpiece chunks
+            // 2) Workpiece chunks
             if let Some(wp) = &self.workpiece_material {
                 render_pass.set_bind_group(0, &wp.bind_group, &[]);
                 for mesh in self.chunk_meshes.meshes.values() {
@@ -1000,7 +1141,7 @@ impl App {
                 }
             }
 
-            // 3) Draw robot arm links (cylinders)
+            // 3) Arm links
             if let Some(cyl) = &self.arm_cylinder {
                 for link_mat in &self.arm_materials {
                     render_pass.set_bind_group(0, &link_mat.bind_group, &[]);
@@ -1013,7 +1154,7 @@ impl App {
                 }
             }
 
-            // 4) Draw joint spheres
+            // 4) Joint spheres
             if let Some(sph) = &self.arm_sphere {
                 for jm in &self.joint_materials {
                     render_pass.set_bind_group(0, &jm.bind_group, &[]);
@@ -1026,7 +1167,7 @@ impl App {
                 }
             }
 
-            // 5) Draw target point sphere
+            // 5) Target sphere
             if let (Some(sph), Some(tgt_mat)) = (&self.arm_sphere, &self.target_material) {
                 render_pass.set_bind_group(0, &tgt_mat.bind_group, &[]);
                 render_pass.set_vertex_buffer(0, sph.vertex_buffer.slice(..));
@@ -1037,7 +1178,7 @@ impl App {
                 render_pass.draw_indexed(0..sph.num_indices, 0, 0..1);
             }
 
-            // 6) Draw tool body (Dremel)
+            // 6) Tool body
             if let (Some(cyl), Some(tb_mat)) = (&self.arm_cylinder, &self.tool_body_material) {
                 render_pass.set_bind_group(0, &tb_mat.bind_group, &[]);
                 render_pass.set_vertex_buffer(0, cyl.vertex_buffer.slice(..));
@@ -1048,7 +1189,7 @@ impl App {
                 render_pass.draw_indexed(0..cyl.num_indices, 0, 0..1);
             }
 
-            // 7) Draw tool tip
+            // 7) Tool tip
             if let (Some(cyl), Some(tt_mat)) = (&self.arm_cylinder, &self.tool_tip_material) {
                 render_pass.set_bind_group(0, &tt_mat.bind_group, &[]);
                 render_pass.set_vertex_buffer(0, cyl.vertex_buffer.slice(..));
@@ -1059,7 +1200,7 @@ impl App {
                 render_pass.draw_indexed(0..cyl.num_indices, 0, 0..1);
             }
 
-            // 8) Draw base pedestal
+            // 8) Base pedestal
             if let (Some(bm), Some(bmat)) = (&self.base_mesh, &self.base_material) {
                 render_pass.set_bind_group(0, &bmat.bind_group, &[]);
                 render_pass.set_vertex_buffer(0, bm.vertex_buffer.slice(..));
@@ -1071,12 +1212,76 @@ impl App {
             }
         }
 
-        // --- Toolpath line pass ---
-        // Build line vertices before borrowing the pipeline mutably
-        let line_verts = self.build_toolpath_lines();
+        // ====== Pass 4: SSAO → SSAO output texture ======
+        if let (Some(ssao), Some(ssao_bg)) = (&self.ssao_pipeline, &self.ssao_bind_group) {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("SSAO Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &ssao.output_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            pass.set_pipeline(&ssao.pipeline);
+            pass.set_bind_group(0, ssao_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        // ====== Pass 5: SSS → SSS output texture ======
+        if let (Some(sss), Some(sss_bg)) = (&self.sss_pipeline, &self.sss_bind_group) {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("SSS Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &sss.output_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            pass.set_pipeline(&sss.pipeline);
+            pass.set_bind_group(0, sss_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        // ====== Pass 6: Composite → swapchain (Load, preserving sky) ======
+        if let (Some(composite), Some(comp_bg)) = (&self.composite_pipeline, &self.composite_bind_group) {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Composite Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                ..Default::default()
+            });
+            pass.set_pipeline(&composite.pipeline);
+            pass.set_bind_group(0, comp_bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        // ====== Pass 7: Toolpath lines → swapchain (Load) ======
+        let current_progress = self.sim.carving.as_ref().map_or(0, |s| s.progress_counts().0);
+        let lines_dirty = current_progress != self.cached_line_progress;
+        if lines_dirty {
+            self.cached_line_verts = self.build_toolpath_lines();
+            self.cached_line_progress = current_progress;
+        }
         if let Some(line_pipe) = &mut self.line_pipeline {
-            if !line_verts.is_empty() {
-                line_pipe.upload(&ctx.queue, &line_verts);
+            if lines_dirty && !self.cached_line_verts.is_empty() {
+                line_pipe.upload(&ctx.queue, &self.cached_line_verts);
             }
             if line_pipe.num_vertices > 0 {
                 let mut line_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1106,43 +1311,112 @@ impl App {
             }
         }
 
-        // --- Overlay pass (2D diagnostics panel) ---
-        let overlay_idx_count = if let Some(overlay) = &self.overlay_pipeline {
-            let size = ctx.config.width as f32;
-            let h = ctx.config.height as f32;
-            overlay.update_screen_size(&ctx.queue, size, h);
+        // ====== Pass 8: egui UI → swapchain (Load) ======
+        let ui_data = self.collect_ui_data();
+        let egui_input = self.egui_state.as_mut().unwrap().take_egui_input(
+            self.window.as_ref().unwrap(),
+        );
+        let mut ui_actions = Vec::new();
+        let egui_output = self.egui_ctx.run(egui_input, |ctx| {
+            ui_actions = ui::build_ui(ctx, &ui_data);
+        });
 
-            let mut ob = OverlayBuilder::new();
-            self.build_diagnostics_overlay(&mut ob, size, h);
-            ob.upload(&ctx.queue, overlay)
-        } else {
-            0
+        // Tessellate
+        let paint_jobs = self.egui_ctx.tessellate(
+            egui_output.shapes,
+            egui_output.pixels_per_point,
+        );
+
+        // Update egui textures and buffers
+        let screen_descriptor = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [ctx.config.width, ctx.config.height],
+            pixels_per_point: egui_output.pixels_per_point,
         };
 
-        if overlay_idx_count > 0 {
-            let overlay = self.overlay_pipeline.as_ref().unwrap();
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Overlay Pass"),
+        let egui_renderer = self.egui_renderer.as_mut().unwrap();
+        for (id, image_delta) in &egui_output.textures_delta.set {
+            egui_renderer.update_texture(&ctx.device, &ctx.queue, *id, image_delta);
+        }
+        let egui_cmd_bufs = egui_renderer.update_buffers(
+            &ctx.device,
+            &ctx.queue,
+            &mut encoder,
+            &paint_jobs,
+            &screen_descriptor,
+        );
+
+        // Render egui (forget_lifetime required by egui-wgpu's 'static RenderPass API)
+        {
+            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("egui Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load, // preserve PBR output
+                        load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
                 })],
                 depth_stencil_attachment: None,
                 ..Default::default()
             });
-            pass.set_pipeline(&overlay.pipeline);
-            pass.set_bind_group(0, &overlay.bind_group, &[]);
-            pass.set_vertex_buffer(0, overlay.vertex_buffer.slice(..));
-            pass.set_index_buffer(overlay.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-            pass.draw_indexed(0..overlay_idx_count, 0, 0..1);
+            let mut pass = pass.forget_lifetime();
+            egui_renderer.render(&mut pass, &paint_jobs, &screen_descriptor);
         }
 
-        ctx.queue.submit(std::iter::once(encoder.finish()));
+        // Free egui textures
+        for id in &egui_output.textures_delta.free {
+            egui_renderer.free_texture(id);
+        }
+
+        // Handle platform output (cursor icon, clipboard, etc.)
+        self.egui_state.as_mut().unwrap().handle_platform_output(
+            self.window.as_ref().unwrap(),
+            egui_output.platform_output,
+        );
+
+        // Submit everything
+        let mut cmd_bufs: Vec<wgpu::CommandBuffer> = egui_cmd_bufs;
+        cmd_bufs.push(encoder.finish());
+        ctx.queue.submit(cmd_bufs);
         output.present();
+
+        // Process UI actions from egui buttons
+        for action in ui_actions {
+            match action {
+                ui::UiAction::TogglePause => {
+                    if self.sim.mode == SimMode::Carving {
+                        if let Some(session) = &mut self.sim.carving {
+                            session.toggle();
+                        }
+                    } else {
+                        self.sim.paused = !self.sim.paused;
+                    }
+                }
+                ui::UiAction::SpeedUp => {
+                    let current_idx = SPEED_PRESETS.iter()
+                        .position(|&s| (s - self.speed_multiplier).abs() < 0.01)
+                        .unwrap_or_else(|| {
+                            SPEED_PRESETS.iter()
+                                .position(|&s| s > self.speed_multiplier)
+                                .unwrap_or(SPEED_PRESETS.len() - 1)
+                        });
+                    let next_idx = (current_idx + 1).min(SPEED_PRESETS.len() - 1);
+                    self.speed_multiplier = SPEED_PRESETS[next_idx];
+                }
+                ui::UiAction::SpeedDown => {
+                    let current_idx = SPEED_PRESETS.iter()
+                        .position(|&s| (s - self.speed_multiplier).abs() < 0.01)
+                        .unwrap_or_else(|| {
+                            SPEED_PRESETS.iter()
+                                .rposition(|&s| s < self.speed_multiplier)
+                                .unwrap_or(0)
+                        });
+                    let next_idx = if current_idx > 0 { current_idx - 1 } else { 0 };
+                    self.speed_multiplier = SPEED_PRESETS[next_idx];
+                }
+            }
+        }
 
         // FPS counter
         self.frame_count += 1;
@@ -1154,252 +1428,92 @@ impl App {
         }
     }
 
-    /// Build the left-side diagnostics overlay.
-    fn build_diagnostics_overlay(&self, ob: &mut OverlayBuilder, _sw: f32, sh: f32) {
-        let panel_w = 220.0f32;
-        let margin = 8.0f32;
-        let scale = 1.0f32; // text scale (1.0 = 8px native glyphs, crisp)
-        let line_h = 8.0 * scale + 3.0; // line height in pixels
-        let bar_h = 8.0f32;
-        let white = [1.0, 1.0, 1.0, 0.95];
-        let gray = [0.7, 0.7, 0.7, 0.9];
-        let green = [0.2, 0.9, 0.3, 1.0];
-        let red = [0.9, 0.3, 0.2, 1.0];
-        let yellow = [0.9, 0.8, 0.2, 1.0];
-        let cyan = [0.3, 0.8, 0.9, 1.0];
-        let orange = [0.9, 0.6, 0.2, 1.0];
-        let bar_bg = [0.15, 0.15, 0.18, 0.6];
+    /// Collect all UI data from current state into a snapshot for egui rendering.
+    fn collect_ui_data(&self) -> ui::UiData {
+        let joint_angles: [f64; 6] = std::array::from_fn(|i| {
+            self.sim.arm.joints[i].angle.to_degrees()
+        });
+        let joint_mins: [f64; 6] = std::array::from_fn(|i| {
+            self.sim.arm.joints[i].angle_min.to_degrees()
+        });
+        let joint_maxs: [f64; 6] = std::array::from_fn(|i| {
+            self.sim.arm.joints[i].angle_max.to_degrees()
+        });
+        let joint_torques: [f64; 6] = std::array::from_fn(|i| {
+            self.sim.arm.joints[i].torque
+        });
 
-        // Panel background
-        ob.rect(0.0, 0.0, panel_w, sh, [0.08, 0.09, 0.12, 0.85]);
-        // Separator line
-        ob.rect(panel_w - 2.0, 0.0, 2.0, sh, [0.3, 0.3, 0.35, 0.5]);
-
-        let mut y = margin;
-
-        // Title
-        ob.text(margin, y, 2.0, white, "SimuForge-Stone");
-        y += 8.0 * 2.0 + 8.0;
-
-        // Mode indicator
-        let mode_color = match self.sim.mode {
-            SimMode::Manual => cyan,
-            SimMode::Carving => orange,
-        };
-        let mode_text = match self.sim.mode {
-            SimMode::Manual => "MANUAL",
-            SimMode::Carving => "CARVING",
-        };
-        ob.rect(margin, y, 10.0, 10.0, mode_color);
-        ob.text(margin + 16.0, y, scale, mode_color, mode_text);
-        y += line_h;
-
-        // Status / carving state
-        if self.sim.mode == SimMode::Carving {
-            if let Some(session) = &self.sim.carving {
-                let state_color = match session.state {
-                    CarvingState::Idle => gray,
-                    CarvingState::Running => green,
-                    CarvingState::Paused => yellow,
-                    CarvingState::Complete => cyan,
-                };
-                let state_text = match session.state {
-                    CarvingState::Idle => "IDLE",
-                    CarvingState::Running => "RUNNING",
-                    CarvingState::Paused => "PAUSED",
-                    CarvingState::Complete => "COMPLETE",
-                };
-                ob.text(margin + 16.0, y, scale, state_color, state_text);
-                y += line_h;
-
-                // Speed multiplier
-                let speed_color = if (self.speed_multiplier - 1.0).abs() < 0.01 { gray } else { yellow };
-                ob.text(margin, y, scale, speed_color,
-                    &format!("Speed: {}x", self.speed_multiplier));
-                y += line_h;
-
-                // Progress bar
-                let (done, total) = session.progress_counts();
-                let prog = session.progress();
-                ob.text(margin, y, scale, white,
-                    &format!("Progress: {:.0}% ({}/{})", prog * 100.0, done, total));
-                y += line_h;
-
-                // Progress bar visual
-                let bar_x = margin;
-                let bar_y = y;
-                let bar_w = panel_w - margin * 2.0;
-                ob.rect(bar_x, bar_y, bar_w, bar_h, bar_bg);
-                ob.rect(bar_x, bar_y, bar_w * prog as f32, bar_h, green);
-                y += bar_h + 2.0;
-
-                // ETA
-                let eta = session.eta();
-                if eta > 0.0 && session.state == CarvingState::Running {
-                    ob.text(margin, y, scale, gray,
-                        &format!("ETA: {:.0}s", eta / self.speed_multiplier));
-                    y += line_h;
-                }
-            }
-        } else {
-            let status_color = if self.sim.paused { yellow } else { green };
-            let status_text = if self.sim.paused { "PAUSED" } else { "RUNNING" };
-            ob.text(margin + 16.0, y, scale, status_color, status_text);
-            y += line_h;
-        }
-        y += 4.0;
-
-        // FPS
-        ob.text(margin, y, scale, gray, &format!("FPS:  {:.0}", self.fps));
-        y += line_h;
-
-        // Sim time
-        ob.text(margin, y, scale, gray, &format!("Time: {:.2}s", self.sim.sim_time));
-        y += line_h;
-
-        // Chunks / Tris
-        ob.text(
-            margin, y, scale, gray,
-            &format!("Mesh: {} chunks  {}K tri",
-                self.chunk_meshes.chunk_count(),
-                self.chunk_meshes.total_triangles() / 1000,
-            ),
-        );
-        y += line_h + 8.0;
-
-        // --- Joint angles ---
-        ob.text(margin, y, scale, white, "Joint Angles");
-        y += line_h + 2.0;
-
-        let link_colors: [[f32; 4]; 6] = [
-            orange, orange, orange, cyan, cyan, cyan,
-        ];
-
-        for (i, joint) in self.sim.arm.joints.iter().enumerate() {
-            let angle_deg = joint.angle.to_degrees();
-            let min_deg = joint.angle_min.to_degrees();
-            let max_deg = joint.angle_max.to_degrees();
-            let range = max_deg - min_deg;
-
-            // Label
-            let label = format!("J{}: {:>7.1}", i + 1, angle_deg);
-            ob.text(margin, y, scale, link_colors[i], &label);
-
-            // Bar background
-            let bar_x = margin;
-            let bar_y = y + line_h;
-            let bar_w = panel_w - margin * 2.0;
-            ob.rect(bar_x, bar_y, bar_w, bar_h, bar_bg);
-
-            // Bar fill: position within range
-            if range > 0.0 {
-                let frac = ((angle_deg - min_deg) / range).clamp(0.0, 1.0) as f32;
-                let fill_w = bar_w * frac;
-                ob.rect(bar_x, bar_y, fill_w, bar_h, link_colors[i]);
-
-                // Center mark (0 degree position)
-                let zero_frac = ((0.0 - min_deg) / range).clamp(0.0, 1.0) as f32;
-                let mark_x = bar_x + bar_w * zero_frac;
-                ob.rect(mark_x - 1.0, bar_y, 2.0, bar_h, white);
-            }
-
-            y += line_h + bar_h + 4.0;
-        }
-
-        y += 4.0;
-
-        // --- Motor torques ---
-        ob.text(margin, y, scale, white, "Motor Torques");
-        y += line_h + 2.0;
-
-        for (i, joint) in self.sim.arm.joints.iter().enumerate() {
-            let torque = joint.torque;
-            let max_t = if i < 3 { 1200.0 } else { 150.0 };
-            let label = format!("J{}: {:>7.1} Nm", i + 1, torque);
-            ob.text(margin, y, scale, gray, &label);
-
-            let bar_x = margin;
-            let bar_y = y + line_h;
-            let bar_w = panel_w - margin * 2.0;
-            ob.rect(bar_x, bar_y, bar_w, bar_h, bar_bg);
-
-            // Torque bar centered at middle (negative goes left, positive right)
-            let mid = bar_x + bar_w * 0.5;
-            let frac = (torque / max_t).clamp(-1.0, 1.0) as f32;
-            if frac >= 0.0 {
-                ob.rect(mid, bar_y, bar_w * 0.5 * frac, bar_h, green);
-            } else {
-                let w = bar_w * 0.5 * (-frac);
-                ob.rect(mid - w, bar_y, w, bar_h, red);
-            }
-            // Center mark
-            ob.rect(mid - 1.0, bar_y, 2.0, bar_h, white);
-
-            y += line_h + bar_h + 4.0;
-        }
-
-        y += 4.0;
-
-        // --- Cutting force ---
-        ob.text(margin, y, scale, white, "Cutting");
-        y += line_h;
-        ob.text(
-            margin, y, scale, gray,
-            &format!("Force: {:.1} N", self.sim.cutting_force_magnitude),
-        );
-        y += line_h;
-
-        let spindle = if self.sim.tool_state.spindle_on {
-            "Spindle: ON"
-        } else {
-            "Spindle: OFF"
-        };
-        let sp_color = if self.sim.tool_state.spindle_on { green } else { red };
-        ob.text(margin, y, scale, sp_color, spindle);
-        y += line_h + 8.0;
-
-        // --- Target & Tool ---
-        let ct_pos = &self.sim.cartesian_target.translation.vector;
-        let ct_rot = &self.sim.cartesian_target.rotation;
+        let ct = &self.sim.cartesian_target.translation.vector;
         let tp = &self.sim.tool_state.position;
-        let ik_color = if self.sim.ik_converged { green } else { red };
-        let ik_text = if self.sim.ik_converged { "IK OK" } else { "IK FAIL" };
-
-        ob.text(margin, y, scale, white, "Target");
-        y += line_h;
-        ob.text(
-            margin, y, scale, ik_color,
-            &format!("{} X:{:.0} Y:{:.0} Z:{:.0}",
-                ik_text, ct_pos.x * 1000.0, ct_pos.y * 1000.0, ct_pos.z * 1000.0),
-        );
-        y += line_h;
-        // Show target orientation as Euler angles (roll/pitch/yaw)
-        let (roll, pitch, yaw): (f64, f64, f64) = ct_rot.euler_angles();
-        ob.text(
-            margin, y, scale, gray,
-            &format!("R:{:.1} P:{:.1} Y:{:.1}",
-                roll.to_degrees(), pitch.to_degrees(), yaw.to_degrees()),
-        );
-        y += line_h + 2.0;
-
-        ob.text(margin, y, scale, white, "Tool");
-        y += line_h;
-        ob.text(
-            margin, y, scale, gray,
-            &format!("X:{:.0} Y:{:.0} Z:{:.0}",
-                tp.x * 1000.0, tp.y * 1000.0, tp.z * 1000.0),
-        );
-        y += line_h + 2.0;
-
-        // Tool position relative to workpiece
         let wc = &self.sim.workpiece_center;
         let local = tp - wc;
         let half = self.sim.workpiece_half_extent;
         let inside = local.x.abs() < half && local.y.abs() < half && local.z.abs() < half;
-        let inside_color = if inside { green } else { red };
-        let inside_text = if inside { "IN BLOCK" } else { "OUTSIDE" };
-        ob.text(margin, y, scale, inside_color, inside_text);
+
+        let tracking_error = (ct - tp).norm() * 1000.0; // mm
+
+        let carving_state = match self.sim.mode {
+            SimMode::Carving => self.sim.carving.as_ref().map(|s| match s.state {
+                CarvingState::Idle => 0u8,
+                CarvingState::Running => 1,
+                CarvingState::Paused => 2,
+                CarvingState::Complete => 3,
+            }),
+            SimMode::Manual => None,
+        };
+
+        let (carving_done, carving_total) = self.sim.carving.as_ref()
+            .map_or((0, 0), |s| s.progress_counts());
+        let carving_progress = self.sim.carving.as_ref()
+            .map_or(0.0, |s| s.progress() as f32);
+        let carving_eta = self.sim.carving.as_ref()
+            .map_or(0.0, |s| s.eta());
+
+        let tool_type = match self.sim.tool.tool_type {
+            simuforge_cutting::tool::ToolType::BallNose => "Ball Nose",
+            simuforge_cutting::tool::ToolType::FlatEnd => "Flat End",
+            simuforge_cutting::tool::ToolType::TaperedBall { .. } => "Tapered Ball",
+        };
+
+        let gcode_file = self.gcode_path.clone();
+        let gcode_waypoints = self.sim.carving.as_ref()
+            .map_or(0, |s| s.waypoints.len());
+        let gcode_est_time = self.sim.carving.as_ref()
+            .map_or(0.0, |s| s.estimated_total_time);
+
+        ui::UiData {
+            mode_manual: self.sim.mode == SimMode::Manual,
+            paused: self.sim.paused,
+            carving_state,
+            speed_multiplier: self.speed_multiplier,
+            fps: self.fps,
+            carving_progress,
+            carving_done,
+            carving_total,
+            carving_eta,
+            joint_angles,
+            joint_mins,
+            joint_maxs,
+            joint_torques,
+            ik_converged: self.sim.ik_converged,
+            target_pos: [ct.x * 1000.0, ct.y * 1000.0, ct.z * 1000.0],
+            tool_pos: [tp.x * 1000.0, tp.y * 1000.0, tp.z * 1000.0],
+            inside_block: inside,
+            tracking_error,
+            spindle_on: self.sim.tool_state.spindle_on,
+            cutting_force: self.sim.cutting_force_magnitude,
+            sim_time: self.sim.sim_time,
+            chunk_count: self.chunk_meshes.chunk_count(),
+            total_triangles: self.chunk_meshes.total_triangles() as usize,
+            tool_type,
+            tool_radius_mm: self.sim.tool.radius * 1000.0,
+            tool_cutting_length_mm: self.sim.tool.cutting_length * 1000.0,
+            gcode_file,
+            gcode_waypoints,
+            gcode_est_time,
+        }
     }
+
 }
 
 impl ApplicationHandler for App {
@@ -1419,12 +1533,69 @@ impl ApplicationHandler for App {
         );
 
         let ctx = pollster::block_on(RenderContext::new(window.clone()));
-        let pbr = PbrPipeline::new(&ctx);
         let shadow = ShadowPipeline::new(&ctx);
+        let pbr = PbrPipeline::new(&ctx, &shadow);
         let ssao = SsaoPipeline::new(&ctx);
         let sss = SssPipeline::new(&ctx);
         let composite = CompositePipeline::new(&ctx);
-        let overlay = OverlayPipeline::new(&ctx);
+
+        // Initialize egui
+        ui::setup_fonts(&self.egui_ctx);
+        ui::setup_theme(&self.egui_ctx);
+        let viewport_id = self.egui_ctx.viewport_id();
+        let egui_state = egui_winit::State::new(
+            self.egui_ctx.clone(),
+            viewport_id,
+            &window,
+            None,
+            None,
+            None,
+        );
+        let egui_renderer = egui_wgpu::Renderer::new(
+            &ctx.device,
+            ctx.format(),
+            None, // no depth
+            1,    // msaa samples
+            false, // no dithering
+        );
+        self.egui_state = Some(egui_state);
+        self.egui_renderer = Some(egui_renderer);
+
+        // Post-processing samplers
+        let post_sampler = ctx.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Post-Process Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let depth_sampler = ctx.device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Depth Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        // Post-processing bind groups
+        let ssao_bg = ssao.create_bind_group(&ctx.device, &ctx.depth_texture, &depth_sampler);
+        let sss_bg = sss.create_bind_group(&ctx.device, &ctx.hdr_texture, &ctx.depth_texture, &post_sampler);
+        let composite_bg = composite.create_bind_group(&ctx.device, &sss.output_view, &ssao.output_view, &post_sampler);
+
+        // Initialize post-processing parameters
+        let w = ctx.config.width as f32;
+        let h = ctx.config.height as f32;
+        ssao.update_params(&ctx.queue, &SsaoParams {
+            proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
+            radius: 0.5,
+            bias: 0.025,
+            intensity: 1.5,
+            _pad: 0.0,
+        });
+        sss.update_params(&ctx.queue, &SssParams::marble(w, h));
+        composite.update_params(&ctx.queue, &CompositeParams::default());
 
         // --- Create GPU resources for arm, ground, workpiece ---
         use wgpu::util::DeviceExt;
@@ -1588,7 +1759,11 @@ impl ApplicationHandler for App {
         self.ssao_pipeline = Some(ssao);
         self.sss_pipeline = Some(sss);
         self.composite_pipeline = Some(composite);
-        self.overlay_pipeline = Some(overlay);
+        self.post_sampler = Some(post_sampler);
+        self.depth_sampler = Some(depth_sampler);
+        self.ssao_bind_group = Some(ssao_bg);
+        self.sss_bind_group = Some(sss_bg);
+        self.composite_bind_group = Some(composite_bg);
         self.render_ctx = Some(ctx);
         self.window = Some(window);
 
@@ -1617,6 +1792,22 @@ impl ApplicationHandler for App {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
+        // Pass event to egui first
+        let _egui_consumed = if let Some(egui_state) = &mut self.egui_state {
+            if let Some(window) = &self.window {
+                let resp = egui_state.on_window_event(window, &event);
+                resp.consumed
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        // Check if egui wants pointer/keyboard input (for suppressing camera/key handling)
+        let egui_wants_pointer = self.egui_ctx.wants_pointer_input();
+        let egui_wants_keyboard = self.egui_ctx.wants_keyboard_input();
+
         match event {
             WindowEvent::CloseRequested => {
                 event_loop.exit();
@@ -1630,6 +1821,28 @@ impl ApplicationHandler for App {
                     }
                     if let Some(sss) = &mut self.sss_pipeline {
                         sss.resize(&ctx.device, &ctx.config);
+                        // Update SSS screen size params
+                        let w = ctx.config.width as f32;
+                        let h = ctx.config.height as f32;
+                        sss.update_params(&ctx.queue, &SssParams::marble(w, h));
+                    }
+                    // Recreate post-processing bind groups (textures changed)
+                    if let (Some(ssao), Some(sss), Some(composite), Some(ds), Some(ps)) = (
+                        &self.ssao_pipeline,
+                        &self.sss_pipeline,
+                        &self.composite_pipeline,
+                        &self.depth_sampler,
+                        &self.post_sampler,
+                    ) {
+                        self.ssao_bind_group = Some(ssao.create_bind_group(
+                            &ctx.device, &ctx.depth_texture, ds,
+                        ));
+                        self.sss_bind_group = Some(sss.create_bind_group(
+                            &ctx.device, &ctx.hdr_texture, &ctx.depth_texture, ps,
+                        ));
+                        self.composite_bind_group = Some(composite.create_bind_group(
+                            &ctx.device, &sss.output_view, &ssao.output_view, ps,
+                        ));
                     }
                 }
             }
@@ -1642,7 +1855,7 @@ impl ApplicationHandler for App {
                         ..
                     },
                 ..
-            } => {
+            } if !egui_wants_keyboard => {
                 let pressed = state == ElementState::Pressed;
 
                 // Continuous movement keys (hold to move)
@@ -1764,7 +1977,7 @@ impl ApplicationHandler for App {
                 }
             }
 
-            WindowEvent::MouseInput { state, button, .. } => {
+            WindowEvent::MouseInput { state, button, .. } if !egui_wants_pointer => {
                 match button {
                     MouseButton::Left => {
                         self.mouse_pressed = state == ElementState::Pressed;
@@ -1779,7 +1992,7 @@ impl ApplicationHandler for App {
                 }
             }
 
-            WindowEvent::CursorMoved { position, .. } => {
+            WindowEvent::CursorMoved { position, .. } if !egui_wants_pointer => {
                 if let Some((lx, ly)) = self.last_mouse_pos {
                     let dx = (position.x - lx) as f32;
                     let dy = (position.y - ly) as f32;
@@ -1794,7 +2007,7 @@ impl ApplicationHandler for App {
                 self.last_mouse_pos = Some((position.x, position.y));
             }
 
-            WindowEvent::MouseWheel { delta, .. } => {
+            WindowEvent::MouseWheel { delta, .. } if !egui_wants_pointer => {
                 let scroll = match delta {
                     winit::event::MouseScrollDelta::LineDelta(_, y) => y,
                     winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y as f32 * 0.01,
@@ -1809,6 +2022,16 @@ impl ApplicationHandler for App {
                 self.last_frame = now;
 
                 let clamped_frame_time = frame_time.min(MAX_FRAME_TIME);
+
+                // Determine if the simulation needs active processing
+                let carving_active = self.sim.mode == SimMode::Carving
+                    && self.sim.carving.as_ref().map_or(false, |s| s.state == CarvingState::Running);
+                let any_movement_key = self.held_keys.w || self.held_keys.s
+                    || self.held_keys.a || self.held_keys.d
+                    || self.held_keys.q || self.held_keys.e
+                    || self.held_keys.i || self.held_keys.k
+                    || self.held_keys.j || self.held_keys.l;
+                let sim_active = carving_active || (!self.sim.paused && any_movement_key) || !self.sim.paused;
 
                 // Carving mode: advance the carving session and set targets
                 if self.sim.mode == SimMode::Carving {
@@ -1827,42 +2050,53 @@ impl ApplicationHandler for App {
                     self.apply_held_keys(clamped_frame_time);
                 }
 
-                // IK solve: update joint targets from Cartesian target (once per frame)
-                if !self.sim.paused {
+                if sim_active {
+                    // IK solve: update joint targets from Cartesian target (once per frame)
                     self.sim.update_ik();
-                }
 
-                // Scale physics accumulator by speed multiplier in carving mode
-                let physics_dt_budget = if self.sim.mode == SimMode::Carving {
-                    clamped_frame_time * self.speed_multiplier
+                    // Scale physics accumulator by speed multiplier in carving mode
+                    let physics_dt_budget = if self.sim.mode == SimMode::Carving {
+                        clamped_frame_time * self.speed_multiplier
+                    } else {
+                        clamped_frame_time
+                    };
+                    self.accumulator += physics_dt_budget;
+
+                    let mut steps = 0u32;
+                    while self.accumulator >= PHYSICS_DT && steps < self.max_physics_steps {
+                        self.sim.physics_step();
+                        self.accumulator -= PHYSICS_DT;
+                        steps += 1;
+                    }
+                    // Drain excess to prevent spiral of death
+                    if self.accumulator > PHYSICS_DT * 10.0 {
+                        self.accumulator = 0.0;
+                    }
+
+                    // Material removal: once per frame (not per physics step)
+                    self.sim.material_removal_step();
                 } else {
-                    clamped_frame_time
-                };
-                self.accumulator += physics_dt_budget;
-
-                let mut steps = 0u32;
-                while self.accumulator >= PHYSICS_DT && steps < self.max_physics_steps {
-                    self.sim.physics_step();
-                    self.accumulator -= PHYSICS_DT;
-                    steps += 1;
-                }
-                // Drain excess to prevent spiral of death
-                if self.accumulator > PHYSICS_DT * 10.0 {
+                    // Idle: don't accumulate physics time
                     self.accumulator = 0.0;
                 }
 
-                // Material removal: once per frame (not per physics step)
-                self.sim.material_removal_step();
-
-                // Submit dirty chunks for background meshing
+                // Always submit dirty chunks for background meshing
+                // (needed during startup even when paused, and after cuts complete)
                 self.async_mesher.submit_dirty(&mut self.sim.workpiece);
 
-                // Render
+                // Render (always — camera may have moved via mouse)
                 self.render();
 
-                // Request next frame
+                // Request next frame, but throttle when idle
+                let has_pending_meshes = !self.sim.workpiece.dirty_chunks.is_empty();
                 if let Some(window) = &self.window {
-                    window.request_redraw();
+                    if sim_active || has_pending_meshes {
+                        window.request_redraw();
+                    } else {
+                        // Idle: cap at ~30fps to save CPU/GPU
+                        std::thread::sleep(std::time::Duration::from_millis(30));
+                        window.request_redraw();
+                    }
                 }
             }
 

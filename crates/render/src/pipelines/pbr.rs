@@ -1,8 +1,9 @@
 //! PBR metallic-roughness rendering pipeline.
 
 use crate::camera::CameraUniform;
-use crate::context::{RenderContext, DEPTH_FORMAT};
+use crate::context::{RenderContext, DEPTH_FORMAT, HDR_FORMAT};
 use crate::mesh::vertex_buffer_layout;
+use crate::pipelines::shadow::ShadowPipeline;
 
 /// Light uniform data.
 #[repr(C)]
@@ -80,10 +81,14 @@ pub struct PbrPipeline {
     pub material_buffer: wgpu::Buffer,
     pub bind_group_layout: wgpu::BindGroupLayout,
     pub bind_group: wgpu::BindGroup,
+    // Shadow map resources (group 1)
+    pub shadow_bind_group_layout: wgpu::BindGroupLayout,
+    pub shadow_bind_group: wgpu::BindGroup,
+    pub shadow_light_vp_buffer: wgpu::Buffer,
 }
 
 impl PbrPipeline {
-    pub fn new(ctx: &RenderContext) -> Self {
+    pub fn new(ctx: &RenderContext, shadow: &ShadowPipeline) -> Self {
         let shader =
             ctx.device
                 .create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -114,6 +119,7 @@ impl PbrPipeline {
             mapped_at_creation: false,
         });
 
+        // Group 0: per-material (camera, light, material)
         let bind_group_layout =
             ctx.device
                 .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -175,11 +181,79 @@ impl PbrPipeline {
                 ],
             });
 
+        // Group 1: shadow map (depth texture, comparison sampler, light VP matrix)
+        let shadow_light_vp_buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Shadow Light VP (PBR)"),
+            size: 64, // mat4x4<f32>
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let shadow_bind_group_layout =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("PBR Shadow Bind Group Layout"),
+                    entries: &[
+                        // Shadow depth texture
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Depth,
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        // Shadow comparison sampler
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(
+                                wgpu::SamplerBindingType::Comparison,
+                            ),
+                            count: None,
+                        },
+                        // Light VP matrix
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+
+        let shadow_bind_group = ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("PBR Shadow Bind Group"),
+                layout: &shadow_bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&shadow.depth_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&shadow.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: shadow_light_vp_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
         let pipeline_layout =
             ctx.device
                 .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                     label: Some("PBR Pipeline Layout"),
-                    bind_group_layouts: &[&bind_group_layout],
+                    bind_group_layouts: &[&bind_group_layout, &shadow_bind_group_layout],
                     push_constant_ranges: &[],
                 });
 
@@ -198,7 +272,7 @@ impl PbrPipeline {
                         module: &shader,
                         entry_point: Some("fs_main"),
                         targets: &[Some(wgpu::ColorTargetState {
-                            format: ctx.format(),
+                            format: HDR_FORMAT,
                             blend: Some(wgpu::BlendState::REPLACE),
                             write_mask: wgpu::ColorWrites::ALL,
                         })],
@@ -229,6 +303,9 @@ impl PbrPipeline {
             material_buffer,
             bind_group_layout,
             bind_group,
+            shadow_bind_group_layout,
+            shadow_bind_group,
+            shadow_light_vp_buffer,
         }
     }
 
@@ -245,6 +322,15 @@ impl PbrPipeline {
     /// Update material uniform.
     pub fn update_material(&self, queue: &wgpu::Queue, uniform: &MaterialUniform) {
         queue.write_buffer(&self.material_buffer, 0, bytemuck::bytes_of(uniform));
+    }
+
+    /// Update the shadow light VP matrix (raw, without model — for fragment shader shadow coords).
+    pub fn update_shadow_light_vp(&self, queue: &wgpu::Queue, light_vp: &glam::Mat4) {
+        queue.write_buffer(
+            &self.shadow_light_vp_buffer,
+            0,
+            bytemuck::bytes_of(&light_vp.to_cols_array_2d()),
+        );
     }
 
     /// Create a separate material bind group (shares camera/light buffers).

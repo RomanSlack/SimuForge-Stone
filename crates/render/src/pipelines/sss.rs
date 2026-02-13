@@ -3,7 +3,7 @@
 //! Uses a screen-space diffusion blur on the irradiance buffer to simulate
 //! light transport through translucent marble.
 
-use crate::context::RenderContext;
+use crate::context::{RenderContext, HDR_FORMAT};
 
 /// SSS parameters.
 #[repr(C)]
@@ -13,6 +13,8 @@ pub struct SssParams {
     pub scatter_radius: f32,
     /// Scatter intensity/strength.
     pub strength: f32,
+    /// Padding to align scatter_color to 16-byte boundary (WGSL vec3 alignment).
+    pub _align: [f32; 2],
     /// Subsurface color tint (warm for marble).
     pub scatter_color: [f32; 3],
     /// Screen dimensions for texel calculations.
@@ -26,6 +28,7 @@ impl SssParams {
         Self {
             scatter_radius: 8.0,
             strength: 0.5,
+            _align: [0.0, 0.0],
             scatter_color: [1.0, 0.85, 0.75], // warm tint for marble
             _pad: 0.0,
             screen_size: [width, height],
@@ -137,7 +140,7 @@ impl SssPipeline {
                         module: &shader,
                         entry_point: Some("fs_main"),
                         targets: &[Some(wgpu::ColorTargetState {
-                            format: ctx.format(),
+                            format: HDR_FORMAT,
                             blend: None,
                             write_mask: wgpu::ColorWrites::ALL,
                         })],
@@ -166,6 +169,43 @@ impl SssPipeline {
         self.output_texture = create_sss_texture(device, config);
         self.output_view = self.output_texture.create_view(&Default::default());
     }
+
+    /// Create a bind group referencing the HDR color texture, depth texture, and a filtering sampler.
+    pub fn create_bind_group(
+        &self,
+        device: &wgpu::Device,
+        color_view: &wgpu::TextureView,
+        depth_view: &wgpu::TextureView,
+        sampler: &wgpu::Sampler,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("SSS Bind Group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(color_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: self.params_buffer.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
+    /// Update SSS parameters.
+    pub fn update_params(&self, queue: &wgpu::Queue, params: &SssParams) {
+        queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(params));
+    }
 }
 
 fn create_sss_texture(
@@ -182,7 +222,7 @@ fn create_sss_texture(
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: config.format,
+        format: HDR_FORMAT,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
         view_formats: &[],
     })

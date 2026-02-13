@@ -139,6 +139,38 @@ impl SsaoPipeline {
         self.output_texture = create_ssao_texture(device, config);
         self.output_view = self.output_texture.create_view(&Default::default());
     }
+
+    /// Create a bind group referencing the scene depth texture and a non-filtering sampler.
+    pub fn create_bind_group(
+        &self,
+        device: &wgpu::Device,
+        depth_view: &wgpu::TextureView,
+        sampler: &wgpu::Sampler,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("SSAO Bind Group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(depth_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: self.params_buffer.as_entire_binding(),
+                },
+            ],
+        })
+    }
+
+    /// Update SSAO parameters.
+    pub fn update_params(&self, queue: &wgpu::Queue, params: &SsaoParams) {
+        queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(params));
+    }
 }
 
 fn create_ssao_texture(
