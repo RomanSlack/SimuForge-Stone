@@ -2,14 +2,18 @@
 //!
 //! Three-pass O(n) algorithm for forward dynamics of an articulated rigid body system.
 //! Given joint torques → computes joint accelerations.
-
-use nalgebra::DVector;
+//!
+//! All storage uses fixed-size stack arrays (N=6) to avoid heap allocation
+//! in the physics hot loop (~80+ calls per frame during cutting).
 
 use crate::arm::RobotArm;
 use crate::spatial::{
     revolute_motion_subspace, spatial_cross_force, spatial_cross_motion, spatial_transform_from_dh,
     spatial_vec, SpatialMatrix, SpatialVector,
 };
+
+/// Max joints supported by stack-allocated arrays.
+const MAX_JOINTS: usize = 6;
 
 /// Compute exact gravity compensation torques using Recursive Newton-Euler.
 ///
@@ -21,25 +25,27 @@ use crate::spatial::{
 pub fn gravity_compensation_rnea(
     arm: &RobotArm,
     gravity: &nalgebra::Vector3<f64>,
-) -> Vec<f64> {
+) -> [f64; MAX_JOINTS] {
     let n = arm.num_joints();
+    debug_assert!(n <= MAX_JOINTS);
     let s = revolute_motion_subspace();
     let a_grav = spatial_vec(&nalgebra::Vector3::zeros(), &(-gravity));
 
     // Forward pass: propagate gravity acceleration through the chain
-    let mut x_j = Vec::with_capacity(n);
-    let mut a = vec![SpatialVector::zeros(); n];
+    let zero_sv = SpatialVector::zeros();
+    let mut x_j = [SpatialMatrix::zeros(); MAX_JOINTS];
+    let mut a = [zero_sv; MAX_JOINTS];
 
     for i in 0..n {
         let xj = spatial_transform_from_dh(&arm.dh_params[i], arm.joints[i].angle);
-        x_j.push(xj);
+        x_j[i] = xj;
         let a_parent = if i == 0 { a_grav } else { a[i - 1] };
         a[i] = xj * a_parent; // static: no joint velocity or acceleration terms
     }
 
     // Backward pass: compute link forces and project onto joint axes
-    let mut f = vec![SpatialVector::zeros(); n];
-    let mut torques = vec![0.0; n];
+    let mut f = [zero_sv; MAX_JOINTS];
+    let mut torques = [0.0; MAX_JOINTS];
 
     for i in (0..n).rev() {
         // Force = I * a (no Coriolis since v=0)
@@ -68,23 +74,26 @@ pub fn gravity_compensation_rnea(
 /// * `gravity` - Gravity vector in base frame [gx, gy, gz]
 ///
 /// # Returns
-/// Joint accelerations as a DVector<f64>
+/// Joint accelerations as `[f64; MAX_JOINTS]`
 pub fn articulated_body_algorithm(
     arm: &RobotArm,
     torques: &[f64],
     gravity: &nalgebra::Vector3<f64>,
-) -> DVector<f64> {
+) -> [f64; MAX_JOINTS] {
     let n = arm.num_joints();
+    debug_assert!(n <= MAX_JOINTS);
     assert_eq!(torques.len(), n);
 
     let s = revolute_motion_subspace(); // Same for all revolute joints
 
-    // ----- Storage -----
-    let mut x_j: Vec<SpatialMatrix> = Vec::with_capacity(n); // joint transforms
-    let mut v: Vec<SpatialVector> = vec![SpatialVector::zeros(); n]; // link velocities
-    let mut c: Vec<SpatialVector> = vec![SpatialVector::zeros(); n]; // bias accelerations
-    let mut i_a: Vec<SpatialMatrix> = Vec::with_capacity(n); // articulated inertias
-    let mut p_a: Vec<SpatialVector> = vec![SpatialVector::zeros(); n]; // bias forces
+    // ----- Storage (stack-allocated) -----
+    let zero_sv = SpatialVector::zeros();
+    let zero_sm = SpatialMatrix::zeros();
+    let mut x_j = [zero_sm; MAX_JOINTS]; // joint transforms
+    let mut v = [zero_sv; MAX_JOINTS]; // link velocities
+    let mut c = [zero_sv; MAX_JOINTS]; // bias accelerations
+    let mut i_a = [zero_sm; MAX_JOINTS]; // articulated inertias
+    let mut p_a = [zero_sv; MAX_JOINTS]; // bias forces
 
     // ----- Pass 1: Outward — compute velocities and bias terms -----
     // Base "acceleration" to account for gravity (virtual acceleration of base)
@@ -101,7 +110,7 @@ pub fn articulated_body_algorithm(
 
         // Joint spatial transform
         let xj = spatial_transform_from_dh(dh, qi);
-        x_j.push(xj);
+        x_j[i] = xj;
 
         // Velocity propagation
         let v_parent = if i == 0 {
@@ -117,7 +126,7 @@ pub fn articulated_body_algorithm(
         c[i] = spatial_cross_motion(&v[i], &v_j);
 
         // Initialize articulated inertia with rigid body inertia
-        i_a.push(arm.link_spatial_inertias[i]);
+        i_a[i] = arm.link_spatial_inertias[i];
 
         // Bias force: v × I*v (Coriolis in body frame)
         p_a[i] = spatial_cross_force(&v[i], &(arm.link_spatial_inertias[i] * v[i]));
@@ -159,8 +168,8 @@ pub fn articulated_body_algorithm(
     }
 
     // ----- Pass 3: Outward — accelerations -----
-    let mut qdd = DVector::zeros(n);
-    let mut a: Vec<SpatialVector> = vec![SpatialVector::zeros(); n];
+    let mut qdd = [0.0; MAX_JOINTS];
+    let mut a = [zero_sv; MAX_JOINTS];
 
     for i in 0..n {
         let a_parent = if i == 0 { a_grav } else { a[i - 1] };
@@ -227,7 +236,7 @@ mod tests {
             max_accel > 0.01,
             "Expected non-zero accelerations under gravity, got max={}. qdd={:?}",
             max_accel,
-            qdd.as_slice()
+            qdd
         );
     }
 
@@ -276,10 +285,10 @@ mod tests {
         let hold_torque = [12.0, 12.0, 8.5, 3.0, 3.0, 2.0];
 
         let mut max_err = 0.0_f64;
-        for step in 0..1000 {
+        for _step in 0..1000 {
             // RNEA-based gravity compensation (exact, includes coupling)
             let grav_comp = gravity_compensation_rnea(&arm, &gravity);
-            let mut taus = vec![0.0; n];
+            let mut taus = [0.0; MAX_JOINTS];
             for i in 0..n {
                 let err = targets[i] - arm.joints[i].angle;
                 let pd = kp[i] * err - kd[i] * arm.joints[i].velocity;
@@ -291,7 +300,7 @@ mod tests {
                 arm.joints[i].torque = joint_torque;
                 taus[i] = arm.joints[i].net_torque();
             }
-            let qdd = articulated_body_algorithm(&arm, &taus, &gravity);
+            let qdd = articulated_body_algorithm(&arm, &taus[..n], &gravity);
 
             for i in 0..n {
                 arm.joints[i].integrate(qdd[i], dt);

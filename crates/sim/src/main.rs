@@ -19,7 +19,6 @@ use simuforge_core::{isometry_to_glam, Vertex};
 use simuforge_cutting::forces::{self, MaterialProps};
 use simuforge_cutting::tool::{Tool, ToolState};
 use simuforge_material::async_mesher::AsyncMesher;
-use simuforge_material::mesher;
 use simuforge_material::octree::OctreeSdf;
 use simuforge_motors::gearbox::Gearbox;
 use simuforge_motors::pid;
@@ -326,6 +325,7 @@ impl SimState {
     }
 
     /// Run one physics step at 1kHz.
+    /// Run one physics step at 1kHz. Does NOT compute FK (caller handles that).
     fn physics_step(&mut self) {
         if self.paused {
             return;
@@ -337,8 +337,8 @@ impl SimState {
         // Exact gravity compensation via RNEA (includes inter-joint coupling)
         let grav_comp = gravity_compensation_rnea(&self.arm, &gravity);
 
-        // PID control: compute motor torque commands
-        let mut joint_torques = vec![0.0; n];
+        // PID control: compute motor torque commands (stack array, no heap alloc)
+        let mut joint_torques = [0.0; 6];
         for i in 0..n {
             let pid_output = self.pid_controllers[i].update(
                 self.joint_targets[i],
@@ -365,7 +365,7 @@ impl SimState {
         }
 
         // Forward dynamics (Featherstone ABA)
-        let accelerations = articulated_body_algorithm(&self.arm, &joint_torques, &gravity);
+        let accelerations = articulated_body_algorithm(&self.arm, &joint_torques[..n], &gravity);
 
         // Integrate + hard-clamp joint limits (safety net)
         for i in 0..n {
@@ -373,15 +373,17 @@ impl SimState {
             self.arm.joints[i].clamp_to_limits();
         }
 
-        // Forward kinematics → tool position
-        let tool_pose = self.arm.forward_kinematics();
-        let tool_pos = tool_pose.translation.vector;
-        self.tool_state.update_position(tool_pos);
-
         // Rotary table
         self.rotary_table.step(PHYSICS_DT);
 
         self.sim_time += PHYSICS_DT;
+    }
+
+    /// Update tool position from current FK. Called once per frame after all physics steps.
+    fn update_tool_state(&mut self) {
+        let tool_pose = self.arm.forward_kinematics();
+        let tool_pos = tool_pose.translation.vector;
+        self.tool_state.update_position(tool_pos);
     }
 
     /// Load a G-code file into a carving session and switch to carving mode.
@@ -597,6 +599,8 @@ struct App {
     joint_materials: Vec<MaterialBind>,
     base_mesh: Option<GpuMesh>,
     base_material: Option<MaterialBind>,
+    stand_mesh: Option<GpuMesh>,
+    stand_material: Option<MaterialBind>,
     ground_mesh: Option<GpuMesh>,
     ground_material: Option<MaterialBind>,
     workpiece_material: Option<MaterialBind>,
@@ -655,6 +659,8 @@ impl App {
             joint_materials: Vec::new(),
             base_mesh: None,
             base_material: None,
+            stand_mesh: None,
+            stand_material: None,
             ground_mesh: None,
             ground_material: None,
             workpiece_material: None,
@@ -856,6 +862,13 @@ impl App {
         let base_pos = Vec3::new(render_pts[0].x, render_pts[0].y - 0.13, render_pts[0].z);
         let base_model = Mat4::from_translation(base_pos);
 
+        // Workpiece stand model: centered under the workpiece
+        let wp_bottom_y = self.sim.workpiece_center.z as f32 - self.sim.workpiece_half_extent as f32;
+        let ground_y = -0.26_f32;
+        let stand_center_y = (wp_bottom_y + ground_y) / 2.0;
+        let stand_pos = Vec3::new(wc.x as f32, stand_center_y, -(wc.y as f32));
+        let stand_model = Mat4::from_translation(stand_pos);
+
         // Target sphere model
         let ct_pos = &self.sim.cartesian_target.translation.vector;
         let tgt_dh = Vec3::new(ct_pos.x as f32, ct_pos.y as f32, ct_pos.z as f32);
@@ -916,14 +929,19 @@ impl App {
                 .with_model(base_model.to_cols_array_2d());
             ctx.queue.write_buffer(&base_mat.buffer, 0, bytemuck::bytes_of(&mat));
         }
+        if let Some(stand_mat) = &self.stand_material {
+            let mat = MaterialUniform::metal([0.20, 0.20, 0.22, 1.0])
+                .with_model(stand_model.to_cols_array_2d());
+            ctx.queue.write_buffer(&stand_mat.buffer, 0, bytemuck::bytes_of(&mat));
+        }
 
         // --- Shadow setup ---
         let light_vp = ShadowPipeline::compute_light_matrix(light_dir.normalize(), 2.0);
         pbr.update_shadow_light_vp(&ctx.queue, &light_vp);
 
         // Collect shadow matrices: light_vp * model for each shadow caster
-        // Order: workpiece, arm links (6), joint spheres (7), tool body, tool tip, base
-        let mut shadow_matrices = Vec::with_capacity(16);
+        // Order: workpiece, arm links (6), joint spheres (7), tool body, tool tip, base, stand
+        let mut shadow_matrices = Vec::with_capacity(18);
         shadow_matrices.push(light_vp * workpiece_model); // 0: workpiece
         for i in 0..6 {
             shadow_matrices.push(light_vp * arm_models[i]); // 1-6: arm links
@@ -934,6 +952,7 @@ impl App {
         shadow_matrices.push(light_vp * tool_body_model); // 14: tool body
         shadow_matrices.push(light_vp * tool_tip_model);  // 15: tool tip
         shadow_matrices.push(light_vp * base_model);      // 16: base
+        shadow_matrices.push(light_vp * stand_model);     // 17: workpiece stand
 
         if let Some(shadow) = &self.shadow_pipeline {
             shadow.upload_matrices(&ctx.queue, &shadow_matrices);
@@ -952,12 +971,7 @@ impl App {
 
         // Upload completed meshes from background workers.
         let async_meshes = self.async_mesher.poll_completed();
-        let sync_meshes = if self.sim.workpiece.dirty_chunks.is_empty() {
-            Vec::new()
-        } else {
-            mesher::remesh_dirty_capped(&mut self.sim.workpiece, 2)
-        };
-        for mesh in async_meshes.iter().chain(sync_meshes.iter()) {
+        for mesh in &async_meshes {
             let coord = (mesh.coord.x, mesh.coord.y, mesh.coord.z);
             self.chunk_meshes.upload_chunk(
                 &ctx.device,
@@ -968,6 +982,8 @@ impl App {
                 &mesh.indices,
             );
         }
+        // Rebuild merged GPU buffer if any chunks changed (persistent buffer, no alloc).
+        self.chunk_meshes.rebuild_if_dirty(&ctx.device, &ctx.queue);
 
         // --- Begin rendering ---
         let output = match ctx.surface.get_current_texture() {
@@ -1031,12 +1047,12 @@ impl App {
 
             let mut si = 0usize; // shadow matrix index
 
-            // Workpiece chunks (all share same model matrix at index 0)
+            // Workpiece (single merged buffer, 1 draw call)
             pass.set_bind_group(0, &shadow.bind_group, &[ShadowPipeline::dynamic_offset(si)]);
-            for mesh in self.chunk_meshes.meshes.values() {
-                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..mesh.num_indices, 0, 0..1);
+            if let (Some(vb), Some(ib)) = (self.chunk_meshes.merged_vertex_buffer(), self.chunk_meshes.merged_index_buffer()) {
+                pass.set_vertex_buffer(0, vb.slice(..));
+                pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..self.chunk_meshes.merged_num_indices(), 0, 0..1);
             }
             si += 1;
 
@@ -1087,6 +1103,15 @@ impl App {
                 pass.set_index_buffer(bm.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..bm.num_indices, 0, 0..1);
             }
+            si += 1;
+
+            // Workpiece stand
+            if let Some(sm) = &self.stand_mesh {
+                pass.set_bind_group(0, &shadow.bind_group, &[ShadowPipeline::dynamic_offset(si)]);
+                pass.set_vertex_buffer(0, sm.vertex_buffer.slice(..));
+                pass.set_index_buffer(sm.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..sm.num_indices, 0, 0..1);
+            }
         }
 
         // ====== Pass 3: PBR → HDR texture (Clear to transparent) + depth (Clear) ======
@@ -1128,17 +1153,16 @@ impl App {
                 render_pass.draw_indexed(0..gnd_mesh.num_indices, 0, 0..1);
             }
 
-            // 2) Workpiece chunks
-            if let Some(wp) = &self.workpiece_material {
+            // 2) Workpiece (single merged draw call)
+            if let (Some(wp), Some(vb), Some(ib)) = (
+                &self.workpiece_material,
+                self.chunk_meshes.merged_vertex_buffer(),
+                self.chunk_meshes.merged_index_buffer(),
+            ) {
                 render_pass.set_bind_group(0, &wp.bind_group, &[]);
-                for mesh in self.chunk_meshes.meshes.values() {
-                    render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                    render_pass.set_index_buffer(
-                        mesh.index_buffer.slice(..),
-                        wgpu::IndexFormat::Uint32,
-                    );
-                    render_pass.draw_indexed(0..mesh.num_indices, 0, 0..1);
-                }
+                render_pass.set_vertex_buffer(0, vb.slice(..));
+                render_pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.draw_indexed(0..self.chunk_meshes.merged_num_indices(), 0, 0..1);
             }
 
             // 3) Arm links
@@ -1209,6 +1233,17 @@ impl App {
                     wgpu::IndexFormat::Uint32,
                 );
                 render_pass.draw_indexed(0..bm.num_indices, 0, 0..1);
+            }
+
+            // 9) Workpiece stand
+            if let (Some(sm), Some(smat)) = (&self.stand_mesh, &self.stand_material) {
+                render_pass.set_bind_group(0, &smat.bind_group, &[]);
+                render_pass.set_vertex_buffer(0, sm.vertex_buffer.slice(..));
+                render_pass.set_index_buffer(
+                    sm.index_buffer.slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                render_pass.draw_indexed(0..sm.num_indices, 0, 0..1);
             }
         }
 
@@ -1690,6 +1725,39 @@ impl ApplicationHandler for App {
             bind_group: bbg,
         });
 
+        // Workpiece stand: box from ground (render Y=-0.26) up to workpiece bottom.
+        // Workpiece bottom in render Y = workpiece_center_z - half_extent.
+        let wp_bottom_y = self.sim.workpiece_center.z as f32 - self.sim.workpiece_half_extent as f32;
+        let ground_y = -0.26_f32;
+        let stand_half_h = (wp_bottom_y - ground_y) / 2.0;
+        if stand_half_h > 0.001 {
+            let (stand_verts, stand_idxs) = generate_box(0.06, stand_half_h, 0.06);
+            let stand_vb = ctx
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Workpiece Stand VB"),
+                    contents: bytemuck::cast_slice(&stand_verts),
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+            let stand_ib = ctx
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("Workpiece Stand IB"),
+                    contents: bytemuck::cast_slice(&stand_idxs),
+                    usage: wgpu::BufferUsages::INDEX,
+                });
+            self.stand_mesh = Some(GpuMesh {
+                vertex_buffer: stand_vb,
+                index_buffer: stand_ib,
+                num_indices: stand_idxs.len() as u32,
+            });
+            let (sbuf, sbg) = pbr.create_material_bind_group(&ctx.device);
+            self.stand_material = Some(MaterialBind {
+                buffer: sbuf,
+                bind_group: sbg,
+            });
+        }
+
         // Ground plane at Y=-0.26 in render space.
         // Cube bottom: DH Z = -0.10 - 0.1525 = -0.2525 → render Y = -0.2525.
         let gs = 3.0f32; // 3m half-extent
@@ -2072,6 +2140,10 @@ impl ApplicationHandler for App {
                     if self.accumulator > PHYSICS_DT * 10.0 {
                         self.accumulator = 0.0;
                     }
+
+                    // FK → tool position: once per frame after all physics steps
+                    // (not per physics step — saves N-1 FK computations)
+                    self.sim.update_tool_state();
 
                     // Material removal: once per frame (not per physics step)
                     self.sim.material_removal_step();

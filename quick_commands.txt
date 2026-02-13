@@ -1,4 +1,4 @@
-cargo run
+cargo run --release <example gcode file>
 
   Controls once the window opens:
   - Space — pause/resume simulation
