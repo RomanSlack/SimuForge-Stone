@@ -341,8 +341,8 @@ mod tests {
         let gcode = GCodeInterpreter::load_file(gcode_path)
             .expect("Failed to load calibration.gcode");
 
-        // Workpiece params matching config.toml: center=(0.65, 0, 0.05), half=0.1525
-        let workpiece_center = Vector3::new(0.65, 0.0, 0.05);
+        // Workpiece params matching config.toml: center=(0.65, 0, -0.2), half=0.1525
+        let workpiece_center = Vector3::new(0.65, 0.0, -0.2);
         let half_extent = 0.1525;
         let workpiece_top_center = Vector3::new(
             workpiece_center.x,
@@ -426,7 +426,7 @@ mod tests {
         let mut gcode = GCodeInterpreter::new();
         gcode.parse(program);
 
-        let offset = Vector3::new(0.65, 0.0, 0.2025);
+        let offset = Vector3::new(0.65, 0.0, -0.0475); // -0.2 + 0.1525 = workpiece top
         let orient = UnitQuaternion::identity();
         let mut session = CarvingSession::from_interpreter(gcode, offset, orient).unwrap();
 

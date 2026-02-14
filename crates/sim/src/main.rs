@@ -179,10 +179,13 @@ impl SimState {
             pid::small_joint_pid(),
         ];
 
-        // Initial joint targets: arm positioned to reach workpiece from above
+        // Initial joint targets: arm positioned above and outside workpiece.
+        // With tool_offset=0.175 and center_z=-0.2, these angles put the tool
+        // at roughly (0.81, 0.0, -0.28) which is safely outside the workpiece
+        // bounds (0.50..0.80 in X, -0.35..-0.05 in Z).
         let mut joint_targets = vec![0.0; n];
-        joint_targets[1] = 0.6;   // J2: shoulder raised
-        joint_targets[2] = -0.6;  // J3: elbow bent down
+        joint_targets[1] = 0.5;   // J2: shoulder raised (less than before)
+        joint_targets[2] = -0.3;  // J3: elbow slightly bent
 
         // Set initial joint angles to match targets (start at the target pose)
         let mut arm = arm;
@@ -438,14 +441,15 @@ impl SimState {
             tool_down,
         );
 
-        // IK seeds: J2+J3 ≈ π/2 for tool-straight-down.
-        // Backward wrist (J5=+π/2) is primary for x<0.8.
+        // IK seeds optimized for tool_offset=0.175 and center_z=-0.2.
+        // The tool extends 175mm past the flange, so standard J2+J3≈π/2 seeds
+        // don't work — need seeds that place the flange higher.
         let seeds: &[[f64; 6]] = &[
-            [0.0, 1.0, 0.57, 0.0, pi2, 0.0],
-            [0.0, 0.9, 0.67, 0.0, pi2, 0.0],
-            [0.0, 0.8, 0.77, 0.0, pi2, 0.0],
-            [0.0, 1.1, 0.47, 0.0, pi2, 0.0],
+            [0.0, 0.5, 1.0, 0.0, pi2, 0.0],
+            [0.0, 0.3, 1.27, 0.0, pi2, 0.0],
+            [0.0, 0.7, 0.0, 0.0, pi2, 0.0],
             [0.0, 1.0, 0.57, pi, -pi2, 0.0], // forward wrist variant
+            [0.0, 0.8, 0.77, 0.0, pi2, 0.0],
         ];
 
         let mut best_angles: Option<Vec<f64>> = None;

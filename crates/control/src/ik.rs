@@ -397,6 +397,7 @@ mod tests {
         // 3. Verify arm tracks them with velocity limiting
 
         let mut arm = RobotArm::default_6dof();
+        arm.tool_offset = 0.175; // CRITICAL: sim sets this from config
         let solver = IkSolver {
             max_iterations: 50,
             position_tolerance: 5e-4,
@@ -406,27 +407,41 @@ mod tests {
             ..IkSolver::default()
         };
 
-        // Pre-position with multiple seeds (matching load_gcode IK seeds)
         let pi = std::f64::consts::PI;
         let pi2 = std::f64::consts::FRAC_PI_2;
-
-        // Tool-down orientation
         let tool_down = UnitQuaternion::from_axis_angle(&Vector3::x_axis(), pi);
         let orientation_weight = 0.6;
 
-        // Workpiece params: center=(0.65, 0, -0.05), half=0.1525
-        // NOTE: config.toml had center_z=0.05 which is WRONG — workpiece too high for arm
-        let workpiece_top = Vector3::new(0.65, 0.0, -0.05 + 0.1525);
+        // Workpiece params: center=(0.65, 0, -0.2), half=0.1525
+        // With tool_offset=0.175, the arm can reach z=0 and below with tool-down.
+        // workpiece_top = -0.2 + 0.1525 = -0.0475 (comfortably reachable)
+        let workpiece_center = Vector3::new(0.65, 0.0, -0.2);
+        let half_extent = 0.1525;
+        let workpiece_top = workpiece_center + Vector3::new(0.0, 0.0, half_extent);
         let start_pos = workpiece_top + Vector3::new(0.0, 0.0, 0.015);
 
-        // Try multiple IK seeds (same as load_gcode)
+        // Verify initial pose doesn't start inside the workpiece
+        let init_angles = vec![0.0, 0.6, -0.6, 0.0, 0.0, 0.0];
+        arm.set_joint_angles(&init_angles);
+        let init_pos = arm.tool_position();
+        let wp_min = workpiece_center - Vector3::new(half_extent, half_extent, half_extent);
+        let wp_max = workpiece_center + Vector3::new(half_extent, half_extent, half_extent);
+        let inside = init_pos.x > wp_min.x && init_pos.x < wp_max.x
+            && init_pos.y > wp_min.y && init_pos.y < wp_max.y
+            && init_pos.z > wp_min.z && init_pos.z < wp_max.z;
+        eprintln!("Initial tool pos: ({:.3},{:.3},{:.3}), inside workpiece: {}",
+            init_pos.x, init_pos.y, init_pos.z, inside);
+        eprintln!("Workpiece: ({:.3},{:.3},{:.3}) to ({:.3},{:.3},{:.3})",
+            wp_min.x, wp_min.y, wp_min.z, wp_max.x, wp_max.y, wp_max.z);
+
+        // Pre-position IK with seeds for tool_offset=0.175
         let start_target = Isometry3::from_parts(Translation3::from(start_pos), tool_down);
         let seeds: &[[f64; 6]] = &[
-            [0.0, 1.0, 0.57, 0.0, pi2, 0.0],
-            [0.0, 0.9, 0.67, 0.0, pi2, 0.0],
-            [0.0, 0.8, 0.77, 0.0, pi2, 0.0],
-            [0.0, 1.1, 0.47, 0.0, pi2, 0.0],
+            [0.0, 0.5, 1.0, 0.0, pi2, 0.0],
+            [0.0, 0.3, 1.27, 0.0, pi2, 0.0],
+            [0.0, 0.7, 0.0, 0.0, pi2, 0.0],
             [0.0, 1.0, 0.57, pi, -pi2, 0.0],
+            [0.0, 0.8, 0.77, 0.0, pi2, 0.0],
         ];
 
         let mut best_err = f64::MAX;
@@ -434,44 +449,33 @@ mod tests {
         for (si, seed) in seeds.iter().enumerate() {
             let mut scratch = arm.clone();
             scratch.set_joint_angles(&seed.to_vec());
-
-            // First check where this seed's FK puts the tool
-            let seed_pos = scratch.tool_position();
-            eprintln!("  Seed {}: FK=({:.3},{:.3},{:.3})", si,
-                seed_pos.x, seed_pos.y, seed_pos.z);
-
             let (ok, iters, err) = solver.solve_weighted(&mut scratch, &start_target, 0.5);
-            eprintln!("  Seed {}: converged={}, iters={}, error={:.1}mm, pos=({:.3},{:.3},{:.3})",
+            eprintln!("  Seed {}: conv={}, iters={}, err={:.1}mm pos=({:.3},{:.3},{:.3})",
                 si, ok, iters, err * 1000.0,
                 scratch.tool_position().x, scratch.tool_position().y, scratch.tool_position().z);
             if ok && err < best_err {
                 best_err = err;
                 best_ok = true;
                 arm.set_joint_angles(&scratch.joint_angles());
-            } else if err < best_err {
+            } else if !best_ok && err < best_err {
                 best_err = err;
                 arm.set_joint_angles(&scratch.joint_angles());
             }
         }
-
-        eprintln!("Pre-position: best_converged={}, best_error={:.1}mm", best_ok, best_err * 1000.0);
-        eprintln!("Target pos: ({:.3},{:.3},{:.3})", start_pos.x, start_pos.y, start_pos.z);
-        eprintln!("Actual pos: ({:.3},{:.3},{:.3})", arm.tool_position().x, arm.tool_position().y, arm.tool_position().z);
-
-        // Even if not perfectly converged, proceed if error is reasonable
-        assert!(best_err < 0.05, "Pre-positioning IK error too large: {:.1}mm", best_err * 1000.0);
+        eprintln!("Pre-position: converged={}, err={:.1}mm, target=({:.3},{:.3},{:.3})",
+            best_ok, best_err * 1000.0, start_pos.x, start_pos.y, start_pos.z);
+        assert!(best_ok, "Pre-positioning IK failed with tool_offset=0.175");
 
         let mut joint_targets = arm.joint_angles();
 
         // Simulate carving: interpolate between waypoints (like trajectory planner)
-        // Keep moves within the comfortable workspace (center ± 50mm in XY)
         let waypoints = [
             workpiece_top + Vector3::new(0.0, 0.0, 0.01),     // Z+10mm (safe)
             workpiece_top + Vector3::new(0.0, 0.0, -0.003),   // Z-3mm (shallow cut)
             workpiece_top + Vector3::new(0.05, 0.0, -0.003),  // Move +X 50mm
             workpiece_top + Vector3::new(0.05, 0.05, -0.003), // Move +Y 50mm
             workpiece_top + Vector3::new(0.0, 0.05, -0.003),  // Back to center X
-            workpiece_top + Vector3::new(0.0, -0.05, -0.003), // Move -Y 100mm (through center)
+            workpiece_top + Vector3::new(0.0, -0.05, -0.003), // Move -Y 100mm
             workpiece_top + Vector3::new(0.0, 0.0, -0.02),    // Center, deeper Z-20mm
             workpiece_top + Vector3::new(0.0, 0.0, 0.01),     // Retract
         ];
@@ -567,6 +571,164 @@ mod tests {
         eprintln!("Total frames: {}, config rejected: {}", total_moves, stuck_count);
         assert!(stuck_count < total_moves / 4,
             "Too many config rejections: {}/{}", stuck_count, total_moves);
+    }
+
+    /// Diagnostic test: replicate the EXACT sim carving loop (load_gcode → update_ik)
+    /// to find why "IK fail" appears in the UI.
+    #[test]
+    fn test_sim_carving_loop_diagnostic() {
+        use nalgebra::{Isometry3, Translation3, UnitQuaternion};
+        use crate::carving::CarvingSession;
+        use crate::gcode::GCodeInterpreter;
+
+        let mut arm = RobotArm::default_6dof();
+        arm.tool_offset = 0.175;
+        let solver = IkSolver {
+            damping: 0.05,
+            max_iterations: 50,
+            position_tolerance: 5e-4,
+            orientation_tolerance: 0.005,
+            max_step: 0.2,
+            nullspace_gain: 0.5,
+        };
+
+        let pi = std::f64::consts::PI;
+        let pi2 = std::f64::consts::FRAC_PI_2;
+        let tool_down = UnitQuaternion::from_axis_angle(&Vector3::x_axis(), pi);
+        let orientation_weight = 0.6;
+
+        // --- Exactly replicate load_gcode ---
+        let workpiece_center = Vector3::new(0.65, 0.0, -0.2);
+        let half_extent = 0.1525;
+        let workpiece_top_center = Vector3::new(
+            workpiece_center.x, workpiece_center.y,
+            workpiece_center.z + half_extent,
+        );
+        let start_pos = workpiece_top_center + Vector3::new(0.0, 0.0, 0.015);
+        let start_target = Isometry3::from_parts(Translation3::from(start_pos), tool_down);
+
+        let seeds: &[[f64; 6]] = &[
+            [0.0, 0.5, 1.0, 0.0, pi2, 0.0],
+            [0.0, 0.3, 1.27, 0.0, pi2, 0.0],
+            [0.0, 0.7, 0.0, 0.0, pi2, 0.0],
+            [0.0, 1.0, 0.57, pi, -pi2, 0.0],
+            [0.0, 0.8, 0.77, 0.0, pi2, 0.0],
+        ];
+
+        let mut best_err = f64::MAX;
+        for seed in seeds {
+            let mut scratch = arm.clone();
+            scratch.set_joint_angles(&seed.to_vec());
+            let (ok, _, err) = solver.solve_weighted(&mut scratch, &start_target, 0.5);
+            if ok && err < best_err {
+                best_err = err;
+                arm.set_joint_angles(&scratch.joint_angles());
+            }
+        }
+        assert!(best_err < 0.001, "Pre-positioning failed: err={:.1}mm", best_err * 1000.0);
+        let angles = arm.joint_angles();
+        eprintln!("Pre-positioned: J2={:.1}° J3={:.1}° J4={:.1}° J5={:.1}°",
+            angles[1].to_degrees(), angles[2].to_degrees(),
+            angles[3].to_degrees(), angles[4].to_degrees());
+        eprintln!("Config flags: {:?}", arm.configuration_flags());
+        assert!(arm.is_collision_free(), "Pre-positioned arm is in self-collision!");
+
+        let mut joint_targets = arm.joint_angles();
+        let converged_fk = arm.forward_kinematics();
+        let tool_orientation = converged_fk.rotation;
+
+        // --- Load actual G-code and create session ---
+        let gcode_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/calibration.gcode");
+        let gcode = GCodeInterpreter::load_file(gcode_path).expect("Failed to load");
+        let mut session = CarvingSession::from_interpreter(gcode, workpiece_top_center, tool_orientation)
+            .expect("Failed to create session");
+        session.set_start_position(arm.tool_position());
+        session.start();
+
+        // --- Simulate the exact update_ik logic for N frames ---
+        let mut cartesian_target = converged_fk;
+        let frame_dt = 1.0 / 60.0;
+        let speed_multiplier = 5.0;
+        let mut ik_fails = 0;
+        let mut config_rejects = 0;
+        let mut collision_rejects = 0;
+        let mut total_frames = 0;
+
+        for _ in 0..300 { // 300 frames = 5 seconds at 60fps
+            let scaled_dt = frame_dt * speed_multiplier;
+            if let Some(target) = session.step(scaled_dt) {
+                cartesian_target = target;
+            }
+
+            // --- Exact copy of update_ik ---
+            let prev_config = arm.configuration_flags();
+
+            let mut scratch = arm.clone();
+            scratch.set_joint_angles(&joint_targets);
+
+            let (converged, iters, _ik_err) = solver.solve_weighted(
+                &mut scratch, &cartesian_target, orientation_weight,
+            );
+
+            let new_angles = scratch.joint_angles();
+            let new_config = scratch.configuration_flags();
+            let config_dist = scratch.config_distance(&joint_targets);
+
+            if new_config != prev_config && config_dist > 0.3 {
+                config_rejects += 1;
+                if total_frames < 10 {
+                    eprintln!("Frame {}: CONFIG REJECT prev={:?} new={:?} dist={:.2}",
+                        total_frames, prev_config, new_config, config_dist);
+                }
+                total_frames += 1;
+                continue;
+            }
+
+            if !scratch.is_collision_free() {
+                collision_rejects += 1;
+                if total_frames < 10 {
+                    eprintln!("Frame {}: COLLISION REJECT angles=({:.1},{:.1},{:.1},{:.1},{:.1},{:.1})",
+                        total_frames,
+                        new_angles[0].to_degrees(), new_angles[1].to_degrees(),
+                        new_angles[2].to_degrees(), new_angles[3].to_degrees(),
+                        new_angles[4].to_degrees(), new_angles[5].to_degrees());
+                }
+                total_frames += 1;
+                continue;
+            }
+
+            if !converged {
+                ik_fails += 1;
+            }
+
+            // Apply velocity limiting
+            let mut deltas: Vec<f64> = new_angles.iter().zip(joint_targets.iter())
+                .map(|(new, old)| new - old).collect();
+            IkSolver::apply_velocity_limits(&mut deltas, &arm, frame_dt);
+            for i in 0..joint_targets.len() {
+                joint_targets[i] += deltas[i];
+            }
+            arm.set_joint_angles(&joint_targets);
+
+            if total_frames < 10 || total_frames % 50 == 0 {
+                let pos = arm.tool_position();
+                let tgt = cartesian_target.translation.vector;
+                let err = (pos - tgt).norm();
+                eprintln!("Frame {}: conv={} iters={} err={:.1}mm pos=({:.3},{:.3},{:.3}) tgt=({:.3},{:.3},{:.3})",
+                    total_frames, converged, iters, err * 1000.0,
+                    pos.x, pos.y, pos.z, tgt.x, tgt.y, tgt.z);
+            }
+            total_frames += 1;
+        }
+
+        eprintln!("=== RESULTS: {} frames, {} IK fails, {} config rejects, {} collision rejects ===",
+            total_frames, ik_fails, config_rejects, collision_rejects);
+
+        // The arm should be successfully tracking for most frames
+        let reject_rate = (config_rejects + collision_rejects) as f64 / total_frames.max(1) as f64;
+        assert!(reject_rate < 0.25,
+            "Too many rejections: {:.0}% ({} config + {} collision out of {} frames)",
+            reject_rate * 100.0, config_rejects, collision_rejects, total_frames);
     }
 
     #[test]

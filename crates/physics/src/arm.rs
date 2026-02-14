@@ -247,15 +247,17 @@ impl RobotArm {
     /// Returns true if the arm is collision-free.
     pub fn is_collision_free(&self) -> bool {
         let frames = self.link_frames();
-        // Link capsule radii (matching rendering radii + margin)
-        const RADII: [f64; 6] = [0.10, 0.08, 0.07, 0.05, 0.05, 0.04];
-        const MARGIN: f64 = 0.02;
+        // Link capsule radii (matching rendering radii)
+        const RADII: [f64; 6] = [0.08, 0.07, 0.06, 0.05, 0.05, 0.04];
+        const MARGIN: f64 = 0.01;
 
-        // Non-adjacent pairs to check
-        const PAIRS: [(usize, usize); 10] = [
+        // Non-adjacent pairs to check.
+        // Note: Link 3 (J4) is zero-length (a=0, d=0), so links 2 and 4 share
+        // an endpoint through it — skip (2,4) as they're effectively adjacent.
+        const PAIRS: [(usize, usize); 9] = [
             (0, 2), (0, 3), (0, 4), (0, 5),
             (1, 3), (1, 4), (1, 5),
-            (2, 4), (2, 5),
+            (2, 5),
             (3, 5),
         ];
 

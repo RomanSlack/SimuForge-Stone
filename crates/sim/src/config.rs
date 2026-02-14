@@ -107,7 +107,7 @@ impl SimConfig {
             workpiece_center: [
                 cfg.get_f64("workpiece.center_x", 0.65),
                 cfg.get_f64("workpiece.center_y", 0.0),
-                cfg.get_f64("workpiece.center_z", -0.05),
+                cfg.get_f64("workpiece.center_z", -0.2),
             ],
             workpiece_half_extent: cfg.get_f64("workpiece.half_extent", 0.1525),
             workpiece_resolution: cfg.get_f64("workpiece.resolution", 0.0005),
