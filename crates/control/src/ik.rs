@@ -640,7 +640,7 @@ mod tests {
         // --- Load actual G-code and create session ---
         let gcode_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/calibration.gcode");
         let gcode = GCodeInterpreter::load_file(gcode_path).expect("Failed to load");
-        let mut session = CarvingSession::from_interpreter(gcode, workpiece_top_center, tool_orientation)
+        let mut session = CarvingSession::from_interpreter(gcode, workpiece_center, half_extent, tool_orientation)
             .expect("Failed to create session");
         session.set_start_position(arm.tool_position());
         session.start();

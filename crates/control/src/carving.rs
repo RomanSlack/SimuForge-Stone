@@ -1,6 +1,6 @@
 //! Carving execution engine — state machine bridging G-code → trajectory → Cartesian targets.
 
-use nalgebra::{Isometry3, UnitQuaternion, Vector3};
+use nalgebra::{Isometry3, Rotation3, UnitQuaternion, Vector3};
 
 use crate::gcode::{GCodeInterpreter, GCommand};
 use crate::trajectory::{TrajectoryPlanner, Waypoint};
@@ -34,10 +34,12 @@ pub struct CarvingSession {
     current_position: Vector3<f64>,
     pub state: CarvingState,
     pub speed_multiplier: f64,
-    /// Offset from G-code local coords to DH world coords.
-    pub workpiece_offset: Vector3<f64>,
-    /// Fixed tool orientation (tool-down for 3-axis milling).
-    pub tool_orientation: UnitQuaternion<f64>,
+    /// Workpiece center in DH world coords.
+    pub workpiece_center: Vector3<f64>,
+    /// Half-extent of the cube (for computing surface offset).
+    pub half_extent: f64,
+    /// Base tool orientation at A=0 (tool-down for top-face milling).
+    pub base_tool_orientation: UnitQuaternion<f64>,
     pub spindle_on: bool,
     /// Whether the current segment is a rapid move (G0) — no cutting during rapids.
     pub is_rapid: bool,
@@ -49,32 +51,51 @@ pub struct CarvingSession {
 
 impl CarvingSession {
     /// Load a G-code file and prepare the carving session.
-    pub fn load_file(path: &str, workpiece_offset: Vector3<f64>, tool_orientation: UnitQuaternion<f64>) -> Result<Self, String> {
+    pub fn load_file(path: &str, workpiece_center: Vector3<f64>, half_extent: f64, tool_orientation: UnitQuaternion<f64>) -> Result<Self, String> {
         let gcode = GCodeInterpreter::load_file(path)?;
-        Self::from_interpreter(gcode, workpiece_offset, tool_orientation)
+        Self::from_interpreter(gcode, workpiece_center, half_extent, tool_orientation)
+    }
+
+    /// Compute world position from G-code local position and A-axis angle.
+    fn gcode_to_world(&self, gcode_pos: &Vector3<f64>, a_angle: f64) -> Vector3<f64> {
+        let local = *gcode_pos + Vector3::new(0.0, 0.0, self.half_extent);
+        let rot = Rotation3::from_axis_angle(&Vector3::x_axis(), a_angle);
+        self.workpiece_center + rot * local
+    }
+
+    /// Compute tool orientation for the given A-axis angle.
+    fn tool_orientation_at(&self, a_angle: f64) -> UnitQuaternion<f64> {
+        let rot = UnitQuaternion::from_axis_angle(&Vector3::x_axis(), a_angle);
+        rot * self.base_tool_orientation
     }
 
     /// Create from a pre-parsed interpreter.
     pub fn from_interpreter(
         gcode: GCodeInterpreter,
-        workpiece_offset: Vector3<f64>,
+        workpiece_center: Vector3<f64>,
+        half_extent: f64,
         tool_orientation: UnitQuaternion<f64>,
     ) -> Result<Self, String> {
+        let workpiece_top = workpiece_center + Vector3::new(0.0, 0.0, half_extent);
+
         // Pre-extract all waypoints for visualization and time estimation
         let mut preview = gcode.clone();
         let mut waypoints = Vec::new();
 
-        // Start position (G-code origin mapped to world)
+        // Start position (G-code origin mapped to world at A=0)
         waypoints.push(CarvingWaypoint {
-            position: workpiece_offset,
+            position: workpiece_top,
             is_rapid: true,
             feed_rate: preview.rapid_rate,
         });
 
-        // Walk through all commands to extract waypoints
-        while let Some((pos, feed, _a)) = preview.next_target() {
-            let world_pos = pos + workpiece_offset;
-            // Determine if this was a rapid by checking feed rate against rapid_rate
+        // Walk through all commands to extract waypoints, tracking A-axis
+        let mut preview_a: f64;
+        while let Some((pos, feed, a)) = preview.next_target() {
+            preview_a = a;
+            let local = pos + Vector3::new(0.0, 0.0, half_extent);
+            let rot = Rotation3::from_axis_angle(&Vector3::x_axis(), preview_a);
+            let world_pos = workpiece_center + rot * local;
             let is_rapid = (feed - preview.rapid_rate).abs() < 1e-6;
             waypoints.push(CarvingWaypoint {
                 position: world_pos,
@@ -97,11 +118,12 @@ impl CarvingSession {
             planner: TrajectoryPlanner::new(0.5), // 0.5 m/s² default accel
             waypoints,
             current_waypoint: 0,
-            current_position: workpiece_offset,
+            current_position: workpiece_top,
             state: CarvingState::Idle,
             speed_multiplier: 1.0,
-            workpiece_offset,
-            tool_orientation,
+            workpiece_center,
+            half_extent,
+            base_tool_orientation: tool_orientation,
             spindle_on: false,
             is_rapid: true,
             elapsed_time: 0.0,
@@ -118,7 +140,8 @@ impl CarvingSession {
                 self.current_waypoint = 0;
                 self.spindle_on = false;
                 self.elapsed_time = 0.0;
-                self.current_position = self.workpiece_offset;
+                let workpiece_top = self.workpiece_center + Vector3::new(0.0, 0.0, self.half_extent);
+                self.current_position = workpiece_top;
                 self.load_next_segment();
             }
             self.state = CarvingState::Running;
@@ -162,7 +185,7 @@ impl CarvingSession {
         self.gcode.reset();
         self.planner = TrajectoryPlanner::new(0.5);
         self.current_waypoint = 0;
-        self.current_position = self.workpiece_offset;
+        self.current_position = self.workpiece_center + Vector3::new(0.0, 0.0, self.half_extent);
         self.state = CarvingState::Idle;
         self.spindle_on = false;
         self.is_rapid = true;
@@ -172,10 +195,11 @@ impl CarvingSession {
 
     /// Advance the carving by dt seconds. Returns the next Cartesian target pose, or None when complete.
     pub fn step(&mut self, dt: f64) -> Option<Isometry3<f64>> {
+        let orient = self.tool_orientation_at(self.a_axis_target);
         if self.state != CarvingState::Running {
             return Some(Isometry3::from_parts(
                 nalgebra::Translation3::from(self.current_position),
-                self.tool_orientation,
+                orient,
             ));
         }
 
@@ -186,7 +210,7 @@ impl CarvingSession {
             self.current_position = pos;
             return Some(Isometry3::from_parts(
                 nalgebra::Translation3::from(pos),
-                self.tool_orientation,
+                orient,
             ));
         }
 
@@ -204,7 +228,7 @@ impl CarvingSession {
                 self.current_position = pos;
                 return Some(Isometry3::from_parts(
                     nalgebra::Translation3::from(pos),
-                    self.tool_orientation,
+                    orient,
                 ));
             }
             // Segment completed immediately (zero-length slipped through) — try next
@@ -243,7 +267,7 @@ impl CarvingSession {
             // Detect rapid moves (feed rate matches rapid_rate)
             self.is_rapid = (feed_rate - self.gcode.rapid_rate).abs() < 1e-6;
 
-            let world_target = target_pos + self.workpiece_offset;
+            let world_target = self.gcode_to_world(&target_pos, self.a_axis_target);
             let dist = (world_target - self.current_position).norm();
 
             self.current_waypoint += 1;
@@ -314,9 +338,9 @@ mod tests {
         let mut gcode = GCodeInterpreter::new();
         gcode.parse(program);
 
-        let offset = Vector3::new(0.86, 0.25, -0.10);
+        let center = Vector3::new(0.86, 0.25, -0.20);
         let orient = UnitQuaternion::identity();
-        let mut session = CarvingSession::from_interpreter(gcode, offset, orient).unwrap();
+        let mut session = CarvingSession::from_interpreter(gcode, center, 0.1, orient).unwrap();
 
         assert_eq!(session.state, CarvingState::Idle);
         assert!(session.waypoints.len() >= 3);
@@ -344,11 +368,6 @@ mod tests {
         // Workpiece params matching config.toml: center=(0.65, 0, -0.2), half=0.1525
         let workpiece_center = Vector3::new(0.65, 0.0, -0.2);
         let half_extent = 0.1525;
-        let workpiece_top_center = Vector3::new(
-            workpiece_center.x,
-            workpiece_center.y,
-            workpiece_center.z + half_extent,
-        );
         let orient = UnitQuaternion::from_axis_angle(
             &Vector3::x_axis(), std::f64::consts::PI,
         );
@@ -357,7 +376,7 @@ mod tests {
         eprintln!("Calibration G-code: {} commands parsed", cmd_count);
         assert!(cmd_count > 50, "Expected >50 commands, got {}", cmd_count);
 
-        let mut session = CarvingSession::from_interpreter(gcode, workpiece_top_center, orient)
+        let mut session = CarvingSession::from_interpreter(gcode, workpiece_center, half_extent, orient)
             .expect("Failed to create CarvingSession");
 
         let wp_count = session.waypoints.len();
@@ -412,8 +431,8 @@ mod tests {
         let y_range = max_pos.y - min_pos.y;
         eprintln!("Workspace coverage: X={:.1}mm, Y={:.1}mm, Z range=[{:.1}mm, {:.1}mm]",
             x_range * 1000.0, y_range * 1000.0,
-            (min_pos.z - workpiece_top_center.z) * 1000.0,
-            (max_pos.z - workpiece_top_center.z) * 1000.0);
+            (min_pos.z - (workpiece_center.z + half_extent)) * 1000.0,
+            (max_pos.z - (workpiece_center.z + half_extent)) * 1000.0);
         assert!(x_range > 0.1, "X range too small: {:.3}m", x_range);
         assert!(y_range > 0.1, "Y range too small: {:.3}m", y_range);
     }
@@ -426,9 +445,9 @@ mod tests {
         let mut gcode = GCodeInterpreter::new();
         gcode.parse(program);
 
-        let offset = Vector3::new(0.65, 0.0, -0.0475); // -0.2 + 0.1525 = workpiece top
+        let center = Vector3::new(0.65, 0.0, -0.2);
         let orient = UnitQuaternion::identity();
-        let mut session = CarvingSession::from_interpreter(gcode, offset, orient).unwrap();
+        let mut session = CarvingSession::from_interpreter(gcode, center, 0.1525, orient).unwrap();
 
         session.start();
         assert_eq!(session.state, CarvingState::Running);

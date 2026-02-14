@@ -1,7 +1,5 @@
 //! Revolute joint model with limits, friction, and backlash.
 
-use std::f64::consts::PI;
-
 /// A single revolute joint with physical properties.
 #[derive(Debug, Clone)]
 pub struct RevoluteJoint {
@@ -151,9 +149,9 @@ impl RotaryTable {
         let friction = -self.viscous_friction * self.velocity;
         let accel = (self.torque + friction) / self.inertia;
         self.velocity += accel * dt;
+        // Clamp velocity to prevent runaway
+        self.velocity = self.velocity.clamp(-6.0, 6.0);
         self.angle += self.velocity * dt;
-        // Wrap to [-π, π]
-        self.angle = ((self.angle + PI) % (2.0 * PI) + 2.0 * PI) % (2.0 * PI) - PI;
     }
 }
 

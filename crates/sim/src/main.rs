@@ -504,7 +504,7 @@ impl SimState {
         // so there's zero initial error → no flailing.
         self.cartesian_target = converged_fk;
 
-        let mut session = CarvingSession::load_file(path, workpiece_top_center, tool_orientation)?;
+        let mut session = CarvingSession::load_file(path, self.workpiece_center, half_extent, tool_orientation)?;
         session.set_start_position(self.arm.tool_position());
 
         eprintln!(
@@ -656,6 +656,10 @@ struct App {
     speed_multiplier: f64,
     max_physics_steps: u32,
     gcode_path: Option<String>,
+    /// Previous A-axis target — detect when rotation is needed.
+    prev_a_axis: f64,
+    /// Retract phase during A-axis rotation: 0=none, 1=retracting, 2=rotating, 3=approaching.
+    retract_phase: u8,
     // Background meshing
     async_mesher: AsyncMesher,
     // Config-derived visual params
@@ -713,6 +717,8 @@ impl App {
             speed_multiplier: cfg.default_speed,
             max_physics_steps: cfg.max_physics_steps,
             gcode_path: None,
+            prev_a_axis: 0.0,
+            retract_phase: 0,
             held_keys: HeldKeys::default(),
             async_mesher: AsyncMesher::new(0),
             tool_radius_m: cfg.tool_radius_mm * 0.001,
@@ -897,13 +903,14 @@ impl App {
         let tip_to = swap.transform_point3(tip_end_dh);
         let tool_tip_model = link_model(body_to, tip_to, self.tool_radius_m as f32);
 
-        // Base model
-        let base_pos = Vec3::new(render_pts[0].x, render_pts[0].y - 0.13, render_pts[0].z);
+        // Base model — pedestal from arm base down to ground
+        let wp_bottom_y = self.sim.workpiece_center.z as f32 - self.sim.workpiece_half_extent as f32;
+        let ground_y = wp_bottom_y - 0.01;
+        let base_half_h = (-ground_y / 2.0).max(0.01);
+        let base_pos = Vec3::new(render_pts[0].x, render_pts[0].y - base_half_h, render_pts[0].z);
         let base_model = Mat4::from_translation(base_pos);
 
         // Workpiece stand model: centered under the workpiece
-        let wp_bottom_y = self.sim.workpiece_center.z as f32 - self.sim.workpiece_half_extent as f32;
-        let ground_y = -0.26_f32;
         let stand_center_y = (wp_bottom_y + ground_y) / 2.0;
         let stand_pos = Vec3::new(wc.x as f32, stand_center_y, -(wc.y as f32));
         let stand_model = Mat4::from_translation(stand_pos);
@@ -1736,9 +1743,13 @@ impl ApplicationHandler for App {
             });
         }
 
-        // Base pedestal: tall box from arm base (Y=0) down to ground (Y=-0.26).
-        // Half-height = 0.13, centered at Y = -0.13.
-        let (base_verts, base_idxs) = generate_box(0.10, 0.13, 0.10);
+        // Ground level: just below the workpiece bottom.
+        let wp_bottom_y_init = self.sim.workpiece_center.z as f32 - self.sim.workpiece_half_extent as f32;
+        let ground_y_init = wp_bottom_y_init - 0.01; // 1cm below workpiece bottom
+
+        // Base pedestal: tall box from arm base (Y=0) down to ground.
+        let base_half_h = (-ground_y_init / 2.0).max(0.01);
+        let (base_verts, base_idxs) = generate_box(0.10, base_half_h, 0.10);
         let base_vb = ctx
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1764,10 +1775,9 @@ impl ApplicationHandler for App {
             bind_group: bbg,
         });
 
-        // Workpiece stand: box from ground (render Y=-0.26) up to workpiece bottom.
-        // Workpiece bottom in render Y = workpiece_center_z - half_extent.
+        // Workpiece stand: box from ground up to workpiece bottom.
         let wp_bottom_y = self.sim.workpiece_center.z as f32 - self.sim.workpiece_half_extent as f32;
-        let ground_y = -0.26_f32;
+        let ground_y = wp_bottom_y - 0.01;
         let stand_half_h = (wp_bottom_y - ground_y) / 2.0;
         if stand_half_h > 0.001 {
             let (stand_verts, stand_idxs) = generate_box(0.06, stand_half_h, 0.06);
@@ -1797,10 +1807,9 @@ impl ApplicationHandler for App {
             });
         }
 
-        // Ground plane at Y=-0.26 in render space.
-        // Cube bottom: DH Z = -0.10 - 0.1525 = -0.2525 → render Y = -0.2525.
+        // Ground plane just below workpiece bottom.
         let gs = 3.0f32; // 3m half-extent
-        let gy = -0.26f32;
+        let gy = ground_y;
         let gnd_verts = vec![
             Vertex { position: [-gs, gy, -gs], normal: [0.0, 1.0, 0.0] },
             Vertex { position: [ gs, gy, -gs], normal: [0.0, 1.0, 0.0] },
@@ -2152,22 +2161,72 @@ impl ApplicationHandler for App {
                 if self.sim.mode == SimMode::Carving {
                     if let Some(session) = &mut self.sim.carving {
                         if session.state == CarvingState::Running {
-                            // Drive rotary table toward A-axis target with PD control
-                            let a_target = session.a_axis_target;
-                            let a_err = a_target - self.sim.rotary_table.angle;
-                            self.sim.rotary_table.torque =
-                                200.0 * a_err - 40.0 * self.sim.rotary_table.velocity;
-
-                            // Gate carving during table rotation: if error > ~1°, pause session
-                            let table_settled = a_err.abs() < 0.02;
-
                             let scaled_dt = clamped_frame_time * self.speed_multiplier;
-                            if table_settled {
-                                if let Some(target) = session.step(scaled_dt) {
-                                    self.sim.cartesian_target = target;
+
+                            match self.retract_phase {
+                                1 => {
+                                    // Phase 1: Retracting — wait for arm to reach safe position
+                                    let arm_pos = self.sim.arm.tool_position();
+                                    let tgt_pos = self.sim.cartesian_target.translation.vector;
+                                    let err = (arm_pos - tgt_pos).norm();
+                                    if err < 0.03 { // within 30mm of retract position
+                                        self.retract_phase = 2;
+                                        eprintln!("Retract complete (err={:.1}mm), rotating to A={:.1}°",
+                                            err * 1000.0, self.prev_a_axis.to_degrees());
+                                    }
+                                }
+                                2 => {
+                                    // Phase 2: Rotating table — drive PD and wait to settle
+                                    let a_err = self.prev_a_axis - self.sim.rotary_table.angle;
+                                    self.sim.rotary_table.torque =
+                                        200.0 * a_err - 80.0 * self.sim.rotary_table.velocity;
+                                    if a_err.abs() < 0.02 && self.sim.rotary_table.velocity.abs() < 0.1 {
+                                        self.retract_phase = 0;
+                                        eprintln!("Table settled at A={:.1}°, resuming carving",
+                                            self.prev_a_axis.to_degrees());
+                                    }
+                                }
+                                _ => {
+                                    // Phase 0: Normal carving — advance session and check for A changes
+                                    let a_err = session.a_axis_target - self.sim.rotary_table.angle;
+                                    self.sim.rotary_table.torque =
+                                        200.0 * a_err - 80.0 * self.sim.rotary_table.velocity;
+                                    let table_settled = a_err.abs() < 0.02;
+
+                                    if table_settled {
+                                        let a_before = session.a_axis_target;
+                                        if let Some(target) = session.step(scaled_dt) {
+                                            self.sim.cartesian_target = target;
+                                        }
+                                        let a_after = session.a_axis_target;
+
+                                        // Detect A-axis change AFTER stepping the session
+                                        if (a_after - a_before).abs() > 0.01 {
+                                            self.retract_phase = 1;
+                                            self.sim.tool_state.spindle_on = false;
+                                            self.prev_a_axis = a_after; // the NEW target angle
+                                            // Retract: move above rotation envelope
+                                            let he = self.sim.workpiece_half_extent;
+                                            let safe_z = self.sim.workpiece_center.z + he * 1.5 + 0.05;
+                                            let retract_pos = nalgebra::Vector3::new(
+                                                self.sim.workpiece_center.x,
+                                                self.sim.workpiece_center.y,
+                                                safe_z,
+                                            );
+                                            let orient = self.sim.cartesian_target.rotation;
+                                            self.sim.cartesian_target = nalgebra::Isometry3::from_parts(
+                                                nalgebra::Translation3::from(retract_pos),
+                                                orient,
+                                            );
+                                            eprintln!("A-axis change to {:.1}°: retracting to Z={:.3}",
+                                                a_after.to_degrees(), safe_z);
+                                        }
+                                    }
+                                    if self.retract_phase == 0 {
+                                        self.sim.tool_state.spindle_on = session.spindle_on && table_settled;
+                                    }
                                 }
                             }
-                            self.sim.tool_state.spindle_on = session.spindle_on && table_settled;
                             self.sim.paused = false;
                         }
                     }
