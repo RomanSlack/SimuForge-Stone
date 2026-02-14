@@ -94,6 +94,8 @@ pub struct SimConfig {
     pub max_physics_steps: u32,
     pub tracking_threshold: f64,
     pub orientation_weight: f64,
+    // Track
+    pub track_default_position: f64,
 }
 
 impl SimConfig {
@@ -115,6 +117,7 @@ impl SimConfig {
             max_physics_steps: cfg.get_u32("carving.max_physics_steps", 5000),
             tracking_threshold: cfg.get_f64("carving.tracking_threshold", 0.01),
             orientation_weight: cfg.get_f64("carving.orientation_weight", 0.6),
+            track_default_position: cfg.get_f64("track.default_position", 0.0),
         }
     }
 }

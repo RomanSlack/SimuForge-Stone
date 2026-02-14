@@ -1,6 +1,6 @@
 //! Carving execution engine — state machine bridging G-code → trajectory → Cartesian targets.
 
-use nalgebra::{Isometry3, Rotation3, UnitQuaternion, Vector3};
+use nalgebra::{Isometry3, UnitQuaternion, Vector3};
 
 use crate::gcode::{GCodeInterpreter, GCommand};
 use crate::trajectory::{TrajectoryPlanner, Waypoint};
@@ -47,6 +47,8 @@ pub struct CarvingSession {
     pub estimated_total_time: f64,
     /// A-axis (rotary table) target angle in radians from G-code.
     pub a_axis_target: f64,
+    /// U-axis (linear track) target position in meters from G-code.
+    pub u_axis_target: f64,
 }
 
 impl CarvingSession {
@@ -56,17 +58,17 @@ impl CarvingSession {
         Self::from_interpreter(gcode, workpiece_center, half_extent, tool_orientation)
     }
 
-    /// Compute world position from G-code local position and A-axis angle.
-    fn gcode_to_world(&self, gcode_pos: &Vector3<f64>, a_angle: f64) -> Vector3<f64> {
-        let local = *gcode_pos + Vector3::new(0.0, 0.0, self.half_extent);
-        let rot = Rotation3::from_axis_angle(&Vector3::x_axis(), a_angle);
-        self.workpiece_center + rot * local
+    /// Compute world position from G-code position.
+    /// G-code is always in machine coordinates: Z=0 = top of (rotated) cube surface.
+    /// The A-axis rotates the physical workpiece, but the tool always approaches from above.
+    /// For a symmetric cube, the top surface is always at center + (0,0,he) regardless of A.
+    fn gcode_to_world(&self, gcode_pos: &Vector3<f64>) -> Vector3<f64> {
+        *gcode_pos + self.workpiece_center + Vector3::new(0.0, 0.0, self.half_extent)
     }
 
-    /// Compute tool orientation for the given A-axis angle.
-    fn tool_orientation_at(&self, a_angle: f64) -> UnitQuaternion<f64> {
-        let rot = UnitQuaternion::from_axis_angle(&Vector3::x_axis(), a_angle);
-        rot * self.base_tool_orientation
+    /// Tool orientation is always the same — tool points down (-Z) regardless of A-axis.
+    fn tool_orientation(&self) -> UnitQuaternion<f64> {
+        self.base_tool_orientation
     }
 
     /// Create from a pre-parsed interpreter.
@@ -89,13 +91,9 @@ impl CarvingSession {
             feed_rate: preview.rapid_rate,
         });
 
-        // Walk through all commands to extract waypoints, tracking A-axis
-        let mut preview_a: f64;
-        while let Some((pos, feed, a)) = preview.next_target() {
-            preview_a = a;
-            let local = pos + Vector3::new(0.0, 0.0, half_extent);
-            let rot = Rotation3::from_axis_angle(&Vector3::x_axis(), preview_a);
-            let world_pos = workpiece_center + rot * local;
+        // Walk through all commands to extract waypoints
+        while let Some((pos, feed, _a, _u)) = preview.next_target() {
+            let world_pos = pos + workpiece_center + Vector3::new(0.0, 0.0, half_extent);
             let is_rapid = (feed - preview.rapid_rate).abs() < 1e-6;
             waypoints.push(CarvingWaypoint {
                 position: world_pos,
@@ -129,6 +127,7 @@ impl CarvingSession {
             elapsed_time: 0.0,
             estimated_total_time: total_time,
             a_axis_target: 0.0,
+            u_axis_target: 0.0,
         })
     }
 
@@ -191,11 +190,12 @@ impl CarvingSession {
         self.is_rapid = true;
         self.elapsed_time = 0.0;
         self.a_axis_target = 0.0;
+        self.u_axis_target = 0.0;
     }
 
     /// Advance the carving by dt seconds. Returns the next Cartesian target pose, or None when complete.
     pub fn step(&mut self, dt: f64) -> Option<Isometry3<f64>> {
-        let orient = self.tool_orientation_at(self.a_axis_target);
+        let orient = self.tool_orientation();
         if self.state != CarvingState::Running {
             return Some(Isometry3::from_parts(
                 nalgebra::Translation3::from(self.current_position),
@@ -258,16 +258,17 @@ impl CarvingSession {
             }
 
             // Get next motion target
-            let (target_pos, feed_rate, a) = match self.gcode.next_target() {
+            let (target_pos, feed_rate, a, u) = match self.gcode.next_target() {
                 Some(t) => t,
                 None => return false,
             };
             self.a_axis_target = a;
+            self.u_axis_target = u;
 
             // Detect rapid moves (feed rate matches rapid_rate)
             self.is_rapid = (feed_rate - self.gcode.rapid_rate).abs() < 1e-6;
 
-            let world_target = self.gcode_to_world(&target_pos, self.a_axis_target);
+            let world_target = self.gcode_to_world(&target_pos);
             let dist = (world_target - self.current_position).norm();
 
             self.current_waypoint += 1;

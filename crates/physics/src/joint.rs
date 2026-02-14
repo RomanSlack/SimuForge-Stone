@@ -129,8 +129,8 @@ impl Default for RevoluteJoint {
 pub struct RotaryTable {
     pub angle: f64,
     pub velocity: f64,
-    pub torque: f64,
-    pub viscous_friction: f64,
+    /// Target angle for internal PD control (set by carving loop).
+    pub target_angle: f64,
     pub inertia: f64,
 }
 
@@ -139,19 +139,71 @@ impl RotaryTable {
         Self {
             angle: 0.0,
             velocity: 0.0,
-            torque: 0.0,
-            viscous_friction: 0.5,
+            target_angle: 0.0,
             inertia,
         }
     }
 
+    /// Step with internal overdamped PD control at physics rate.
+    /// kp=200, I=5 → ω_n=6.3 → critical kd=2*ω_n*I=63.
+    /// Use kd=80 + viscous=20 for heavily overdamped response (ζ≈1.6).
     pub fn step(&mut self, dt: f64) {
-        let friction = -self.viscous_friction * self.velocity;
-        let accel = (self.torque + friction) / self.inertia;
+        let err = self.target_angle - self.angle;
+        let pd_torque = 200.0 * err - 100.0 * self.velocity;
+        let accel = pd_torque / self.inertia;
         self.velocity += accel * dt;
-        // Clamp velocity to prevent runaway
-        self.velocity = self.velocity.clamp(-6.0, 6.0);
+        self.velocity = self.velocity.clamp(-4.0, 4.0);
         self.angle += self.velocity * dt;
+    }
+
+    /// Angular error from target.
+    pub fn error(&self) -> f64 {
+        (self.target_angle - self.angle).abs()
+    }
+}
+
+/// Linear track (U-axis) — translates the arm base along X.
+/// Mechanically independent from the 6DOF arm (like RotaryTable).
+#[derive(Debug, Clone)]
+pub struct LinearTrack {
+    pub position: f64,
+    pub velocity: f64,
+    /// Target position for internal PD control (set by carving loop).
+    pub target_position: f64,
+    /// Effective mass of the carriage (kg).
+    pub inertia: f64,
+    pub min_position: f64,
+    pub max_position: f64,
+}
+
+impl LinearTrack {
+    pub fn new(inertia: f64) -> Self {
+        Self {
+            position: 0.0,
+            velocity: 0.0,
+            target_position: 0.0,
+            inertia,
+            min_position: -0.5,
+            max_position: 0.5,
+        }
+    }
+
+    /// Step with internal overdamped PD control at physics rate.
+    /// kp=2000, kd=800 — overdamped (ζ≈1.3) for ~50kg carriage.
+    /// Settles 75mm step in ~0.3s sim time.
+    pub fn step(&mut self, dt: f64) {
+        let err = self.target_position - self.position;
+        let pd_force = 2000.0 * err - 800.0 * self.velocity;
+        let accel = pd_force / self.inertia;
+        self.velocity += accel * dt;
+        self.velocity = self.velocity.clamp(-1.0, 1.0); // 1 m/s max
+        self.position += self.velocity * dt;
+        self.position = self.position.clamp(self.min_position, self.max_position);
+    }
+
+    /// Position error from target.
+    pub fn error(&self) -> f64 {
+        (self.target_position - self.position).abs()
     }
 }
 

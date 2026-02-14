@@ -13,6 +13,7 @@ pub enum GCommand {
         y: Option<f64>,
         z: Option<f64>,
         a: Option<f64>,
+        u: Option<f64>,
     },
     /// G1: Linear feed move.
     LinearFeed {
@@ -20,6 +21,7 @@ pub enum GCommand {
         y: Option<f64>,
         z: Option<f64>,
         a: Option<f64>,
+        u: Option<f64>,
         f: Option<f64>,
     },
     /// G2: Clockwise arc (XY plane).
@@ -59,6 +61,8 @@ pub struct GCodeInterpreter {
     pub position: Vector3<f64>,
     /// Current A-axis angle (rad).
     pub a_axis: f64,
+    /// Current U-axis position (meters).
+    pub u_axis: f64,
     /// Current feed rate (m/s). G-code uses mm/min, converted on parse.
     pub feed_rate: f64,
     /// Rapid feed rate (m/s).
@@ -72,6 +76,7 @@ impl GCodeInterpreter {
             current: 0,
             position: Vector3::zeros(),
             a_axis: 0.0,
+            u_axis: 0.0,
             feed_rate: 0.01,  // 600 mm/min default
             rapid_rate: 0.1,  // 6000 mm/min
         }
@@ -128,11 +133,12 @@ impl GCodeInterpreter {
             let y = find_value(&tokens, 'Y').map(mm_to_m);
             let z = find_value(&tokens, 'Z').map(mm_to_m);
             let a = find_value(&tokens, 'A').map(|v| v.to_radians());
+            let u = find_value(&tokens, 'U').map(mm_to_m);
             let f = find_value(&tokens, 'F').map(mmpm_to_mps);
 
             return match g {
-                0 => Some(GCommand::Rapid { x, y, z, a }),
-                1 => Some(GCommand::LinearFeed { x, y, z, a, f }),
+                0 => Some(GCommand::Rapid { x, y, z, a, u }),
+                1 => Some(GCommand::LinearFeed { x, y, z, a, u, f }),
                 2 => {
                     let i = mm_to_m(find_value(&tokens, 'I').unwrap_or(0.0));
                     let j = mm_to_m(find_value(&tokens, 'J').unwrap_or(0.0));
@@ -150,9 +156,9 @@ impl GCodeInterpreter {
         Some(GCommand::Comment(line.to_string()))
     }
 
-    /// Get the next target position and feed rate from the program.
+    /// Get the next target position, feed rate, A-axis, and U-axis from the program.
     /// Returns None when program is complete.
-    pub fn next_target(&mut self) -> Option<(Vector3<f64>, f64, f64)> {
+    pub fn next_target(&mut self) -> Option<(Vector3<f64>, f64, f64, f64)> {
         if self.current >= self.commands.len() {
             return None;
         }
@@ -161,20 +167,22 @@ impl GCodeInterpreter {
         self.current += 1;
 
         match cmd {
-            GCommand::Rapid { x, y, z, a } => {
+            GCommand::Rapid { x, y, z, a, u } => {
                 if let Some(x) = x { self.position.x = x; }
                 if let Some(y) = y { self.position.y = y; }
                 if let Some(z) = z { self.position.z = z; }
                 if let Some(a) = a { self.a_axis = a; }
-                Some((self.position, self.rapid_rate, self.a_axis))
+                if let Some(u) = u { self.u_axis = u; }
+                Some((self.position, self.rapid_rate, self.a_axis, self.u_axis))
             }
-            GCommand::LinearFeed { x, y, z, a, f } => {
+            GCommand::LinearFeed { x, y, z, a, u, f } => {
                 if let Some(f) = f { self.feed_rate = f; }
                 if let Some(x) = x { self.position.x = x; }
                 if let Some(y) = y { self.position.y = y; }
                 if let Some(z) = z { self.position.z = z; }
                 if let Some(a) = a { self.a_axis = a; }
-                Some((self.position, self.feed_rate, self.a_axis))
+                if let Some(u) = u { self.u_axis = u; }
+                Some((self.position, self.feed_rate, self.a_axis, self.u_axis))
             }
             GCommand::ArcCW { x, y, z, f, .. } | GCommand::ArcCCW { x, y, z, f, .. } => {
                 // Simplified: treat arcs as linear moves for now
@@ -182,7 +190,7 @@ impl GCodeInterpreter {
                 if let Some(x) = x { self.position.x = x; }
                 if let Some(y) = y { self.position.y = y; }
                 if let Some(z) = z { self.position.z = z; }
-                Some((self.position, self.feed_rate, self.a_axis))
+                Some((self.position, self.feed_rate, self.a_axis, self.u_axis))
             }
             GCommand::SpindleOn { .. } | GCommand::SpindleOff | GCommand::Comment(_) => {
                 // Skip non-motion commands, try next
@@ -215,6 +223,7 @@ impl GCodeInterpreter {
         self.current = 0;
         self.position = Vector3::zeros();
         self.a_axis = 0.0;
+        self.u_axis = 0.0;
     }
 }
 
@@ -297,7 +306,7 @@ M5
 
         // Step through targets
         let mut positions = Vec::new();
-        while let Some((pos, _rate, _a)) = interp.next_target() {
+        while let Some((pos, _rate, _a, _u)) = interp.next_target() {
             positions.push(pos);
         }
 

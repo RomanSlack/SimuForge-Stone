@@ -768,4 +768,125 @@ mod tests {
             arm.joints[3].angle, arm.joints[4].angle, arm.joints[5].angle
         );
     }
+
+    /// Headless diagnostic: replicate the exact sim carving startup and trace IK
+    #[test]
+    fn test_carving_startup_diagnostic() {
+        use nalgebra::{UnitQuaternion, Isometry3, Translation3};
+
+        let pi = std::f64::consts::PI;
+        let pi2 = std::f64::consts::FRAC_PI_2;
+
+        // Arm setup matching sim
+        let mut arm = RobotArm::default_6dof();
+        arm.tool_offset = 0.175;
+
+        // IK pre-position (same seeds as load_gcode)
+        let workpiece_center = Vector3::new(0.65, 0.0, -0.2);
+        let half_extent = 0.1525;
+        let workpiece_top = workpiece_center + Vector3::new(0.0, 0.0, half_extent);
+        let orient = UnitQuaternion::from_axis_angle(&Vector3::x_axis(), pi);
+        let target = Isometry3::from_parts(Translation3::from(workpiece_top), orient);
+
+        let solver = IkSolver::default();
+        let seeds: &[[f64; 6]] = &[
+            [0.0, 0.5, 1.0, 0.0, pi2, 0.0],
+            [0.0, 0.3, 1.27, 0.0, pi2, 0.0],
+            [0.0, 0.7, 0.0, 0.0, pi2, 0.0],
+            [0.0, 1.0, 0.57, pi, -pi2, 0.0],
+            [0.0, 0.8, 0.77, 0.0, pi2, 0.0],
+        ];
+        let mut best_err = f64::MAX;
+        let mut best_angles: Vec<f64> = vec![0.0; 6];
+        for seed in seeds {
+            arm.set_joint_angles(seed);
+            let (ok, _, err) = solver.solve_weighted(&mut arm, &target, 0.6);
+            if ok && err < best_err {
+                best_err = err;
+                best_angles = arm.joint_angles().to_vec();
+            }
+        }
+        arm.set_joint_angles(&best_angles);
+        let mut joint_targets = best_angles.clone();
+        let tool_pos = arm.tool_position();
+        eprintln!("IK pre-positioned: err={:.2}mm, pos=({:.3},{:.3},{:.3})",
+            best_err * 1000.0, tool_pos.x, tool_pos.y, tool_pos.z);
+        eprintln!("  J1={:.1}° J2={:.1}° J3={:.1}° J4={:.1}° J5={:.1}° J6={:.1}°",
+            best_angles[0].to_degrees(), best_angles[1].to_degrees(),
+            best_angles[2].to_degrees(), best_angles[3].to_degrees(),
+            best_angles[4].to_degrees(), best_angles[5].to_degrees());
+
+        // Load the calibration G-code
+        let gcode_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/calibration.gcode");
+        let mut session = crate::carving::CarvingSession::load_file(
+            gcode_path, workpiece_center, half_extent, orient,
+        ).expect("load gcode");
+        session.start();
+
+        // Simulate the carving loop frame by frame
+        let frame_dt = 1.0 / 60.0;
+        let speed_mult = 5.0;
+        let mut cartesian_target = target;
+
+        for frame in 0..300 {  // 5 seconds of frames
+            let scaled_dt = frame_dt * speed_mult;
+
+            // Advance session (like sim does)
+            let is_rapid = session.is_rapid;
+            if let Some(t) = session.step(scaled_dt) {
+                cartesian_target = t;
+            }
+
+            // IK solve (replicating update_ik)
+            let mut scratch = arm.clone();
+            scratch.set_joint_angles(&joint_targets);
+            let (converged, _, ik_err) = solver.solve_weighted(
+                &mut scratch, &cartesian_target, 0.6,
+            );
+            let new_angles = scratch.joint_angles().to_vec();
+
+            // Collision check
+            let collision_free = scratch.is_collision_free();
+
+            // Velocity limiting
+            let mut deltas: Vec<f64> = new_angles.iter().zip(joint_targets.iter())
+                .map(|(n, o)| n - o).collect();
+            IkSolver::apply_velocity_limits(&mut deltas, &arm, frame_dt);
+
+            let target_pos = cartesian_target.translation.vector;
+            let arm_tool = arm.tool_position();
+            let tracking_err = (arm_tool - target_pos).norm();
+
+            if frame < 30 || frame % 30 == 0 || !collision_free || !converged {
+                eprintln!("Frame {:3}: rapid={} conv={} coll_free={} ik_err={:.1}mm track={:.1}mm target=({:.3},{:.3},{:.3}) | deltas: [{:.4},{:.4},{:.4},{:.4},{:.4},{:.4}]",
+                    frame, is_rapid, converged, collision_free,
+                    ik_err * 1000.0, tracking_err * 1000.0,
+                    target_pos.x, target_pos.y, target_pos.z,
+                    deltas[0], deltas[1], deltas[2], deltas[3], deltas[4], deltas[5]);
+            }
+
+            if !collision_free {
+                eprintln!("  COLLISION REJECTED! scratch angles: [{:.1},{:.1},{:.1},{:.1},{:.1},{:.1}]°",
+                    new_angles[0].to_degrees(), new_angles[1].to_degrees(),
+                    new_angles[2].to_degrees(), new_angles[3].to_degrees(),
+                    new_angles[4].to_degrees(), new_angles[5].to_degrees());
+                // Don't update joint targets
+                continue;
+            }
+
+            // Apply velocity-limited deltas
+            for i in 0..6 {
+                joint_targets[i] += deltas[i];
+            }
+            arm.set_joint_angles(&joint_targets);
+        }
+
+        let final_pos = arm.tool_position();
+        let final_target = cartesian_target.translation.vector;
+        let final_err = (final_pos - final_target).norm();
+        eprintln!("\nFinal: tool=({:.3},{:.3},{:.3}) target=({:.3},{:.3},{:.3}) err={:.1}mm",
+            final_pos.x, final_pos.y, final_pos.z,
+            final_target.x, final_target.y, final_target.z,
+            final_err * 1000.0);
+    }
 }

@@ -1,304 +1,298 @@
-(SimuForge IK Calibration / Stress-Test Program)
+(SimuForge Calibration - Carve bold numbers 1-4 on four faces)
 (Workpiece: 305mm cube, half_extent = 152.5mm)
 (G-code origin = top center, Z=0 = surface, negative = into material)
-(XY range: -152.5 to +152.5)
+(Numbers ~200mm tall, strokes ~30mm wide via multiple parallel passes)
 (A-axis = rotary table: A0=top, A90=front, A-90=back, A180=bottom)
-(Tests: velocity limits, orientation control, config consistency,)
-(  singularity damping, collision avoidance, null-space centering,)
-(  A-axis rotation, multi-face access)
+(U-axis = linear track: moves arm base along X in mm, negative = back)
+(U75 slides arm 75mm toward workpiece so X=-50 serif is comfortably reachable)
 
-G0 Z10                (Safe height)
-M3 S10000            (Spindle on)
+G0 Z10 U0
+M3 S10000
 
 (========================================================)
-(=== FACE 1: TOP FACE - A0                            ===)
+(=== FACE 1: TOP - Bold "1"                           ===)
 (========================================================)
 
-(--- Section 1: Cross Pattern ---)
-(--- Sweep +/-X and +/-Y axes at Z=-3 ---)
-
-G0 X0 Y0
-G1 Z-3 F300
+(--- Vertical stroke, 5 passes at X=-8,-4,0,4,8 ---)
+G0 X-8 Y100
+G1 Z-10 F300
+G1 X-8 Y-100 F600
+G0 Z5
+G0 X-4 Y100
+G1 Z-10 F300
+G1 X-4 Y-100 F600
+G0 Z5
+G0 X0 Y100
+G1 Z-10 F300
+G1 X0 Y-100 F600
+G0 Z5
+G0 X4 Y100
+G1 Z-10 F300
+G1 X4 Y-100 F600
+G0 Z5
+G0 X8 Y100
+G1 Z-10 F300
+G1 X8 Y-100 F600
 G0 Z5
 
-G0 X-120 Y0
-G1 Z-3 F300
-G1 X120 Y0 F800
+(--- Bottom serif, 3 passes at Y=-100,-92,-84 ---)
+G0 X-50 Y-100
+G1 Z-10 F300
+G1 X50 Y-100 F600
+G0 Z5
+G0 X-50 Y-92
+G1 Z-10 F300
+G1 X50 Y-92 F600
+G0 Z5
+G0 X-50 Y-84
+G1 Z-10 F300
+G1 X50 Y-84 F600
 G0 Z5
 
-G0 X0 Y-120
-G1 Z-3 F300
-G1 X0 Y120 F800
-G0 Z10
-
-(--- Section 2: Perimeter Trace ---)
-
-G0 X-120 Y-120
-G1 Z-5 F300
-G1 X120 Y-120 F600
-G1 X120 Y120 F600
-G1 X-120 Y120 F600
-G1 X-120 Y-120 F600
-G0 Z10
-
-(--- Section 3: Diagonal Star ---)
-
-G0 X-120 Y-120
-G1 Z-5 F300
-G1 X120 Y120 F800
-G0 Z10
-
-G0 X-120 Y120
-G1 Z-5 F300
-G1 X120 Y-120 F800
-G0 Z10
-
-(--- Section 4: Depth Spiral at Z=-15 ---)
-
-G0 X-110 Y-110
-G1 Z-15 F300
-G1 X110 Y-110 F600
-G1 X110 Y110 F600
-G1 X-110 Y110 F600
-G1 X-110 Y-70 F600
-G1 X70 Y-70 F600
-G1 X70 Y70 F600
-G1 X-70 Y70 F600
-G1 X-70 Y-30 F600
-G1 X30 Y-30 F600
-G1 X30 Y30 F600
-G1 X-30 Y30 F600
-G1 X-30 Y0 F600
-G1 X0 Y0 F600
-G0 Z10
-
-(--- Section 5: Corner Triangles ---)
-
-G0 X100 Y100
-G1 Z-5 F300
-G1 X120 Y100 F500
-G1 X120 Y120 F500
-G1 X100 Y120 F500
-G1 X100 Y100 F500
-G0 Z10
-
-G0 X-100 Y100
-G1 Z-5 F300
-G1 X-120 Y100 F500
-G1 X-120 Y120 F500
-G1 X-100 Y120 F500
-G1 X-100 Y100 F500
-G0 Z10
-
-G0 X-100 Y-100
-G1 Z-5 F300
-G1 X-120 Y-100 F500
-G1 X-120 Y-120 F500
-G1 X-100 Y-120 F500
-G1 X-100 Y-100 F500
-G0 Z10
-
-G0 X100 Y-100
-G1 Z-5 F300
-G1 X120 Y-100 F500
-G1 X120 Y-120 F500
-G1 X100 Y-120 F500
-G1 X100 Y-100 F500
-G0 Z10
-
-(--- Section 6: Speed Ramp ---)
-
-G0 X-120 Y0
-G1 Z-3 F300
-G1 X-80 Y0 F200
-G1 X-40 Y0 F400
-G1 X0 Y0 F600
-G1 X40 Y0 F1000
-G1 X80 Y0 F1500
-G1 X120 Y0 F2000
-G0 Z10
-
-(--- Section 7: Zigzag 5mm pitch ---)
-
-G0 X-40 Y-40
-G1 Z-5 F300
-G1 X-40 Y40 F800
-G1 X-35 Y40 F800
-G1 X-35 Y-40 F800
-G1 X-30 Y-40 F800
-G1 X-30 Y40 F800
-G1 X-25 Y40 F800
-G1 X-25 Y-40 F800
-G1 X-20 Y-40 F800
-G1 X-20 Y40 F800
-G1 X-15 Y40 F800
-G1 X-15 Y-40 F800
-G1 X-10 Y-40 F800
-G1 X-10 Y40 F800
-G1 X-5 Y40 F800
-G1 X-5 Y-40 F800
-G1 X0 Y-40 F800
-G1 X0 Y40 F800
-G1 X5 Y40 F800
-G1 X5 Y-40 F800
-G1 X10 Y-40 F800
-G1 X10 Y40 F800
-G1 X15 Y40 F800
-G1 X15 Y-40 F800
-G1 X20 Y-40 F800
-G1 X20 Y40 F800
-G1 X25 Y40 F800
-G1 X25 Y-40 F800
-G1 X30 Y-40 F800
-G1 X30 Y40 F800
-G1 X35 Y40 F800
-G1 X35 Y-40 F800
-G1 X40 Y-40 F800
-G1 X40 Y40 F800
+(--- Angled serif, 3 passes ---)
+G0 X-30 Y52
+G1 Z-10 F300
+G1 X-8 Y100 F600
+G0 Z5
+G0 X-22 Y52
+G1 Z-10 F300
+G1 X0 Y100 F600
+G0 Z5
+G0 X-14 Y52
+G1 Z-10 F300
+G1 X8 Y100 F600
 G0 Z10
 
 (========================================================)
-(=== FACE 2: FRONT FACE - A90                         ===)
-(=== Rotary table tilts workpiece 90 degrees           ===)
-(=== Former +Y face now faces up                       ===)
+(=== FACE 2: FRONT - Bold "2"   (A90)                 ===)
 (========================================================)
 
 M5
 G0 Z25
 G0 X0 Y0
-G0 A90
+G0 A90 U75
 M3 S10000
 G0 Z10
 
-(--- Cross on front face ---)
-G0 X0 Y0
-G1 Z-3 F300
+(--- Top bar, 3 passes ---)
+G0 X-50 Y100
+G1 Z-10 F300
+G1 X50 Y100 F600
+G0 Z5
+G0 X-50 Y92
+G1 Z-10 F300
+G1 X50 Y92 F600
+G0 Z5
+G0 X-50 Y84
+G1 Z-10 F300
+G1 X50 Y84 F600
 G0 Z5
 
-G0 X-100 Y0
-G1 Z-3 F300
-G1 X100 Y0 F800
+(--- Right side down, 3 passes ---)
+G0 X50 Y84
+G1 Z-10 F300
+G1 X50 Y20 F600
+G0 Z5
+G0 X42 Y84
+G1 Z-10 F300
+G1 X42 Y20 F600
+G0 Z5
+G0 X34 Y84
+G1 Z-10 F300
+G1 X34 Y20 F600
 G0 Z5
 
-G0 X0 Y-100
-G1 Z-3 F300
-G1 X0 Y100 F800
-G0 Z10
+(--- Diagonal, 3 passes ---)
+G0 X50 Y20
+G1 Z-10 F300
+G1 X-50 Y-20 F600
+G0 Z5
+G0 X42 Y20
+G1 Z-10 F300
+G1 X-42 Y-20 F600
+G0 Z5
+G0 X50 Y12
+G1 Z-10 F300
+G1 X-50 Y-28 F600
+G0 Z5
 
-(--- Perimeter on front face ---)
-G0 X-100 Y-100
-G1 Z-5 F300
-G1 X100 Y-100 F600
-G1 X100 Y100 F600
-G1 X-100 Y100 F600
-G1 X-100 Y-100 F600
-G0 Z10
+(--- Left side down, 3 passes ---)
+G0 X-50 Y-20
+G1 Z-10 F300
+G1 X-50 Y-84 F600
+G0 Z5
+G0 X-42 Y-20
+G1 Z-10 F300
+G1 X-42 Y-84 F600
+G0 Z5
+G0 X-34 Y-20
+G1 Z-10 F300
+G1 X-34 Y-84 F600
+G0 Z5
 
-(--- Diagonal on front face ---)
-G0 X-100 Y-100
-G1 Z-5 F300
-G1 X100 Y100 F800
-G0 Z10
-
-G0 X-100 Y100
-G1 Z-5 F300
-G1 X100 Y-100 F800
+(--- Bottom bar, 3 passes ---)
+G0 X-50 Y-84
+G1 Z-10 F300
+G1 X50 Y-84 F600
+G0 Z5
+G0 X-50 Y-92
+G1 Z-10 F300
+G1 X50 Y-92 F600
+G0 Z5
+G0 X-50 Y-100
+G1 Z-10 F300
+G1 X50 Y-100 F600
 G0 Z10
 
 (========================================================)
-(=== FACE 3: RIGHT SIDE - A90 already, work on +X edge===)
-(=== Plunge along right edge                           ===)
-(========================================================)
-
-G0 X120 Y0
-G1 Z0 F300
-G1 Z-15 F400
-G1 Z-30 F400
-G0 Z10
-
-G0 X-120 Y0
-G1 Z0 F300
-G1 Z-15 F400
-G1 Z-30 F400
-G0 Z10
-
-(========================================================)
-(=== FACE 4: BACK FACE - A-90                         ===)
-(=== Rotary table tilts workpiece -90 degrees          ===)
-(=== Former -Y face now faces up                       ===)
+(=== FACE 3: BACK - Bold "3"   (A-90)                 ===)
 (========================================================)
 
 M5
 G0 Z25
 G0 X0 Y0
-G0 A-90
+G0 A-90 U75
 M3 S10000
 G0 Z10
 
-(--- Cross on back face ---)
-G0 X-100 Y0
-G1 Z-3 F300
-G1 X100 Y0 F800
+(--- Top bar, 3 passes ---)
+G0 X-50 Y100
+G1 Z-10 F300
+G1 X50 Y100 F600
+G0 Z5
+G0 X-50 Y92
+G1 Z-10 F300
+G1 X50 Y92 F600
+G0 Z5
+G0 X-50 Y84
+G1 Z-10 F300
+G1 X50 Y84 F600
 G0 Z5
 
-G0 X0 Y-100
-G1 Z-3 F300
-G1 X0 Y100 F800
-G0 Z10
+(--- Right side top half, 3 passes ---)
+G0 X50 Y84
+G1 Z-10 F300
+G1 X50 Y16 F600
+G0 Z5
+G0 X42 Y84
+G1 Z-10 F300
+G1 X42 Y16 F600
+G0 Z5
+G0 X34 Y84
+G1 Z-10 F300
+G1 X34 Y16 F600
+G0 Z5
 
-(--- Perimeter on back face ---)
-G0 X-100 Y-100
-G1 Z-5 F300
-G1 X100 Y-100 F600
-G1 X100 Y100 F600
-G1 X-100 Y100 F600
-G1 X-100 Y-100 F600
+(--- Middle bar, 3 passes ---)
+G0 X-20 Y16
+G1 Z-10 F300
+G1 X50 Y16 F600
+G0 Z5
+G0 X-20 Y8
+G1 Z-10 F300
+G1 X50 Y8 F600
+G0 Z5
+G0 X-20 Y0
+G1 Z-10 F300
+G1 X50 Y0 F600
+G0 Z5
+
+(--- Right side bottom half, 3 passes ---)
+G0 X50 Y0
+G1 Z-10 F300
+G1 X50 Y-84 F600
+G0 Z5
+G0 X42 Y0
+G1 Z-10 F300
+G1 X42 Y-84 F600
+G0 Z5
+G0 X34 Y0
+G1 Z-10 F300
+G1 X34 Y-84 F600
+G0 Z5
+
+(--- Bottom bar, 3 passes ---)
+G0 X-50 Y-84
+G1 Z-10 F300
+G1 X50 Y-84 F600
+G0 Z5
+G0 X-50 Y-92
+G1 Z-10 F300
+G1 X50 Y-92 F600
+G0 Z5
+G0 X-50 Y-100
+G1 Z-10 F300
+G1 X50 Y-100 F600
 G0 Z10
 
 (========================================================)
-(=== FACE 5: BOTTOM FACE - A180                       ===)
-(=== Rotary table flips workpiece upside down          ===)
+(=== FACE 4: BOTTOM - Bold "4"   (A180)               ===)
 (========================================================)
 
 M5
 G0 Z25
 G0 X0 Y0
-G0 A180
+G0 A180 U75
 M3 S10000
 G0 Z10
 
-(--- Cross on bottom face ---)
-G0 X-80 Y0
-G1 Z-3 F300
-G1 X80 Y0 F800
+(--- Left vertical stroke, 3 passes ---)
+G0 X-45 Y100
+G1 Z-10 F300
+G1 X-45 Y0 F600
+G0 Z5
+G0 X-37 Y100
+G1 Z-10 F300
+G1 X-37 Y0 F600
+G0 Z5
+G0 X-29 Y100
+G1 Z-10 F300
+G1 X-29 Y0 F600
 G0 Z5
 
-G0 X0 Y-80
-G1 Z-3 F300
-G1 X0 Y80 F800
-G0 Z10
+(--- Crossbar, 3 passes ---)
+G0 X-50 Y0
+G1 Z-10 F300
+G1 X50 Y0 F600
+G0 Z5
+G0 X-50 Y-8
+G1 Z-10 F300
+G1 X50 Y-8 F600
+G0 Z5
+G0 X-50 Y-16
+G1 Z-10 F300
+G1 X50 Y-16 F600
+G0 Z5
 
-(--- Small spiral on bottom ---)
-G0 X-60 Y-60
-G1 Z-8 F300
-G1 X60 Y-60 F600
-G1 X60 Y60 F600
-G1 X-60 Y60 F600
-G1 X-60 Y-30 F600
-G1 X30 Y-30 F600
-G1 X30 Y30 F600
-G1 X-30 Y30 F600
-G1 X-30 Y0 F600
-G1 X0 Y0 F600
+(--- Right vertical full height, 5 passes ---)
+G0 X16 Y100
+G1 Z-10 F300
+G1 X16 Y-100 F600
+G0 Z5
+G0 X20 Y100
+G1 Z-10 F300
+G1 X20 Y-100 F600
+G0 Z5
+G0 X24 Y100
+G1 Z-10 F300
+G1 X24 Y-100 F600
+G0 Z5
+G0 X28 Y100
+G1 Z-10 F300
+G1 X28 Y-100 F600
+G0 Z5
+G0 X32 Y100
+G1 Z-10 F300
+G1 X32 Y-100 F600
 G0 Z10
 
 (========================================================)
-(=== RETURN: Back to A0, center, done                 ===)
+(=== RETURN: Back to A0, done                         ===)
 (========================================================)
 
 M5
 G0 Z25
-G0 X0 Y0
+G0 X0 Y0 U0
 G0 A0
 G0 Z25
 G0 X0 Y0

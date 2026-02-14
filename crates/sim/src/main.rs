@@ -25,7 +25,7 @@ use simuforge_motors::pid;
 use simuforge_motors::stepper::{MotorState, StepperMotor};
 use simuforge_physics::aba::{articulated_body_algorithm, gravity_compensation_rnea};
 use simuforge_physics::arm::RobotArm;
-use simuforge_physics::joint::RotaryTable;
+use simuforge_physics::joint::{LinearTrack, RotaryTable};
 use simuforge_render::arm_visual::{generate_cylinder, generate_sphere, generate_box};
 use simuforge_render::camera::{CameraUniform, OrbitCamera};
 use simuforge_render::context::RenderContext;
@@ -126,6 +126,7 @@ struct SimState {
     tool: Tool,
     tool_state: ToolState,
     rotary_table: RotaryTable,
+    linear_track: LinearTrack,
     material: MaterialProps,
     ik_solver: IkSolver,
     sim_time: f64,
@@ -136,6 +137,8 @@ struct SimState {
     cartesian_target: nalgebra::Isometry3<f64>,
     /// Whether IK converged on last solve.
     ik_converged: bool,
+    /// Consecutive frames where IK was collision-rejected.
+    ik_consecutive_collisions: u32,
     /// Carving session (loaded G-code program).
     carving: Option<CarvingSession>,
     /// Current mode: Manual or Carving.
@@ -209,17 +212,22 @@ impl SimState {
             _ => Tool::flat_end(cfg.tool_radius_mm, cfg.tool_cutting_length_mm),
         };
         let mut tool_state = ToolState::new();
-        // Initialize frame_start_position to the current tool tip
+        let rotary_table = RotaryTable::new(5.0); // 5 kg·m² inertia
+        let mut linear_track = LinearTrack::new(50.0); // 50 kg carriage
+        linear_track.position = cfg.track_default_position;
+        linear_track.target_position = cfg.track_default_position;
+
+        // Initialize frame_start_position to the current tool tip (world space)
         // so the first frame doesn't create a huge swept path from origin.
-        let initial_tool_pos = arm.tool_position();
+        let track_offset = Vector3::new(linear_track.position, 0.0, 0.0);
+        let initial_tool_pos = arm.tool_position() + track_offset;
         tool_state.position = initial_tool_pos;
         tool_state.prev_position = initial_tool_pos;
         tool_state.frame_start_position = initial_tool_pos;
 
-        let rotary_table = RotaryTable::new(5.0); // 5 kg·m² inertia
-
-        // Cartesian target = initial tool tip pose (position + orientation)
-        let cartesian_target = arm.forward_kinematics();
+        // Cartesian target = initial tool tip pose (world space)
+        let mut cartesian_target = arm.forward_kinematics();
+        cartesian_target.translation.vector += track_offset;
 
         eprintln!(
             "Config: tool={}({:.1}mm), workpiece=({:.2},{:.2},{:.2}), speed={}x",
@@ -240,6 +248,7 @@ impl SimState {
             tool,
             tool_state,
             rotary_table,
+            linear_track,
             material: MaterialProps::marble(),
             ik_solver: IkSolver {
                 damping: 0.05,
@@ -254,6 +263,7 @@ impl SimState {
             cutting_force_magnitude: 0.0,
             cartesian_target,
             ik_converged: true,
+            ik_consecutive_collisions: 0,
             carving: None,
             mode: SimMode::Manual,
             tracking_threshold: cfg.tracking_threshold,
@@ -271,13 +281,18 @@ impl SimState {
         let mut scratch = self.arm.clone();
         scratch.set_joint_angles(&self.joint_targets);
 
+        // Transform world target into arm-local frame by subtracting track offset
+        let track_offset = Vector3::new(self.linear_track.position, 0.0, 0.0);
+        let mut local_target = self.cartesian_target;
+        local_target.translation.vector -= track_offset;
+
         let converged = if self.mode == SimMode::Carving {
             let (ok, _, _) = self.ik_solver.solve_weighted(
-                &mut scratch, &self.cartesian_target, self.orientation_weight,
+                &mut scratch, &local_target, self.orientation_weight,
             );
             ok
         } else {
-            let (ok, _, _) = self.ik_solver.solve(&mut scratch, &self.cartesian_target);
+            let (ok, _, _) = self.ik_solver.solve(&mut scratch, &local_target);
             ok
         };
 
@@ -292,11 +307,24 @@ impl SimState {
             return;
         }
 
-        // Phase 5: Self-collision avoidance — reject solutions in collision
+        // Self-collision avoidance — reject solutions in collision
         if !scratch.is_collision_free() {
+            self.ik_consecutive_collisions += 1;
+            if self.ik_consecutive_collisions == 30 {
+                eprintln!("WARNING: IK collision-rejected 30 consecutive frames!");
+                eprintln!("  target=({:.3},{:.3},{:.3})",
+                    self.cartesian_target.translation.vector.x,
+                    self.cartesian_target.translation.vector.y,
+                    self.cartesian_target.translation.vector.z);
+                eprintln!("  IK angles: [{:.1},{:.1},{:.1},{:.1},{:.1},{:.1}]°",
+                    new_angles[0].to_degrees(), new_angles[1].to_degrees(),
+                    new_angles[2].to_degrees(), new_angles[3].to_degrees(),
+                    new_angles[4].to_degrees(), new_angles[5].to_degrees());
+            }
             self.ik_converged = false;
             return;
         }
+        self.ik_consecutive_collisions = 0;
 
         self.ik_converged = converged;
 
@@ -340,14 +368,22 @@ impl SimState {
             motor.thermal_energy = 0.0;
         }
 
-        // Reset tool state to initial tool position
-        let initial_tool_pos = self.arm.tool_position();
+        // Reset linear track
+        self.linear_track.position = 0.0;
+        self.linear_track.velocity = 0.0;
+        self.linear_track.target_position = 0.0;
+
+        // Reset tool state to initial tool position (world space)
+        let track_offset = Vector3::new(self.linear_track.position, 0.0, 0.0);
+        let initial_tool_pos = self.arm.tool_position() + track_offset;
         self.tool_state.position = initial_tool_pos;
         self.tool_state.prev_position = initial_tool_pos;
         self.tool_state.frame_start_position = initial_tool_pos;
 
-        // Reset cartesian target (full pose)
-        self.cartesian_target = self.arm.forward_kinematics();
+        // Reset cartesian target (full pose, world space)
+        let mut fk = self.arm.forward_kinematics();
+        fk.translation.vector += track_offset;
+        self.cartesian_target = fk;
         self.ik_converged = true;
         self.cutting_force_magnitude = 0.0;
     }
@@ -404,13 +440,18 @@ impl SimState {
         // Rotary table
         self.rotary_table.step(PHYSICS_DT);
 
+        // Linear track
+        self.linear_track.step(PHYSICS_DT);
+
         self.sim_time += PHYSICS_DT;
     }
 
     /// Update tool position from current FK. Called once per frame after all physics steps.
+    /// Tool position is in world space (arm-local + track offset).
     fn update_tool_state(&mut self) {
         let tool_pose = self.arm.forward_kinematics();
-        let tool_pos = tool_pose.translation.vector;
+        let track_offset = Vector3::new(self.linear_track.position, 0.0, 0.0);
+        let tool_pos = tool_pose.translation.vector + track_offset;
         self.tool_state.update_position(tool_pos);
     }
 
@@ -430,12 +471,13 @@ impl SimState {
         let pi2 = std::f64::consts::FRAC_PI_2;
         let tool_down = UnitQuaternion::from_axis_angle(&Vector3::x_axis(), pi);
 
-        // Desired position: 15mm above workpiece top center
+        // Desired position: 15mm above workpiece top center (arm-local, subtract track)
+        let track_offset = Vector3::new(self.linear_track.position, 0.0, 0.0);
         let start_pos = Vector3::new(
             workpiece_top_center.x,
             workpiece_top_center.y,
             workpiece_top_center.z + 0.015,
-        );
+        ) - track_offset;
         let start_target = nalgebra::Isometry3::from_parts(
             nalgebra::Translation3::from(start_pos),
             tool_down,
@@ -493,7 +535,8 @@ impl SimState {
         for j in self.arm.joints.iter_mut() {
             j.velocity = 0.0;
         }
-        let tool_pos = self.arm.tool_position();
+        let track_offset = Vector3::new(self.linear_track.position, 0.0, 0.0);
+        let tool_pos = self.arm.tool_position() + track_offset;
         self.tool_state.position = tool_pos;
         self.tool_state.prev_position = tool_pos;
         self.tool_state.frame_start_position = tool_pos;
@@ -502,10 +545,12 @@ impl SimState {
         }
         // Set cartesian_target to the arm's ACTUAL pose (not the desired one)
         // so there's zero initial error → no flailing.
-        self.cartesian_target = converged_fk;
+        let mut world_fk = converged_fk;
+        world_fk.translation.vector += track_offset;
+        self.cartesian_target = world_fk;
 
         let mut session = CarvingSession::load_file(path, self.workpiece_center, half_extent, tool_orientation)?;
-        session.set_start_position(self.arm.tool_position());
+        session.set_start_position(tool_pos);
 
         eprintln!(
             "Loaded G-code: {} waypoints, estimated {:.1}s",
@@ -543,9 +588,12 @@ impl SimState {
             let actual_pos = self.tool_state.position;
             let tracking_error = (target_pos - actual_pos).norm();
             if tracking_error > self.tracking_threshold {
-                // Arm too far from target — still repositioning, don't cut
+                // Arm too far from target — still repositioning, don't cut.
+                // IMPORTANT: Do NOT reset frame_start_position here!
+                // Let the tool path accumulate so that when the arm catches up,
+                // the full swept path is cut in one shot. This prevents
+                // "missing" cuts at high speed multipliers.
                 self.cutting_force_magnitude = 0.0;
-                self.tool_state.frame_start_position = self.tool_state.position;
                 return;
             }
         }
@@ -568,11 +616,13 @@ impl SimState {
         let end = rot_inv * (end_world - wc);
 
         // Quick AABB check: is the tool anywhere near the workpiece?
+        // Check if EITHER endpoint is near the workpiece (tool may enter or exit).
         let half = self.workpiece_half_extent + 0.02; // workpiece half-extent + margin
-        let tp = end;
-        if tp.x.abs() > half || tp.y.abs() > half || tp.z.abs() > half {
+        let start_inside = start.x.abs() <= half && start.y.abs() <= half && start.z.abs() <= half;
+        let end_inside = end.x.abs() <= half && end.y.abs() <= half && end.z.abs() <= half;
+        if !start_inside && !end_inside {
             self.cutting_force_magnitude = 0.0;
-            return; // tool is outside workpiece region
+            return; // tool is entirely outside workpiece region
         }
 
         let tool_sdf = self.tool.swept_sdf(&start, &end);
@@ -642,6 +692,11 @@ struct App {
     ground_material: Option<MaterialBind>,
     workpiece_material: Option<MaterialBind>,
     target_material: Option<MaterialBind>,
+    // Linear track (rail + carriage)
+    track_rail_mesh: Option<GpuMesh>,
+    track_rail_material: Option<MaterialBind>,
+    track_carriage_mesh: Option<GpuMesh>,
+    track_carriage_material: Option<MaterialBind>,
     // Tool (Dremel) visual
     tool_body_material: Option<MaterialBind>,
     tool_tip_material: Option<MaterialBind>,
@@ -706,6 +761,10 @@ impl App {
             ground_material: None,
             workpiece_material: None,
             target_material: None,
+            track_rail_mesh: None,
+            track_rail_material: None,
+            track_carriage_mesh: None,
+            track_carriage_material: None,
             tool_body_material: None,
             tool_tip_material: None,
             post_sampler: None,
@@ -771,7 +830,8 @@ impl App {
         // Uses position-only IK with loose tolerance for a fast go/no-go check.
         let mut test = self.sim.arm.clone();
         test.set_joint_angles(&self.sim.joint_targets);
-        let target_pos = self.sim.cartesian_target.translation.vector;
+        let track_offset = Vector3::new(self.sim.linear_track.position, 0.0, 0.0);
+        let target_pos = self.sim.cartesian_target.translation.vector - track_offset;
         let (ok, _, _) = self.sim.ik_solver.solve_position(&mut test, &target_pos);
         if !ok {
             self.sim.cartesian_target = prev_target;
@@ -865,12 +925,14 @@ impl App {
         let rot_a = Mat4::from_axis_angle(Vec3::X, table_angle);
         let workpiece_model = swap * translate_dh * rot_a;
 
-        // Arm link frames → render-space positions
+        // Arm link frames → render-space positions (offset by track position)
+        let track_x = self.sim.linear_track.position as f32;
         let frames = self.sim.arm.link_frames();
         let mut render_pts = Vec::with_capacity(7);
         for i in 0..7 {
             let f = isometry_to_glam(&frames[i]);
-            render_pts.push(swap.transform_point3(Vec3::new(f.col(3).x, f.col(3).y, f.col(3).z)));
+            let dh_pos = Vec3::new(f.col(3).x + track_x, f.col(3).y, f.col(3).z);
+            render_pts.push(swap.transform_point3(dh_pos));
         }
 
         // Arm link model matrices
@@ -890,10 +952,10 @@ impl App {
             ));
         }
 
-        // Tool models
+        // Tool models (offset by track position)
         let flange_mat = isometry_to_glam(&self.sim.arm.flange_pose());
         let tool_z_dh = Vec3::new(flange_mat.col(2).x, flange_mat.col(2).y, flange_mat.col(2).z);
-        let flange_pos_dh = Vec3::new(flange_mat.col(3).x, flange_mat.col(3).y, flange_mat.col(3).z);
+        let flange_pos_dh = Vec3::new(flange_mat.col(3).x + track_x, flange_mat.col(3).y, flange_mat.col(3).z);
         let body_end_dh = flange_pos_dh + tool_z_dh * 0.15;
         let body_from = swap.transform_point3(flange_pos_dh);
         let body_to = swap.transform_point3(body_end_dh);
@@ -914,6 +976,24 @@ impl App {
         let stand_center_y = (wp_bottom_y + ground_y) / 2.0;
         let stand_pos = Vec3::new(wc.x as f32, stand_center_y, -(wc.y as f32));
         let stand_model = Mat4::from_translation(stand_pos);
+
+        // Track rail: static, centered at midpoint of travel range, on ground.
+        // DH coords: X = track center, Y = 0, Z = ground level + rail half-height.
+        let track_min = self.sim.linear_track.min_position as f32;
+        let track_max = self.sim.linear_track.max_position as f32;
+        let rail_center_x = (track_min + track_max) / 2.0;
+        let rail_dh = Vec3::new(rail_center_x, 0.0, ground_y + 0.01 + 0.02); // ground + margin + half rail height
+        // In render space, DH Z→Y, DH Y→-Z. Rail extends along X.
+        // generate_box(hx, hy, hz) → render box is ±hx on X, ±hy on Y, ±hz on Z.
+        // We want rail extending along render-X, thin in render-Y (height), and narrow in render-Z (depth).
+        // DH X = render X, DH Z = render Y (via coord_swap).
+        let rail_render_pos = swap.transform_point3(rail_dh);
+        let track_rail_model = Mat4::from_translation(rail_render_pos);
+
+        // Track carriage: slides with arm base, sits on top of rail.
+        let carriage_dh = Vec3::new(track_x, 0.0, ground_y + 0.01 + 0.04 + 0.025); // on top of rail
+        let carriage_render_pos = swap.transform_point3(carriage_dh);
+        let track_carriage_model = Mat4::from_translation(carriage_render_pos);
 
         // Target sphere model
         let ct_pos = &self.sim.cartesian_target.translation.vector;
@@ -980,6 +1060,16 @@ impl App {
                 .with_model(stand_model.to_cols_array_2d());
             ctx.queue.write_buffer(&stand_mat.buffer, 0, bytemuck::bytes_of(&mat));
         }
+        if let Some(rail_mat) = &self.track_rail_material {
+            let mat = MaterialUniform::metal([0.30, 0.30, 0.32, 1.0])
+                .with_model(track_rail_model.to_cols_array_2d());
+            ctx.queue.write_buffer(&rail_mat.buffer, 0, bytemuck::bytes_of(&mat));
+        }
+        if let Some(car_mat) = &self.track_carriage_material {
+            let mat = MaterialUniform::metal([0.18, 0.18, 0.20, 1.0])
+                .with_model(track_carriage_model.to_cols_array_2d());
+            ctx.queue.write_buffer(&car_mat.buffer, 0, bytemuck::bytes_of(&mat));
+        }
 
         // --- Shadow setup ---
         let light_vp = ShadowPipeline::compute_light_matrix(light_dir.normalize(), 2.0);
@@ -999,6 +1089,8 @@ impl App {
         shadow_matrices.push(light_vp * tool_tip_model);  // 15: tool tip
         shadow_matrices.push(light_vp * base_model);      // 16: base
         shadow_matrices.push(light_vp * stand_model);     // 17: workpiece stand
+        shadow_matrices.push(light_vp * track_rail_model);    // 18: track rail
+        shadow_matrices.push(light_vp * track_carriage_model); // 19: track carriage
 
         if let Some(shadow) = &self.shadow_pipeline {
             shadow.upload_matrices(&ctx.queue, &shadow_matrices);
@@ -1158,6 +1250,24 @@ impl App {
                 pass.set_index_buffer(sm.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..sm.num_indices, 0, 0..1);
             }
+            si += 1;
+
+            // Track rail
+            if let Some(rm) = &self.track_rail_mesh {
+                pass.set_bind_group(0, &shadow.bind_group, &[ShadowPipeline::dynamic_offset(si)]);
+                pass.set_vertex_buffer(0, rm.vertex_buffer.slice(..));
+                pass.set_index_buffer(rm.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..rm.num_indices, 0, 0..1);
+            }
+            si += 1;
+
+            // Track carriage
+            if let Some(cm) = &self.track_carriage_mesh {
+                pass.set_bind_group(0, &shadow.bind_group, &[ShadowPipeline::dynamic_offset(si)]);
+                pass.set_vertex_buffer(0, cm.vertex_buffer.slice(..));
+                pass.set_index_buffer(cm.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..cm.num_indices, 0, 0..1);
+            }
         }
 
         // ====== Pass 3: PBR → HDR texture (Clear to transparent) + depth (Clear) ======
@@ -1290,6 +1400,28 @@ impl App {
                     wgpu::IndexFormat::Uint32,
                 );
                 render_pass.draw_indexed(0..sm.num_indices, 0, 0..1);
+            }
+
+            // 10) Track rail
+            if let (Some(rm), Some(rmat)) = (&self.track_rail_mesh, &self.track_rail_material) {
+                render_pass.set_bind_group(0, &rmat.bind_group, &[]);
+                render_pass.set_vertex_buffer(0, rm.vertex_buffer.slice(..));
+                render_pass.set_index_buffer(
+                    rm.index_buffer.slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                render_pass.draw_indexed(0..rm.num_indices, 0, 0..1);
+            }
+
+            // 11) Track carriage
+            if let (Some(cm), Some(cmat)) = (&self.track_carriage_mesh, &self.track_carriage_material) {
+                render_pass.set_bind_group(0, &cmat.bind_group, &[]);
+                render_pass.set_vertex_buffer(0, cm.vertex_buffer.slice(..));
+                render_pass.set_index_buffer(
+                    cm.index_buffer.slice(..),
+                    wgpu::IndexFormat::Uint32,
+                );
+                render_pass.draw_indexed(0..cm.num_indices, 0, 0..1);
             }
         }
 
@@ -1775,6 +1907,55 @@ impl ApplicationHandler for App {
             bind_group: bbg,
         });
 
+        // Linear track rail: long flat box on the ground, extending along X (DH).
+        // In render space: X stays X, DH-Z → render-Y, DH-Y → render -Z.
+        // Rail extends from min_position to max_position along DH-X.
+        let track = &self.sim.linear_track;
+        let rail_half_len = ((track.max_position - track.min_position) / 2.0) as f32 + 0.15;
+        let rail_half_h = 0.02_f32; // 4cm tall rail
+        let rail_half_w = 0.08_f32; // 16cm wide
+        let (rail_verts, rail_idxs) = generate_box(rail_half_len, rail_half_h, rail_half_w);
+        let rail_vb = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Track Rail VB"),
+            contents: bytemuck::cast_slice(&rail_verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let rail_ib = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Track Rail IB"),
+            contents: bytemuck::cast_slice(&rail_idxs),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        self.track_rail_mesh = Some(GpuMesh {
+            vertex_buffer: rail_vb,
+            index_buffer: rail_ib,
+            num_indices: rail_idxs.len() as u32,
+        });
+        let (rbuf, rbg) = pbr.create_material_bind_group(&ctx.device);
+        self.track_rail_material = Some(MaterialBind { buffer: rbuf, bind_group: rbg });
+
+        // Track carriage: smaller box that slides with the arm base.
+        let carriage_half_len = 0.12_f32; // 24cm long
+        let carriage_half_h = 0.025_f32; // 5cm tall
+        let carriage_half_w = 0.10_f32; // 20cm wide
+        let (car_verts, car_idxs) = generate_box(carriage_half_len, carriage_half_h, carriage_half_w);
+        let car_vb = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Track Carriage VB"),
+            contents: bytemuck::cast_slice(&car_verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let car_ib = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Track Carriage IB"),
+            contents: bytemuck::cast_slice(&car_idxs),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        self.track_carriage_mesh = Some(GpuMesh {
+            vertex_buffer: car_vb,
+            index_buffer: car_ib,
+            num_indices: car_idxs.len() as u32,
+        });
+        let (cbuf, cbg) = pbr.create_material_bind_group(&ctx.device);
+        self.track_carriage_material = Some(MaterialBind { buffer: cbuf, bind_group: cbg });
+
         // Workpiece stand: box from ground up to workpiece bottom.
         let wp_bottom_y = self.sim.workpiece_center.z as f32 - self.sim.workpiece_half_extent as f32;
         let ground_y = wp_bottom_y - 0.01;
@@ -2030,7 +2211,10 @@ impl ApplicationHandler for App {
                             );
                         }
                         Key::Character("r") => {
-                            self.sim.cartesian_target = self.sim.arm.forward_kinematics();
+                            let mut fk = self.sim.arm.forward_kinematics();
+                            let track_off = Vector3::new(self.sim.linear_track.position, 0.0, 0.0);
+                            fk.translation.vector += track_off;
+                            self.sim.cartesian_target = fk;
                             eprintln!("Target reset to current tool pose");
                         }
                         Key::Character("R") => {
@@ -2165,22 +2349,28 @@ impl ApplicationHandler for App {
 
                             match self.retract_phase {
                                 1 => {
-                                    // Phase 1: Retracting — wait for arm to reach safe position
-                                    let arm_pos = self.sim.arm.tool_position();
-                                    let tgt_pos = self.sim.cartesian_target.translation.vector;
-                                    let err = (arm_pos - tgt_pos).norm();
-                                    if err < 0.03 { // within 30mm of retract position
+                                    // Phase 1: Retracting — wait for arm to clear cube rotation envelope.
+                                    // Don't require precise positioning — just ensure the arm is outside
+                                    // the sphere swept by cube corners during rotation.
+                                    let track_off = Vector3::new(self.sim.linear_track.position, 0.0, 0.0);
+                                    let arm_pos = self.sim.arm.tool_position() + track_off;
+                                    let wc = self.sim.workpiece_center;
+                                    let he = self.sim.workpiece_half_extent;
+                                    let clearance = he * 1.5 + 0.05; // corner sweep + margin
+                                    let dist_from_center = (arm_pos - wc).norm();
+                                    if dist_from_center > clearance {
                                         self.retract_phase = 2;
-                                        eprintln!("Retract complete (err={:.1}mm), rotating to A={:.1}°",
-                                            err * 1000.0, self.prev_a_axis.to_degrees());
+                                        eprintln!("Arm clear ({:.0}mm from center, need {:.0}mm), rotating to A={:.1}°",
+                                            dist_from_center * 1000.0, clearance * 1000.0,
+                                            self.prev_a_axis.to_degrees());
                                     }
                                 }
                                 2 => {
-                                    // Phase 2: Rotating table — drive PD and wait to settle
-                                    let a_err = self.prev_a_axis - self.sim.rotary_table.angle;
-                                    self.sim.rotary_table.torque =
-                                        200.0 * a_err - 80.0 * self.sim.rotary_table.velocity;
-                                    if a_err.abs() < 0.02 && self.sim.rotary_table.velocity.abs() < 0.1 {
+                                    // Phase 2: Rotating table — PD runs inside physics_step at 1kHz.
+                                    self.sim.rotary_table.target_angle = self.prev_a_axis;
+                                    if self.sim.rotary_table.error() < 0.02
+                                        && self.sim.rotary_table.velocity.abs() < 0.1
+                                    {
                                         self.retract_phase = 0;
                                         eprintln!("Table settled at A={:.1}°, resuming carving",
                                             self.prev_a_axis.to_degrees());
@@ -2188,14 +2378,34 @@ impl ApplicationHandler for App {
                                 }
                                 _ => {
                                     // Phase 0: Normal carving — advance session and check for A changes
-                                    let a_err = session.a_axis_target - self.sim.rotary_table.angle;
-                                    self.sim.rotary_table.torque =
-                                        200.0 * a_err - 80.0 * self.sim.rotary_table.velocity;
-                                    let table_settled = a_err.abs() < 0.02;
+                                    self.sim.rotary_table.target_angle = session.a_axis_target;
+                                    self.sim.linear_track.target_position = session.u_axis_target;
+                                    // Only gate on rotary table — it rotates the WORKPIECE (can't cut mid-spin).
+                                    // Track moves the ARM BASE; IK compensates dynamically, no settling needed.
+                                    let table_settled = self.sim.rotary_table.error() < 0.02;
 
                                     if table_settled {
+                                        // Adaptive feedrate (like real CNC servo loops):
+                                        // Scale session advancement proportionally to tracking
+                                        // error so the arm stays close to the target path.
+                                        // Rapids use a higher gain (target never jumps more than ~10mm),
+                                        // cuts use a tighter gain (accuracy matters for carving).
+                                        let track_off = Vector3::new(self.sim.linear_track.position, 0.0, 0.0);
+                                        let arm_pos = self.sim.arm.tool_position() + track_off;
+                                        let target_pos = self.sim.cartesian_target.translation.vector;
+                                        let tracking_err = (arm_pos - target_pos).norm();
+                                        let effective_dt = if session.is_rapid {
+                                            // Rapids: aggressive scaling — halve speed at 20mm lag
+                                            let feedrate_scale = 1.0 / (1.0 + tracking_err * 50.0);
+                                            scaled_dt * feedrate_scale
+                                        } else {
+                                            // Cuts: tighter scaling — halve speed at 50mm lag
+                                            let feedrate_scale = 1.0 / (1.0 + tracking_err * 20.0);
+                                            scaled_dt * feedrate_scale
+                                        };
+
                                         let a_before = session.a_axis_target;
-                                        if let Some(target) = session.step(scaled_dt) {
+                                        if let Some(target) = session.step(effective_dt) {
                                             self.sim.cartesian_target = target;
                                         }
                                         let a_after = session.a_axis_target;
@@ -2205,21 +2415,23 @@ impl ApplicationHandler for App {
                                             self.retract_phase = 1;
                                             self.sim.tool_state.spindle_on = false;
                                             self.prev_a_axis = a_after; // the NEW target angle
-                                            // Retract: move above rotation envelope
+                                            // Retract AWAY from cube in +X direction (not up — Z is
+                                            // unreachable at safe height with tool-down orientation).
+                                            // Cube corner sweep radius = he*sqrt(2) ≈ 0.216m.
+                                            // Retract to X = center.x + he*2, Z = center.z (reachable).
                                             let he = self.sim.workpiece_half_extent;
-                                            let safe_z = self.sim.workpiece_center.z + he * 1.5 + 0.05;
                                             let retract_pos = nalgebra::Vector3::new(
-                                                self.sim.workpiece_center.x,
+                                                self.sim.workpiece_center.x + he * 2.0 + 0.05,
                                                 self.sim.workpiece_center.y,
-                                                safe_z,
+                                                self.sim.workpiece_center.z,
                                             );
                                             let orient = self.sim.cartesian_target.rotation;
                                             self.sim.cartesian_target = nalgebra::Isometry3::from_parts(
                                                 nalgebra::Translation3::from(retract_pos),
                                                 orient,
                                             );
-                                            eprintln!("A-axis change to {:.1}°: retracting to Z={:.3}",
-                                                a_after.to_degrees(), safe_z);
+                                            eprintln!("A-axis change to {:.1}°: retracting to X={:.3}",
+                                                a_after.to_degrees(), retract_pos.x);
                                         }
                                     }
                                     if self.retract_phase == 0 {
