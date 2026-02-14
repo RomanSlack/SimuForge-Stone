@@ -388,6 +388,188 @@ mod tests {
     }
 
     #[test]
+    fn test_ik_tracks_carving_trajectory() {
+        use nalgebra::{Isometry3, Translation3, UnitQuaternion};
+
+        // Simulate the actual carving loop:
+        // 1. Pre-position arm near workpiece
+        // 2. Feed a sequence of cartesian targets through IK
+        // 3. Verify arm tracks them with velocity limiting
+
+        let mut arm = RobotArm::default_6dof();
+        let solver = IkSolver {
+            max_iterations: 50,
+            position_tolerance: 5e-4,
+            orientation_tolerance: 0.005,
+            max_step: 0.2,
+            nullspace_gain: 0.5,
+            ..IkSolver::default()
+        };
+
+        // Pre-position with multiple seeds (matching load_gcode IK seeds)
+        let pi = std::f64::consts::PI;
+        let pi2 = std::f64::consts::FRAC_PI_2;
+
+        // Tool-down orientation
+        let tool_down = UnitQuaternion::from_axis_angle(&Vector3::x_axis(), pi);
+        let orientation_weight = 0.6;
+
+        // Workpiece params: center=(0.65, 0, -0.05), half=0.1525
+        // NOTE: config.toml had center_z=0.05 which is WRONG — workpiece too high for arm
+        let workpiece_top = Vector3::new(0.65, 0.0, -0.05 + 0.1525);
+        let start_pos = workpiece_top + Vector3::new(0.0, 0.0, 0.015);
+
+        // Try multiple IK seeds (same as load_gcode)
+        let start_target = Isometry3::from_parts(Translation3::from(start_pos), tool_down);
+        let seeds: &[[f64; 6]] = &[
+            [0.0, 1.0, 0.57, 0.0, pi2, 0.0],
+            [0.0, 0.9, 0.67, 0.0, pi2, 0.0],
+            [0.0, 0.8, 0.77, 0.0, pi2, 0.0],
+            [0.0, 1.1, 0.47, 0.0, pi2, 0.0],
+            [0.0, 1.0, 0.57, pi, -pi2, 0.0],
+        ];
+
+        let mut best_err = f64::MAX;
+        let mut best_ok = false;
+        for (si, seed) in seeds.iter().enumerate() {
+            let mut scratch = arm.clone();
+            scratch.set_joint_angles(&seed.to_vec());
+
+            // First check where this seed's FK puts the tool
+            let seed_pos = scratch.tool_position();
+            eprintln!("  Seed {}: FK=({:.3},{:.3},{:.3})", si,
+                seed_pos.x, seed_pos.y, seed_pos.z);
+
+            let (ok, iters, err) = solver.solve_weighted(&mut scratch, &start_target, 0.5);
+            eprintln!("  Seed {}: converged={}, iters={}, error={:.1}mm, pos=({:.3},{:.3},{:.3})",
+                si, ok, iters, err * 1000.0,
+                scratch.tool_position().x, scratch.tool_position().y, scratch.tool_position().z);
+            if ok && err < best_err {
+                best_err = err;
+                best_ok = true;
+                arm.set_joint_angles(&scratch.joint_angles());
+            } else if err < best_err {
+                best_err = err;
+                arm.set_joint_angles(&scratch.joint_angles());
+            }
+        }
+
+        eprintln!("Pre-position: best_converged={}, best_error={:.1}mm", best_ok, best_err * 1000.0);
+        eprintln!("Target pos: ({:.3},{:.3},{:.3})", start_pos.x, start_pos.y, start_pos.z);
+        eprintln!("Actual pos: ({:.3},{:.3},{:.3})", arm.tool_position().x, arm.tool_position().y, arm.tool_position().z);
+
+        // Even if not perfectly converged, proceed if error is reasonable
+        assert!(best_err < 0.05, "Pre-positioning IK error too large: {:.1}mm", best_err * 1000.0);
+
+        let mut joint_targets = arm.joint_angles();
+
+        // Simulate carving: interpolate between waypoints (like trajectory planner)
+        // Keep moves within the comfortable workspace (center ± 50mm in XY)
+        let waypoints = [
+            workpiece_top + Vector3::new(0.0, 0.0, 0.01),     // Z+10mm (safe)
+            workpiece_top + Vector3::new(0.0, 0.0, -0.003),   // Z-3mm (shallow cut)
+            workpiece_top + Vector3::new(0.05, 0.0, -0.003),  // Move +X 50mm
+            workpiece_top + Vector3::new(0.05, 0.05, -0.003), // Move +Y 50mm
+            workpiece_top + Vector3::new(0.0, 0.05, -0.003),  // Back to center X
+            workpiece_top + Vector3::new(0.0, -0.05, -0.003), // Move -Y 100mm (through center)
+            workpiece_top + Vector3::new(0.0, 0.0, -0.02),    // Center, deeper Z-20mm
+            workpiece_top + Vector3::new(0.0, 0.0, 0.01),     // Retract
+        ];
+
+        let frame_dt = 1.0 / 60.0;
+        let feed_rate = 0.01; // 10mm/s (600mm/min) — typical cutting speed
+        let mut stuck_count = 0;
+        let mut total_moves = 0;
+        let mut current_target = arm.tool_position();
+
+        for (seg_idx, &waypoint_pos) in waypoints.iter().enumerate() {
+            // Interpolate smoothly from current_target to waypoint_pos
+            let seg_dist = (waypoint_pos - current_target).norm();
+            let seg_time = if seg_dist > 1e-6 { seg_dist / feed_rate } else { 0.0 };
+            let num_frames = (seg_time / frame_dt).ceil() as usize + 1;
+            let direction = if seg_dist > 1e-6 {
+                (waypoint_pos - current_target) / seg_dist
+            } else {
+                Vector3::zeros()
+            };
+
+            let mut seg_rejected = 0;
+            for f in 0..num_frames {
+                let t = (f as f64 * frame_dt * feed_rate).min(seg_dist);
+                let interp_pos = current_target + direction * t;
+                let cart_target = Isometry3::from_parts(
+                    Translation3::from(interp_pos), tool_down,
+                );
+
+                let mut scratch = arm.clone();
+                scratch.set_joint_angles(&joint_targets);
+
+                let (_converged, _iters, ik_err) = solver.solve_weighted(
+                    &mut scratch, &cart_target, orientation_weight,
+                );
+
+                let new_angles = scratch.joint_angles();
+                let prev_config = arm.configuration_flags();
+                let new_config = scratch.configuration_flags();
+                let config_dist = scratch.config_distance(&joint_targets);
+
+                // Config consistency check (same as update_ik)
+                if new_config != prev_config && config_dist > 0.3 {
+                    stuck_count += 1;
+                    seg_rejected += 1;
+                    if seg_rejected <= 3 || seg_rejected % 100 == 0 {
+                        eprintln!("  REJECT seg{} f{}: cfg {:?}→{:?} dist={:.2} ik_err={:.1}mm",
+                            seg_idx, f, prev_config, new_config, config_dist, ik_err * 1000.0);
+                    }
+                    continue;
+                }
+
+                // Velocity limiting
+                let mut deltas: Vec<f64> = new_angles.iter().zip(joint_targets.iter())
+                    .map(|(new, old)| new - old)
+                    .collect();
+                IkSolver::apply_velocity_limits(&mut deltas, &arm, frame_dt);
+
+                for i in 0..joint_targets.len() {
+                    joint_targets[i] += deltas[i];
+                }
+                arm.set_joint_angles(&joint_targets);
+                total_moves += 1;
+
+                // Log first and last frames for debugging
+                if f == 0 || f == num_frames - 1 {
+                    let pos_err = (arm.tool_position() - interp_pos).norm();
+                    eprintln!("  seg{} f{}/{}: err={:.1}mm ik_err={:.1}mm",
+                        seg_idx, f, num_frames, pos_err*1000.0, ik_err*1000.0);
+                }
+            }
+            if seg_rejected > 0 {
+                eprintln!("  Segment {} had {} config rejections out of {} frames",
+                    seg_idx, seg_rejected, num_frames);
+            }
+            current_target = waypoint_pos;
+
+            let pos_err = (arm.tool_position() - waypoint_pos).norm();
+            eprintln!(
+                "Waypoint {}: ({:.0},{:.0},{:.0})mm err={:.1}mm config=({},{},{})",
+                seg_idx,
+                waypoint_pos.x * 1000.0, waypoint_pos.y * 1000.0, waypoint_pos.z * 1000.0,
+                pos_err * 1000.0,
+                arm.configuration_flags().0, arm.configuration_flags().1, arm.configuration_flags().2,
+            );
+            assert!(
+                pos_err < 0.01, // 10mm — smooth interpolation should track well
+                "Waypoint {} tracking error too large: {:.1}mm",
+                seg_idx, pos_err * 1000.0
+            );
+        }
+
+        eprintln!("Total frames: {}, config rejected: {}", total_moves, stuck_count);
+        assert!(stuck_count < total_moves / 4,
+            "Too many config rejections: {}/{}", stuck_count, total_moves);
+    }
+
+    #[test]
     fn test_nullspace_centering_reduces_drift() {
         let mut arm = RobotArm::default_6dof();
         // Set wrist joints far from center

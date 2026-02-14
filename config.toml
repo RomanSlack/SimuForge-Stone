@@ -15,7 +15,7 @@ tool_offset = 0.175
 # Workpiece center in DH coordinates (meters)
 center_x = 0.65
 center_y = 0.0
-center_z = 0.05
+center_z = -0.05
 # Half-extent of the cube (meters). 0.1525 = ~6 inches = 305mm cube
 half_extent = 0.1525
 # Octree voxel resolution (meters). Smaller = finer detail but more memory.

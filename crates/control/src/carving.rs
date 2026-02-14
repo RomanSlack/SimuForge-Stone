@@ -333,4 +333,114 @@ mod tests {
         assert_eq!(session.state, CarvingState::Complete);
         assert!(session.progress() > 0.9);
     }
+
+    #[test]
+    fn test_calibration_gcode_loads_and_produces_targets() {
+        // Load the actual calibration G-code file
+        let gcode_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples/calibration.gcode");
+        let gcode = GCodeInterpreter::load_file(gcode_path)
+            .expect("Failed to load calibration.gcode");
+
+        // Workpiece params matching config.toml: center=(0.65, 0, 0.05), half=0.1525
+        let workpiece_center = Vector3::new(0.65, 0.0, 0.05);
+        let half_extent = 0.1525;
+        let workpiece_top_center = Vector3::new(
+            workpiece_center.x,
+            workpiece_center.y,
+            workpiece_center.z + half_extent,
+        );
+        let orient = UnitQuaternion::from_axis_angle(
+            &Vector3::x_axis(), std::f64::consts::PI,
+        );
+
+        let cmd_count = gcode.commands.len();
+        eprintln!("Calibration G-code: {} commands parsed", cmd_count);
+        assert!(cmd_count > 50, "Expected >50 commands, got {}", cmd_count);
+
+        let mut session = CarvingSession::from_interpreter(gcode, workpiece_top_center, orient)
+            .expect("Failed to create CarvingSession");
+
+        let wp_count = session.waypoints.len();
+        eprintln!("Calibration G-code: {} waypoints extracted", wp_count);
+        assert!(wp_count > 30, "Expected >30 waypoints, got {}", wp_count);
+        eprintln!("Estimated time: {:.1}s", session.estimated_total_time);
+
+        // Start the session and step through, collecting all targets
+        session.start();
+        assert_eq!(session.state, CarvingState::Running);
+
+        let mut targets: Vec<Vector3<f64>> = Vec::new();
+        let mut steps = 0;
+        let dt = 0.001; // 1ms steps
+        while session.state == CarvingState::Running && steps < 5_000_000 {
+            if let Some(target) = session.step(dt) {
+                targets.push(target.translation.vector);
+            }
+            steps += 1;
+        }
+
+        assert_eq!(session.state, CarvingState::Complete,
+            "Session did not complete after {} steps", steps);
+        eprintln!("Session completed after {} steps, {} targets sampled", steps, targets.len());
+
+        // Verify targets are within reasonable workspace bounds
+        // The arm can reach ~1.4m, workpiece center is at ~0.65m
+        let mut min_pos = Vector3::new(f64::MAX, f64::MAX, f64::MAX);
+        let mut max_pos = Vector3::new(f64::MIN, f64::MIN, f64::MIN);
+        for t in &targets {
+            for i in 0..3 {
+                min_pos[i] = min_pos[i].min(t[i]);
+                max_pos[i] = max_pos[i].max(t[i]);
+            }
+        }
+        eprintln!("Target bounds: min=({:.3},{:.3},{:.3}) max=({:.3},{:.3},{:.3})",
+            min_pos.x, min_pos.y, min_pos.z, max_pos.x, max_pos.y, max_pos.z);
+
+        // All targets should be within arm's reachable workspace (roughly)
+        for (i, t) in targets.iter().enumerate() {
+            let dist_from_base = (t.x * t.x + t.y * t.y).sqrt();
+            assert!(dist_from_base < 1.5,
+                "Target {} at ({:.3},{:.3},{:.3}) too far from base: {:.3}m",
+                i, t.x, t.y, t.z, dist_from_base);
+            // Z should be within reasonable range (base is at z=0.3, workspace extends down)
+            assert!(t.z > -0.5 && t.z < 1.5,
+                "Target {} Z out of range: {:.3}", i, t.z);
+        }
+
+        // Verify the workspace spans a reasonable range around the workpiece
+        let x_range = max_pos.x - min_pos.x;
+        let y_range = max_pos.y - min_pos.y;
+        eprintln!("Workspace coverage: X={:.1}mm, Y={:.1}mm, Z range=[{:.1}mm, {:.1}mm]",
+            x_range * 1000.0, y_range * 1000.0,
+            (min_pos.z - workpiece_top_center.z) * 1000.0,
+            (max_pos.z - workpiece_top_center.z) * 1000.0);
+        assert!(x_range > 0.1, "X range too small: {:.3}m", x_range);
+        assert!(y_range > 0.1, "Y range too small: {:.3}m", y_range);
+    }
+
+    #[test]
+    fn test_carving_session_first_segment_loads() {
+        // Minimal test: ensure that after start(), the first segment is loaded
+        // and step() returns a target immediately
+        let program = "G0 Z10\nM3 S10000\nG0 X0 Y0\nG1 Z-3 F300\nG0 Z5\nM5\n";
+        let mut gcode = GCodeInterpreter::new();
+        gcode.parse(program);
+
+        let offset = Vector3::new(0.65, 0.0, 0.2025);
+        let orient = UnitQuaternion::identity();
+        let mut session = CarvingSession::from_interpreter(gcode, offset, orient).unwrap();
+
+        session.start();
+        assert_eq!(session.state, CarvingState::Running);
+
+        // The very first step should return a target
+        let target = session.step(0.001);
+        assert!(target.is_some(), "First step() should return a target, not None");
+
+        let pos = target.unwrap().translation.vector;
+        eprintln!("First target: ({:.4}, {:.4}, {:.4})", pos.x, pos.y, pos.z);
+
+        // Should be near the workpiece offset (first G-code move is G0 Z10 → +0.01m)
+        assert!((pos.x - 0.65).abs() < 0.5, "First target X too far: {:.3}", pos.x);
+    }
 }
