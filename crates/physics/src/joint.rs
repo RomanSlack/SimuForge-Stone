@@ -28,6 +28,8 @@ pub struct RevoluteJoint {
     pub limit_stiffness: f64,
     /// Joint damping for limit enforcement (Nm·s/rad).
     pub limit_damping: f64,
+    /// Maximum joint velocity (rad/s). Per-joint limit based on motor/gearbox.
+    pub velocity_limit: f64,
 }
 
 impl RevoluteJoint {
@@ -46,6 +48,7 @@ impl RevoluteJoint {
             backlash: 0.0,
             limit_stiffness: 1000.0, // Nm/rad — soft spring at limits (hard clamp is backup)
             limit_damping: 200.0,    // Nm·s/rad — absorb energy at limits
+            velocity_limit: 3.0,     // rad/s — default, overridden per-joint
         }
     }
 
@@ -78,14 +81,11 @@ impl RevoluteJoint {
         self.torque + self.friction_torque() + self.limit_torque()
     }
 
-    /// Maximum joint velocity (rad/s). Safety clamp to prevent runaway.
-    const MAX_VELOCITY: f64 = 3.0; // ~172°/s — fast for an industrial arm
-
     /// Integrate joint state forward by dt given acceleration.
     pub fn integrate(&mut self, acceleration: f64, dt: f64) {
         self.velocity += acceleration * dt;
-        // Safety clamp: prevent runaway velocities
-        self.velocity = self.velocity.clamp(-Self::MAX_VELOCITY, Self::MAX_VELOCITY);
+        // Safety clamp: prevent runaway velocities (per-joint limit)
+        self.velocity = self.velocity.clamp(-self.velocity_limit, self.velocity_limit);
         self.angle += self.velocity * dt;
     }
 
@@ -110,6 +110,12 @@ impl RevoluteJoint {
     pub fn with_friction(mut self, viscous: f64, coulomb: f64) -> Self {
         self.viscous_friction = viscous;
         self.coulomb_friction = coulomb;
+        self
+    }
+
+    /// Set per-joint velocity limit (builder pattern).
+    pub fn with_velocity_limit(mut self, limit: f64) -> Self {
+        self.velocity_limit = limit;
         self
     }
 }

@@ -118,14 +118,16 @@ impl RobotArm {
         ];
 
         let joints = vec![
-            // Large joints (100:1 planetary): high friction from gearbox
-            RevoluteJoint::new(-360.0, 360.0).with_friction(10.0, 3.0),  // J1: base, continuous rotation
-            RevoluteJoint::new(-45.0, 135.0).with_friction(10.0, 3.0),   // J2
-            RevoluteJoint::new(-135.0, 135.0).with_friction(8.0, 2.5),   // J3
-            // Small joints (50:1 planetary): less friction
-            RevoluteJoint::new(-180.0, 180.0).with_friction(3.0, 1.0),   // J4
-            RevoluteJoint::new(-120.0, 120.0).with_friction(3.0, 1.0),   // J5
-            RevoluteJoint::new(-360.0, 360.0).with_friction(2.0, 0.5),   // J6
+            // Large joints (100:1 planetary): high friction, low output speed
+            // NEMA34 80 rad/s / 100:1 = 0.8 rad/s max at output
+            RevoluteJoint::new(-360.0, 360.0).with_friction(10.0, 3.0).with_velocity_limit(0.8),  // J1
+            RevoluteJoint::new(-45.0, 135.0).with_friction(10.0, 3.0).with_velocity_limit(0.8),   // J2
+            RevoluteJoint::new(-135.0, 135.0).with_friction(8.0, 2.5).with_velocity_limit(0.8),   // J3
+            // Small joints (50:1 planetary): less friction, faster output
+            // NEMA23 120 rad/s / 50:1 = 2.4 rad/s max at output
+            RevoluteJoint::new(-180.0, 180.0).with_friction(3.0, 1.0).with_velocity_limit(2.4),   // J4
+            RevoluteJoint::new(-120.0, 120.0).with_friction(3.0, 1.0).with_velocity_limit(2.4),   // J5
+            RevoluteJoint::new(-360.0, 360.0).with_friction(2.0, 0.5).with_velocity_limit(2.4),   // J6
         ];
 
         // Link masses (approximate for steel/aluminum arm)
@@ -212,6 +214,69 @@ impl RobotArm {
         self.forward_kinematics().translation.vector
     }
 
+    /// Joint center positions for null-space centering.
+    /// Returns the midpoint of each joint's range.
+    pub fn joint_centers(&self) -> Vec<f64> {
+        self.joints.iter().map(|j| {
+            (j.angle_min + j.angle_max) / 2.0
+        }).collect()
+    }
+
+    /// Configuration flags: (elbow_sign, wrist_sign, shoulder_sign).
+    /// Used to detect configuration flips between IK solutions.
+    pub fn configuration_flags(&self) -> (bool, bool, bool) {
+        let elbow = self.joints[2].angle >= 0.0;     // J3 sign determines elbow up/down
+        let wrist = self.joints[4].angle >= 0.0;      // J5 sign determines wrist flip
+        let shoulder = self.joints[1].angle >= 0.0;    // J2 sign determines shoulder config
+        (elbow, wrist, shoulder)
+    }
+
+    /// Weighted configuration distance between current state and a set of angles.
+    /// Heavier weights on J2, J3 (elbow-determining joints) and J5 (wrist flip).
+    pub fn config_distance(&self, other_angles: &[f64]) -> f64 {
+        const WEIGHTS: [f64; 6] = [1.0, 3.0, 3.0, 1.5, 2.0, 0.5];
+        let mut dist = 0.0;
+        for (i, joint) in self.joints.iter().enumerate() {
+            let d = joint.angle - other_angles[i];
+            dist += WEIGHTS[i] * d * d;
+        }
+        dist.sqrt()
+    }
+
+    /// Check if any non-adjacent link capsules are in collision.
+    /// Returns true if the arm is collision-free.
+    pub fn is_collision_free(&self) -> bool {
+        let frames = self.link_frames();
+        // Link capsule radii (matching rendering radii + margin)
+        const RADII: [f64; 6] = [0.10, 0.08, 0.07, 0.05, 0.05, 0.04];
+        const MARGIN: f64 = 0.02;
+
+        // Non-adjacent pairs to check
+        const PAIRS: [(usize, usize); 10] = [
+            (0, 2), (0, 3), (0, 4), (0, 5),
+            (1, 3), (1, 4), (1, 5),
+            (2, 4), (2, 5),
+            (3, 5),
+        ];
+
+        for &(a, b) in &PAIRS {
+            let pa_start = frames[a].translation.vector;
+            let pa_end = frames[a + 1].translation.vector;
+            let pb_start = frames[b].translation.vector;
+            let pb_end = frames[b + 1].translation.vector;
+
+            let dist = segment_segment_distance(
+                &pa_start, &pa_end, &pb_start, &pb_end,
+            );
+            let min_dist = RADII[a] + RADII[b] + MARGIN;
+
+            if dist < min_dist {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Compute gravity compensation torques (motor-side).
     ///
     /// Returns the joint torques needed to hold the arm static against gravity.
@@ -237,6 +302,63 @@ impl RobotArm {
 
         torques
     }
+}
+
+/// Closest distance between two line segments in 3D.
+/// Segment 1: p0→p1, Segment 2: q0→q1.
+fn segment_segment_distance(
+    p0: &Vector3<f64>, p1: &Vector3<f64>,
+    q0: &Vector3<f64>, q1: &Vector3<f64>,
+) -> f64 {
+    let d1 = p1 - p0; // direction of segment 1
+    let d2 = q1 - q0; // direction of segment 2
+    let r = p0 - q0;
+
+    let a = d1.dot(&d1); // |d1|²
+    let e = d2.dot(&d2); // |d2|²
+    let f = d2.dot(&r);
+
+    // Both segments degenerate to points
+    if a < 1e-12 && e < 1e-12 {
+        return r.norm();
+    }
+    // First segment degenerates to a point
+    if a < 1e-12 {
+        let t = (f / e).clamp(0.0, 1.0);
+        return (p0 - (q0 + d2 * t)).norm();
+    }
+
+    let c = d1.dot(&r);
+
+    // Second segment degenerates to a point
+    if e < 1e-12 {
+        let s = (-c / a).clamp(0.0, 1.0);
+        return ((p0 + d1 * s) - q0).norm();
+    }
+
+    let b = d1.dot(&d2);
+    let denom = a * e - b * b;
+
+    // Segments not parallel
+    let mut s = if denom.abs() > 1e-12 {
+        ((b * f - c * e) / denom).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    let mut t = (b * s + f) / e;
+
+    if t < 0.0 {
+        t = 0.0;
+        s = (-c / a).clamp(0.0, 1.0);
+    } else if t > 1.0 {
+        t = 1.0;
+        s = ((b - c) / a).clamp(0.0, 1.0);
+    }
+
+    let closest_p = p0 + d1 * s;
+    let closest_q = q0 + d2 * t;
+    (closest_p - closest_q).norm()
 }
 
 #[cfg(test)]

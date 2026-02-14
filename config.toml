@@ -30,4 +30,4 @@ max_physics_steps = 5000
 # target before cutting begins. Prevents spurious cuts during repositioning.
 tracking_threshold = 0.01
 # Orientation weight for IK during carving (0.0=position-only, 1.0=full 6DOF)
-orientation_weight = 0.2
+orientation_weight = 0.6

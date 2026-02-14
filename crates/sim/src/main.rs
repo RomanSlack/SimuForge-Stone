@@ -244,6 +244,7 @@ impl SimState {
                 position_tolerance: 5e-4,
                 orientation_tolerance: 0.005,
                 max_step: 0.2,
+                nullspace_gain: 0.5,
             },
             sim_time: 0.0,
             paused: true,
@@ -258,34 +259,54 @@ impl SimState {
     }
 
     /// Solve IK: update joint_targets from cartesian_target.
-    /// In carving mode, uses position-only IK (3DOF) — the arm finds its own
-    /// natural orientation, avoiding the orientation-fight that causes bobbing.
-    /// In manual mode, uses full 6DOF pose IK so the user can control orientation.
-    /// Rate-limits joint target changes to prevent flopping at workspace boundaries.
+    /// Applies configuration consistency check (Phase 4), self-collision avoidance (Phase 5),
+    /// and per-joint velocity limiting (Phase 1).
     fn update_ik(&mut self) {
+        let prev_targets = self.joint_targets.clone();
+        let prev_config = self.arm.configuration_flags();
+
         let mut scratch = self.arm.clone();
         scratch.set_joint_angles(&self.joint_targets);
 
         let converged = if self.mode == SimMode::Carving {
-            // Weighted IK: gentle orientation bias keeps tool pointing down
             let (ok, _, _) = self.ik_solver.solve_weighted(
                 &mut scratch, &self.cartesian_target, self.orientation_weight,
             );
             ok
         } else {
-            // Full 6DOF IK: user controls orientation via IJKL keys
             let (ok, _, _) = self.ik_solver.solve(&mut scratch, &self.cartesian_target);
             ok
         };
+
+        let new_angles = scratch.joint_angles();
+
+        // Phase 4: Configuration consistency — reject solutions that flip elbow/wrist
+        let new_config = scratch.configuration_flags();
+        let config_dist = scratch.config_distance(&prev_targets);
+        if new_config != prev_config && config_dist > 0.3 {
+            // Configuration flipped with large joint change — reject
+            self.ik_converged = false;
+            return;
+        }
+
+        // Phase 5: Self-collision avoidance — reject solutions in collision
+        if !scratch.is_collision_free() {
+            self.ik_converged = false;
+            return;
+        }
+
         self.ik_converged = converged;
 
-        // Rate-limit: max joint angle change per frame (~60fps).
-        // Prevents oscillation when IK can't fully converge at workspace boundary.
-        let max_delta = 0.05; // ~3 deg/frame → ~180 deg/s max slew rate
-        let new_angles = scratch.joint_angles();
+        // Phase 1: Per-joint velocity limiting instead of flat max_delta.
+        // Scale entire delta vector proportionally so no joint exceeds its velocity limit.
+        let frame_dt = 1.0 / 60.0; // ~60fps
+        let mut deltas: Vec<f64> = new_angles.iter().zip(self.joint_targets.iter())
+            .map(|(new, old)| new - old)
+            .collect();
+        IkSolver::apply_velocity_limits(&mut deltas, &self.arm, frame_dt);
+
         for i in 0..self.joint_targets.len() {
-            let delta = new_angles[i] - self.joint_targets[i];
-            self.joint_targets[i] += delta.clamp(-max_delta, max_delta);
+            self.joint_targets[i] += deltas[i];
         }
     }
 
@@ -2053,6 +2074,14 @@ impl ApplicationHandler for App {
                             let next_idx = if current_idx > 0 { current_idx - 1 } else { 0 };
                             self.speed_multiplier = SPEED_PRESETS[next_idx];
                             eprintln!("Speed: {}x", self.speed_multiplier);
+                        }
+                        Key::Character("]") => {
+                            self.sim.orientation_weight = (self.sim.orientation_weight + 0.1).min(1.0);
+                            eprintln!("Orientation weight: {:.1}", self.sim.orientation_weight);
+                        }
+                        Key::Character("[") => {
+                            self.sim.orientation_weight = (self.sim.orientation_weight - 0.1).max(0.0);
+                            eprintln!("Orientation weight: {:.1}", self.sim.orientation_weight);
                         }
                         _ => {}
                     }

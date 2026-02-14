@@ -114,7 +114,7 @@ impl SimConfig {
             default_speed: cfg.get_f64("carving.default_speed", 1.0),
             max_physics_steps: cfg.get_u32("carving.max_physics_steps", 5000),
             tracking_threshold: cfg.get_f64("carving.tracking_threshold", 0.01),
-            orientation_weight: cfg.get_f64("carving.orientation_weight", 0.2),
+            orientation_weight: cfg.get_f64("carving.orientation_weight", 0.6),
         }
     }
 }
