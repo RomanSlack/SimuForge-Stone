@@ -300,6 +300,14 @@ impl SimState {
 
         let new_angles = scratch.joint_angles();
 
+        // Configuration guard: reject forward wrist solutions (J3 > 0) during carving.
+        // Forward wrist makes the arm approach from the side, phasing through the block.
+        // Backward wrist (J3 < 0) approaches from above — the only realistic configuration.
+        if self.mode == SimMode::Carving && new_angles[2] > 0.0 {
+            self.ik_converged = false;
+            return;
+        }
+
         // Self-collision avoidance — reject solutions in collision
         if !scratch.is_collision_free() {
             self.ik_consecutive_collisions += 1;
@@ -484,15 +492,15 @@ impl SimState {
             tool_down,
         );
 
-        // IK seeds optimized for tool_offset=0.175 and center_z=-0.2.
-        // The tool extends 175mm past the flange, so standard J2+J3≈π/2 seeds
-        // don't work — need seeds that place the flange higher.
+        // IK seeds for backward wrist configuration (J3 < 0, J5 = +π/2).
+        // At arm-local X ≈ 0.72m, backward wrist converges to J3 ≈ -121° (-2.11 rad).
+        // J3 MUST be negative — positive J3 gives forward wrist (tool from side).
         let seeds: &[[f64; 6]] = &[
-            [0.0, 0.5, 1.0, 0.0, pi2, 0.0],
-            [0.0, 0.3, 1.27, 0.0, pi2, 0.0],
-            [0.0, 0.7, 0.0, 0.0, pi2, 0.0],
-            [0.0, 1.0, 0.57, pi, -pi2, 0.0], // forward wrist variant
-            [0.0, 0.8, 0.77, 0.0, pi2, 0.0],
+            [0.0, 0.8, -2.0, 0.0, pi2, 0.0],   // J3=-114.6°
+            [0.0, 0.9, -2.1, 0.0, pi2, 0.0],   // J3=-120.3°
+            [0.0, 1.0, -2.2, 0.0, pi2, 0.0],   // J3=-126.1°
+            [0.0, 0.7, -1.8, 0.0, pi2, 0.0],   // J3=-103.1°
+            [0.0, 0.85, -1.9, 0.0, pi2, 0.0],  // J3=-108.9°
         ];
 
         let mut best_angles: Option<Vec<f64>> = None;
@@ -504,7 +512,14 @@ impl SimState {
             let (ok, _, final_err) = self.ik_solver.solve_weighted(
                 &mut scratch, &start_target, 0.5,
             );
-            if ok && final_err < best_err {
+            if !ok { continue; }
+            // Reject forward wrist solutions (J3 > 0): arm approaches from the side,
+            // phasing through the workpiece. Only accept backward wrist (J3 < 0).
+            let j3 = scratch.joints[2].angle;
+            if j3 > 0.0 {
+                continue;
+            }
+            if final_err < best_err {
                 best_err = final_err;
                 best_angles = Some(scratch.joint_angles());
             }
@@ -1009,7 +1024,10 @@ impl App {
 
         // --- Upload material uniforms ---
         if let Some(wp) = &self.workpiece_material {
-            let mat = MaterialUniform::marble().with_model(workpiece_model.to_cols_array_2d());
+            let he = self.sim.workpiece_half_extent as f32;
+            let mat = MaterialUniform::marble()
+                .with_model(workpiece_model.to_cols_array_2d())
+                .with_bounds([-he, -he, -he], [he, he, he]);
             ctx.queue.write_buffer(&wp.buffer, 0, bytemuck::bytes_of(&mat));
         }
         if let Some(gnd) = &self.ground_material {

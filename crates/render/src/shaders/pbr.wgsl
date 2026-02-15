@@ -18,6 +18,8 @@ struct MaterialUniform {
     base_color: vec4<f32>,
     params: vec4<f32>, // roughness, metallic, subsurface, pad
     model: mat4x4<f32>,
+    bounds_min: vec4<f32>, // original workpiece AABB min (object space)
+    bounds_max: vec4<f32>, // original workpiece AABB max (object space)
 };
 
 // Group 0: per-material uniforms
@@ -39,6 +41,7 @@ struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) world_pos: vec3<f32>,
     @location(1) world_normal: vec3<f32>,
+    @location(2) object_pos: vec3<f32>,
 };
 
 @vertex
@@ -47,6 +50,7 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     let world_pos = material.model * vec4<f32>(in.position, 1.0);
     out.clip_position = camera.view_proj * world_pos;
     out.world_pos = world_pos.xyz;
+    out.object_pos = in.position;
     // Transform normal by the upper-left 3x3 of model matrix
     let normal_matrix = mat3x3<f32>(
         material.model[0].xyz,
@@ -108,9 +112,33 @@ fn compute_shadow(world_pos: vec3<f32>) -> f32 {
     return shadow;
 }
 
+// Compute how deep a point is inside the original workpiece bounds.
+// Returns 0.0 on the original surface, positive values for carved interior.
+fn carve_depth(obj_pos: vec3<f32>) -> f32 {
+    let bmin = material.bounds_min.xyz;
+    let bmax = material.bounds_max.xyz;
+    // If bounds are zero (non-workpiece objects), skip
+    if (bmin.x == bmax.x && bmin.y == bmax.y && bmin.z == bmax.z) {
+        return 0.0;
+    }
+    // Min distance from point to any original cube face
+    let d = min(
+        min(obj_pos.x - bmin.x, bmax.x - obj_pos.x),
+        min(
+            min(obj_pos.y - bmin.y, bmax.y - obj_pos.y),
+            min(obj_pos.z - bmin.z, bmax.z - obj_pos.z)
+        )
+    );
+    return max(d, 0.0);
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let albedo = material.base_color.rgb;
+    // Depth-based interior coloring: white shell → warm reddish core
+    let depth = carve_depth(in.object_pos);
+    let interior_color = vec3<f32>(0.78, 0.42, 0.36); // warm terracotta red
+    let depth_blend = smoothstep(0.0, 0.015, depth); // transition over ~15mm
+    let albedo = mix(material.base_color.rgb, interior_color, depth_blend);
     let roughness = material.params.x;
     let metallic = material.params.y;
 

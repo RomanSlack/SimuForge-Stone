@@ -36,6 +36,10 @@ pub struct MaterialUniform {
     pub params: [f32; 4],
     /// Model matrix (object → world).
     pub model: [[f32; 4]; 4],
+    /// Original workpiece AABB min (object space). Used for depth-based interior coloring.
+    pub bounds_min: [f32; 4],
+    /// Original workpiece AABB max (object space). Used for depth-based interior coloring.
+    pub bounds_max: [f32; 4],
 }
 
 impl MaterialUniform {
@@ -45,6 +49,8 @@ impl MaterialUniform {
             base_color: [0.92, 0.91, 0.88, 1.0],
             params: [0.3, 0.0, 0.5, 0.0],
             model: IDENTITY_MAT4,
+            bounds_min: [0.0; 4],
+            bounds_max: [0.0; 4],
         }
     }
 
@@ -54,6 +60,8 @@ impl MaterialUniform {
             base_color: color,
             params: [0.4, 0.9, 0.0, 0.0],
             model: IDENTITY_MAT4,
+            bounds_min: [0.0; 4],
+            bounds_max: [0.0; 4],
         }
     }
 
@@ -63,12 +71,21 @@ impl MaterialUniform {
             base_color: [0.25, 0.27, 0.30, 1.0],
             params: [0.9, 0.0, 0.0, -1.0], // params.w < 0 triggers grid in shader
             model: IDENTITY_MAT4,
+            bounds_min: [0.0; 4],
+            bounds_max: [0.0; 4],
         }
     }
 
     /// Set model matrix, returning modified copy.
     pub fn with_model(mut self, model: [[f32; 4]; 4]) -> Self {
         self.model = model;
+        self
+    }
+
+    /// Set original workpiece bounds (object space) for depth-based interior coloring.
+    pub fn with_bounds(mut self, min: [f32; 3], max: [f32; 3]) -> Self {
+        self.bounds_min = [min[0], min[1], min[2], 0.0];
+        self.bounds_max = [max[0], max[1], max[2], 0.0];
         self
     }
 }
