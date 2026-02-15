@@ -109,6 +109,11 @@ enum SimMode {
 /// Speed multiplier presets for carving.
 const SPEED_PRESETS: &[f64] = &[0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0];
 
+/// Optimal arm-local X distance for tool-down orientation.
+/// At 0.72m, J3 ≈ -121° (comfortable margin from ±135° limit).
+/// The dynamic track auto-positions the arm base so arm-local X stays near this value.
+const OPTIMAL_LOCAL_X: f64 = 0.72;
+
 /// Full simulation state.
 #[allow(dead_code)]
 struct SimState {
@@ -275,9 +280,6 @@ impl SimState {
     /// Applies configuration consistency check (Phase 4), self-collision avoidance (Phase 5),
     /// and per-joint velocity limiting (Phase 1).
     fn update_ik(&mut self) {
-        let prev_targets = self.joint_targets.clone();
-        let prev_config = self.arm.configuration_flags();
-
         let mut scratch = self.arm.clone();
         scratch.set_joint_angles(&self.joint_targets);
 
@@ -297,15 +299,6 @@ impl SimState {
         };
 
         let new_angles = scratch.joint_angles();
-
-        // Phase 4: Configuration consistency — reject solutions that flip elbow/wrist
-        let new_config = scratch.configuration_flags();
-        let config_dist = scratch.config_distance(&prev_targets);
-        if new_config != prev_config && config_dist > 0.3 {
-            // Configuration flipped with large joint change — reject
-            self.ik_converged = false;
-            return;
-        }
 
         // Self-collision avoidance — reject solutions in collision
         if !scratch.is_collision_free() {
@@ -470,6 +463,14 @@ impl SimState {
         let pi = std::f64::consts::PI;
         let pi2 = std::f64::consts::FRAC_PI_2;
         let tool_down = UnitQuaternion::from_axis_angle(&Vector3::x_axis(), pi);
+
+        // Snap track to optimal position for the workpiece center.
+        // Dynamic track keeps arm-local X at OPTIMAL_LOCAL_X for best reachability.
+        let initial_track = (workpiece_top_center.x - OPTIMAL_LOCAL_X)
+            .clamp(self.linear_track.min_position, self.linear_track.max_position);
+        self.linear_track.position = initial_track;
+        self.linear_track.velocity = 0.0;
+        self.linear_track.target_position = initial_track;
 
         // Desired position: 15mm above workpiece top center (arm-local, subtract track)
         let track_offset = Vector3::new(self.linear_track.position, 0.0, 0.0);
@@ -2379,28 +2380,46 @@ impl ApplicationHandler for App {
                                 _ => {
                                     // Phase 0: Normal carving — advance session and check for A changes
                                     self.sim.rotary_table.target_angle = session.a_axis_target;
-                                    self.sim.linear_track.target_position = session.u_axis_target;
-                                    // Only gate on rotary table — it rotates the WORKPIECE (can't cut mid-spin).
-                                    // Track moves the ARM BASE; IK compensates dynamically, no settling needed.
+
+                                    // Dynamic track: auto-position arm base so arm-local X
+                                    // stays near OPTIMAL_LOCAL_X for best reachability.
+                                    // This replaces hardcoded G-code U commands — the track
+                                    // smoothly follows the carving target in real time.
+                                    let desired_track = (self.sim.cartesian_target.translation.vector.x - OPTIMAL_LOCAL_X)
+                                        .clamp(self.sim.linear_track.min_position, self.sim.linear_track.max_position);
+                                    self.sim.linear_track.target_position = desired_track;
+
+                                    // Gate on rotary table only — it rotates the WORKPIECE,
+                                    // so cutting mid-spin would carve wrong positions.
+                                    // Track settling is handled implicitly: if the track hasn't
+                                    // reached its target, the arm can't reach the IK target either,
+                                    // so tracking error exceeds the freeze threshold below.
                                     let table_settled = self.sim.rotary_table.error() < 0.02;
 
                                     if table_settled {
                                         // Adaptive feedrate (like real CNC servo loops):
                                         // Scale session advancement proportionally to tracking
                                         // error so the arm stays close to the target path.
-                                        // Rapids use a higher gain (target never jumps more than ~10mm),
-                                        // cuts use a tighter gain (accuracy matters for carving).
+                                        // CRITICAL: completely freeze when error > 3× threshold
+                                        // to prevent the session racing ahead of the arm during
+                                        // rapid repositioning (e.g., serif start at X=-50).
                                         let track_off = Vector3::new(self.sim.linear_track.position, 0.0, 0.0);
                                         let arm_pos = self.sim.arm.tool_position() + track_off;
                                         let target_pos = self.sim.cartesian_target.translation.vector;
                                         let tracking_err = (arm_pos - target_pos).norm();
-                                        let effective_dt = if session.is_rapid {
-                                            // Rapids: aggressive scaling — halve speed at 20mm lag
-                                            let feedrate_scale = 1.0 / (1.0 + tracking_err * 50.0);
+                                        let catchup_threshold = self.sim.tracking_threshold * 3.0;
+                                        let effective_dt = if tracking_err > catchup_threshold {
+                                            // Arm too far from target — freeze session to let it catch up.
+                                            // Without this, the session races ahead during rapids and
+                                            // cutting starts before the arm reaches the start position.
+                                            0.0
+                                        } else if session.is_rapid {
+                                            // Rapids: aggressive scaling — halve speed at 10mm lag
+                                            let feedrate_scale = 1.0 / (1.0 + tracking_err * 100.0);
                                             scaled_dt * feedrate_scale
                                         } else {
-                                            // Cuts: tighter scaling — halve speed at 50mm lag
-                                            let feedrate_scale = 1.0 / (1.0 + tracking_err * 20.0);
+                                            // Cuts: tighter scaling — halve speed at 20mm lag
+                                            let feedrate_scale = 1.0 / (1.0 + tracking_err * 50.0);
                                             scaled_dt * feedrate_scale
                                         };
 

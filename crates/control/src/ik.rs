@@ -889,4 +889,106 @@ mod tests {
             final_target.x, final_target.y, final_target.z,
             final_err * 1000.0);
     }
+
+    /// Diagnostic: check IK reachability across the full serif line X=-50..+50
+    /// with different track offsets to find the right U value.
+    #[test]
+    fn test_serif_reachability_with_track() {
+        use nalgebra::{UnitQuaternion, Isometry3, Translation3};
+
+        let pi = std::f64::consts::PI;
+        let pi2 = std::f64::consts::FRAC_PI_2;
+
+        let workpiece_center = Vector3::new(0.65, 0.0, -0.2);
+        let half_extent = 0.1525;
+        let workpiece_top_z = workpiece_center.z + half_extent; // -0.0475
+        let tool_down = UnitQuaternion::from_axis_angle(&Vector3::x_axis(), pi);
+        let solver = IkSolver::default();
+
+        // Serif line: Y=-100mm, Z=-10mm (cutting depth), X sweeps -50..+50
+        let gcode_y = -0.100;
+        let gcode_z = -0.010; // 10mm below surface
+        let world_y = workpiece_center.y + gcode_y;
+        let world_z = workpiece_top_z + gcode_z;
+
+        // Test different track offsets
+        for track_mm in &[0, -75, -100, -150] {
+            let track_m = *track_mm as f64 / 1000.0;
+            eprintln!("\n=== Track U={} (offset={:.3}m) ===", track_mm, track_m);
+
+            // Pre-position arm with IK seed for tool-down above workpiece center
+            let mut arm = RobotArm::default_6dof();
+            arm.tool_offset = 0.175;
+            let prepos_target = Isometry3::from_parts(
+                Translation3::from(Vector3::new(
+                    workpiece_center.x - track_m, // arm-local
+                    workpiece_center.y,
+                    workpiece_top_z + 0.015,
+                )),
+                tool_down,
+            );
+            let seeds: &[[f64; 6]] = &[
+                [0.0, 0.5, 1.0, 0.0, pi2, 0.0],
+                [0.0, 0.3, 1.27, 0.0, pi2, 0.0],
+                [0.0, 0.7, 0.0, 0.0, pi2, 0.0],
+                [0.0, 0.8, 0.77, 0.0, pi2, 0.0],
+            ];
+            let mut best_err = f64::MAX;
+            let mut best_angles = vec![0.0; 6];
+            for seed in seeds {
+                let mut s = arm.clone();
+                s.set_joint_angles(&seed.to_vec());
+                let (ok, _, err) = solver.solve_weighted(&mut s, &prepos_target, 0.5);
+                if ok && err < best_err {
+                    best_err = err;
+                    best_angles = s.joint_angles().to_vec();
+                }
+            }
+            arm.set_joint_angles(&best_angles);
+            eprintln!("Pre-positioned: err={:.2}mm, J=[{:.1},{:.1},{:.1},{:.1},{:.1},{:.1}]°",
+                best_err * 1000.0,
+                best_angles[0].to_degrees(), best_angles[1].to_degrees(),
+                best_angles[2].to_degrees(), best_angles[3].to_degrees(),
+                best_angles[4].to_degrees(), best_angles[5].to_degrees());
+
+            // Now test each X position along the serif
+            let mut prev_angles = best_angles.clone();
+            let mut all_ok = true;
+            for gcode_x_mm in (-50..=50).step_by(10) {
+                let gcode_x = gcode_x_mm as f64 / 1000.0;
+                let world_x = workpiece_center.x + gcode_x;
+                // Arm-local target (subtract track offset)
+                let local_x = world_x - track_m;
+                let target = Isometry3::from_parts(
+                    Translation3::from(Vector3::new(local_x, world_y, world_z)),
+                    tool_down,
+                );
+
+                // Start from previous solution for continuity
+                arm.set_joint_angles(&prev_angles);
+                let (ok, iters, _err) = solver.solve_weighted(&mut arm, &target, 0.6);
+                let pos = arm.tool_position();
+                let pos_err = (pos - target.translation.vector).norm();
+                let j3_deg = arm.joints[2].angle.to_degrees();
+
+                let coll_free = arm.is_collision_free();
+                let status = if !coll_free { "COLL" }
+                    else if ok && pos_err < 0.005 { "OK" }
+                    else if ok { "DRIFT" }
+                    else { "FAIL" };
+
+                if status != "OK" { all_ok = false; }
+
+                eprintln!("  X={:+4}mm: {} pos_err={:.1}mm J3={:.1}° coll_free={} iters={} local_x={:.3}",
+                    gcode_x_mm, status, pos_err * 1000.0, j3_deg, coll_free, iters, local_x);
+
+                if ok {
+                    prev_angles = arm.joint_angles().to_vec();
+                }
+            }
+            if all_ok {
+                eprintln!("  >>> ALL POSITIONS REACHABLE with U={}", track_mm);
+            }
+        }
+    }
 }

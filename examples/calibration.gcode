@@ -3,10 +3,9 @@
 (G-code origin = top center, Z=0 = surface, negative = into material)
 (Numbers ~200mm tall, strokes ~30mm wide via multiple parallel passes)
 (A-axis = rotary table: A0=top, A90=front, A-90=back, A180=bottom)
-(U-axis = linear track: moves arm base along X in mm, negative = back)
-(U75 slides arm 75mm toward workpiece so X=-50 serif is comfortably reachable)
+(U-axis = linear track: auto-positions dynamically for optimal arm reach)
 
-G0 Z10 U0
+G0 Z10
 M3 S10000
 
 (========================================================)
@@ -70,7 +69,7 @@ G0 Z10
 M5
 G0 Z25
 G0 X0 Y0
-G0 A90 U75
+G0 A90
 M3 S10000
 G0 Z10
 
@@ -151,7 +150,7 @@ G0 Z10
 M5
 G0 Z25
 G0 X0 Y0
-G0 A-90 U75
+G0 A-90
 M3 S10000
 G0 Z10
 
@@ -232,7 +231,7 @@ G0 Z10
 M5
 G0 Z25
 G0 X0 Y0
-G0 A180 U75
+G0 A180
 M3 S10000
 G0 Z10
 
@@ -292,7 +291,7 @@ G0 Z10
 
 M5
 G0 Z25
-G0 X0 Y0 U0
+G0 X0 Y0
 G0 A0
 G0 Z25
 G0 X0 Y0
