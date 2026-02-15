@@ -152,6 +152,10 @@ struct SimState {
     tracking_threshold: f64,
     /// Orientation weight for IK during carving (0.0=position-only, 1.0=full 6DOF).
     orientation_weight: f64,
+    /// Diagnostic: last A-axis angle where cutting happened, to detect face changes.
+    diag_last_a: f64,
+    /// Diagnostic: counter for cuts on current face.
+    diag_cut_count: u32,
 }
 
 impl SimState {
@@ -273,6 +277,8 @@ impl SimState {
             mode: SimMode::Manual,
             tracking_threshold: cfg.tracking_threshold,
             orientation_weight: cfg.orientation_weight,
+            diag_last_a: 0.0,
+            diag_cut_count: 0,
         }
     }
 
@@ -631,6 +637,34 @@ impl SimState {
         let start = rot_inv * (start_world - wc);
         let end = rot_inv * (end_world - wc);
 
+        // Diagnostic: detect face changes and log first cuts on each face
+        let a_deg = angle.to_degrees();
+        if (angle - self.diag_last_a).abs() > 0.1 {
+            eprintln!("=== Face change: A={:.1}° → A={:.1}° ===", self.diag_last_a.to_degrees(), a_deg);
+            self.diag_last_a = angle;
+            self.diag_cut_count = 0;
+        }
+        if self.diag_cut_count < 5 {
+            let he = self.workpiece_half_extent;
+            // For A=0: depth from top = he - end.z (top face at z=+he)
+            // For A=90: depth from front = he - end.y (front face at y=+he)
+            let (face_name, depth) = if angle.abs() < 0.1 {
+                ("TOP", he - end.z)
+            } else if (angle - std::f64::consts::FRAC_PI_2).abs() < 0.1 {
+                ("FRONT", he - end.y)
+            } else if (angle + std::f64::consts::FRAC_PI_2).abs() < 0.1 {
+                ("BACK", he + end.y) // back face at y=-he
+            } else {
+                ("BOTTOM", he + end.z) // bottom at z=-he
+            };
+            eprintln!("  Cut #{} on {} (A={:.1}°): local=({:.1},{:.1},{:.1})mm, depth={:.1}mm, world_end=({:.3},{:.3},{:.3})",
+                self.diag_cut_count, face_name, a_deg,
+                end.x*1000.0, end.y*1000.0, end.z*1000.0,
+                depth*1000.0,
+                end_world.x, end_world.y, end_world.z);
+            self.diag_cut_count += 1;
+        }
+
         // Quick AABB check: is the tool anywhere near the workpiece?
         // Check if EITHER endpoint is near the workpiece (tool may enter or exit).
         let half = self.workpiece_half_extent + 0.02; // workpiece half-extent + margin
@@ -641,8 +675,12 @@ impl SimState {
             return; // tool is entirely outside workpiece region
         }
 
-        let tool_sdf = self.tool.swept_sdf(&start, &end);
-        let (bounds_min, bounds_max) = self.tool.swept_bounds(&start, &end);
+        // Tool axis in workpiece-local coords: tool always points -Z in world,
+        // so the body extends +Z (from tip toward shank). Rotate to local frame.
+        let tool_axis_world = Vector3::new(0.0, 0.0, 1.0); // tip→shank = +Z in world
+        let tool_axis_local = rot_inv * tool_axis_world;
+        let tool_sdf = self.tool.swept_sdf(&start, &end, &tool_axis_local);
+        let (bounds_min, bounds_max) = self.tool.swept_bounds(&start, &end, &tool_axis_local);
         self.workpiece.subtract(bounds_min, bounds_max, tool_sdf);
 
         // Cutting forces (for display)
@@ -2381,6 +2419,11 @@ impl ApplicationHandler for App {
                                     // Phase 1: Retracting — wait for arm to clear cube rotation envelope.
                                     // Don't require precise positioning — just ensure the arm is outside
                                     // the sphere swept by cube corners during rotation.
+                                    // Keep dynamic track updated so IK solves correctly during retract.
+                                    let desired_track = (self.sim.cartesian_target.translation.vector.x - OPTIMAL_LOCAL_X)
+                                        .clamp(self.sim.linear_track.min_position, self.sim.linear_track.max_position);
+                                    self.sim.linear_track.target_position = desired_track;
+
                                     let track_off = Vector3::new(self.sim.linear_track.position, 0.0, 0.0);
                                     let arm_pos = self.sim.arm.tool_position() + track_off;
                                     let wc = self.sim.workpiece_center;
@@ -2396,11 +2439,19 @@ impl ApplicationHandler for App {
                                 }
                                 2 => {
                                     // Phase 2: Rotating table — PD runs inside physics_step at 1kHz.
+                                    // Keep dynamic track following cartesian_target during rotation.
+                                    let desired_track = (self.sim.cartesian_target.translation.vector.x - OPTIMAL_LOCAL_X)
+                                        .clamp(self.sim.linear_track.min_position, self.sim.linear_track.max_position);
+                                    self.sim.linear_track.target_position = desired_track;
+
                                     self.sim.rotary_table.target_angle = self.prev_a_axis;
                                     if self.sim.rotary_table.error() < 0.02
                                         && self.sim.rotary_table.velocity.abs() < 0.1
                                     {
                                         self.retract_phase = 0;
+                                        // Reset frame_start to prevent accumulated swept path
+                                        // from retract leaking into the first cut of the new face.
+                                        self.sim.tool_state.frame_start_position = self.sim.tool_state.position;
                                         eprintln!("Table settled at A={:.1}°, resuming carving",
                                             self.prev_a_axis.to_degrees());
                                     }

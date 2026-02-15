@@ -62,13 +62,15 @@ impl Tool {
     /// Returns a closure suitable for OctreeSdf::subtract().
     ///
     /// - BallNose: capsule SDF (sphere swept along path)
-    /// - FlatEnd: vertical cylinder swept along path (full radius at all depths)
+    /// - FlatEnd: cylinder swept along path, oriented along `tool_axis`
     ///
-    /// Positions are in world space (meters). Tool axis is Z-up (DH convention).
+    /// `tool_axis` is the unit vector from tool tip toward shank (up along tool body)
+    /// in the same coordinate frame as start/end (typically workpiece-local).
     pub fn swept_sdf(
         &self,
         start: &Vector3<f64>,
         end: &Vector3<f64>,
+        tool_axis: &Vector3<f64>,
     ) -> impl Fn(f32, f32, f32) -> f32 {
         let ax = start.x as f32;
         let ay = start.y as f32;
@@ -79,6 +81,9 @@ impl Tool {
         let r = self.radius as f32;
         let tool_type = self.tool_type;
         let cl = self.cutting_length as f32;
+        let tax = tool_axis.x as f32;
+        let tay = tool_axis.y as f32;
+        let taz = tool_axis.z as f32;
 
         move |px: f32, py: f32, pz: f32| -> f32 {
             match tool_type {
@@ -86,7 +91,7 @@ impl Tool {
                     simuforge_material_sdf_capsule(px, py, pz, ax, ay, az, bx, by, bz, r)
                 }
                 ToolType::FlatEnd => {
-                    sdf_swept_cylinder(px, py, pz, ax, ay, az, bx, by, bz, r, cl)
+                    sdf_swept_cylinder_axis(px, py, pz, ax, ay, az, bx, by, bz, r, cl, tax, tay, taz)
                 }
                 ToolType::TaperedBall { .. } => {
                     simuforge_material_sdf_capsule(px, py, pz, ax, ay, az, bx, by, bz, r)
@@ -96,27 +101,37 @@ impl Tool {
     }
 
     /// Bounding box of the swept volume between two positions, with padding.
+    /// `tool_axis` is the unit vector from tip toward shank (same frame as start/end).
     pub fn swept_bounds(
         &self,
         start: &Vector3<f64>,
         end: &Vector3<f64>,
+        tool_axis: &Vector3<f64>,
     ) -> ([f32; 3], [f32; 3]) {
         let r = self.radius as f32;
         let pad = r + 0.002; // extra padding for SDF margin
-        let min = [
-            (start.x.min(end.x) as f32) - pad,
-            (start.y.min(end.y) as f32) - pad,
-            (start.z.min(end.z) as f32) - pad,
-        ];
-        // For FlatEnd, the cylinder extends upward by cutting_length from the tip
-        let z_extra = match self.tool_type {
-            ToolType::FlatEnd => self.cutting_length as f32,
-            _ => 0.0,
+        // For FlatEnd, the cylinder extends along tool_axis by cutting_length from the tip.
+        // Expand the bounding box along the tool axis direction.
+        let axis_extent = match self.tool_type {
+            ToolType::FlatEnd => {
+                let cl = self.cutting_length as f32;
+                [
+                    (tool_axis.x as f32 * cl).abs(),
+                    (tool_axis.y as f32 * cl).abs(),
+                    (tool_axis.z as f32 * cl).abs(),
+                ]
+            }
+            _ => [0.0, 0.0, 0.0],
         };
+        let min = [
+            (start.x.min(end.x) as f32) - pad - axis_extent[0],
+            (start.y.min(end.y) as f32) - pad - axis_extent[1],
+            (start.z.min(end.z) as f32) - pad - axis_extent[2],
+        ];
         let max = [
-            (start.x.max(end.x) as f32) + pad,
-            (start.y.max(end.y) as f32) + pad,
-            (start.z.max(end.z) as f32) + pad + z_extra,
+            (start.x.max(end.x) as f32) + pad + axis_extent[0],
+            (start.y.max(end.y) as f32) + pad + axis_extent[1],
+            (start.z.max(end.z) as f32) + pad + axis_extent[2],
         ];
         (min, max)
     }
@@ -173,14 +188,17 @@ fn simuforge_material_sdf_capsule(
 /// flat bottom at the tool tip position. The cylinder extends upward (+Z) from the tip.
 /// When swept between positions A and B, any point inside the union of all cylinder
 /// positions along the path returns a negative value.
-fn sdf_swept_cylinder(
+/// SDF for a flat-end cylinder swept along a path, oriented along an arbitrary tool axis.
+/// `tax, tay, taz` = unit vector from tip toward shank (tool body direction).
+fn sdf_swept_cylinder_axis(
     px: f32, py: f32, pz: f32,
     ax: f32, ay: f32, az: f32,
     bx: f32, by: f32, bz: f32,
     radius: f32,
     cutting_length: f32,
+    tax: f32, tay: f32, taz: f32,
 ) -> f32 {
-    // Find closest point on line segment AB (same projection as capsule)
+    // Find closest point on line segment AB (swept path)
     let pax = px - ax;
     let pay = py - ay;
     let paz = pz - az;
@@ -200,15 +218,25 @@ fn sdf_swept_cylinder(
     let cy = ay + t * bay;
     let cz = az + t * baz;
 
-    // Horizontal distance (XY plane) — full radius at all depths
+    // Vector from closest path point to query point
     let dx = px - cx;
     let dy = py - cy;
-    let horiz = (dx * dx + dy * dy).sqrt() - radius;
+    let dz = pz - cz;
 
-    // Vertical distance: cylinder from cz (tip) to cz + cutting_length (top)
-    let z_center = cz + cutting_length * 0.5;
-    let z_half = cutting_length * 0.5;
-    let vert = (pz - z_center).abs() - z_half;
+    // Decompose into components along tool axis and perpendicular to it.
+    // Tool axis goes from tip (at c) toward shank (c + cutting_length * tool_axis).
+    let along = dx * tax + dy * tay + dz * taz; // projection onto tool axis
+
+    // Perpendicular distance (radial) — distance from tool axis line
+    let perp_x = dx - along * tax;
+    let perp_y = dy - along * tay;
+    let perp_z = dz - along * taz;
+    let horiz = (perp_x * perp_x + perp_y * perp_y + perp_z * perp_z).sqrt() - radius;
+
+    // Axial distance: cylinder extends from tip (along=0) to tip + cutting_length (along=cl)
+    let center = cutting_length * 0.5;
+    let half = cutting_length * 0.5;
+    let vert = (along - center).abs() - half;
 
     // Proper SDF: Euclidean distance outside corners, max inside
     if horiz > 0.0 && vert > 0.0 {
