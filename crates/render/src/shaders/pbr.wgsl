@@ -136,7 +136,7 @@ fn carve_depth(obj_pos: vec3<f32>) -> f32 {
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Depth-based interior coloring: white shell → warm reddish core
     let depth = carve_depth(in.object_pos);
-    let interior_color = vec3<f32>(0.78, 0.42, 0.36); // warm terracotta red
+    let interior_color = vec3<f32>(0.85, 0.25, 0.22); // strong red interior
     let depth_blend = smoothstep(0.0, 0.015, depth); // transition over ~15mm
     let albedo = mix(material.base_color.rgb, interior_color, depth_blend);
     let roughness = material.params.x;

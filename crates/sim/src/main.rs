@@ -667,7 +667,7 @@ impl SimState {
 struct HeldKeys {
     w: bool, s: bool, a: bool, d: bool, q: bool, e: bool,
     i: bool, k: bool, j: bool, l: bool,
-    shift: bool,
+    shift: bool, alt: bool,
 }
 
 /// Application state for winit event loop.
@@ -739,6 +739,8 @@ struct App {
     // Cached toolpath line vertices (rebuilt only when progress changes)
     cached_line_verts: Vec<LineVertex>,
     cached_line_progress: usize,
+    /// Whether to show G-code toolpath lines (Alt+H to toggle).
+    show_toolpath: bool,
 }
 
 impl App {
@@ -800,6 +802,7 @@ impl App {
             tool_cutting_length_m: cfg.tool_cutting_length_mm * 0.001,
             cached_line_verts: Vec::new(),
             cached_line_progress: usize::MAX, // force rebuild on first use
+            show_toolpath: true,
         }
     }
 
@@ -1511,6 +1514,7 @@ impl App {
             self.cached_line_verts = self.build_toolpath_lines();
             self.cached_line_progress = current_progress;
         }
+        if self.show_toolpath {
         if let Some(line_pipe) = &mut self.line_pipeline {
             if lines_dirty && !self.cached_line_verts.is_empty() {
                 line_pipe.upload(&ctx.queue, &self.cached_line_verts);
@@ -1542,6 +1546,7 @@ impl App {
                 line_pass.draw(0..line_pipe.num_vertices, 0..1);
             }
         }
+        } // show_toolpath
 
         // ====== Pass 8: egui UI → swapchain (Load) ======
         let ui_data = self.collect_ui_data();
@@ -2187,6 +2192,7 @@ impl ApplicationHandler for App {
                     Key::Character("j") | Key::Character("J") => self.held_keys.j = pressed,
                     Key::Character("l") | Key::Character("L") => self.held_keys.l = pressed,
                     Key::Named(NamedKey::Shift) => self.held_keys.shift = pressed,
+                    Key::Named(NamedKey::Alt) => self.held_keys.alt = pressed,
                     _ => {}
                 }
 
@@ -2298,6 +2304,10 @@ impl ApplicationHandler for App {
                         Key::Character("[") => {
                             self.sim.orientation_weight = (self.sim.orientation_weight - 0.1).max(0.0);
                             eprintln!("Orientation weight: {:.1}", self.sim.orientation_weight);
+                        }
+                        Key::Character("h") | Key::Character("H") if self.held_keys.alt => {
+                            self.show_toolpath = !self.show_toolpath;
+                            eprintln!("Toolpath visibility: {}", if self.show_toolpath { "ON" } else { "OFF" });
                         }
                         _ => {}
                     }
