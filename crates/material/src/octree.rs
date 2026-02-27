@@ -5,6 +5,8 @@
 //! Solid (fully inside) or Air (fully outside) to save memory.
 
 use std::collections::HashSet;
+use std::io::{Read, Write};
+use std::path::Path;
 
 /// Quantized signed distance: i8 maps to [-1.0, 1.0] range scaled by cell size.
 /// Negative = inside, Positive = outside, 0 ≈ surface.
@@ -416,6 +418,88 @@ impl OctreeSdf {
     /// Take dirty chunks (clears the set, returns the coords).
     pub fn take_dirty(&mut self) -> Vec<ChunkCoord> {
         self.dirty_chunks.drain().collect()
+    }
+
+    /// Save the SDF to a binary file.
+    ///
+    /// Format: "SDF1" magic (4B) + cell_size f32 LE (4B) + num_chunks u32 LE (4B)
+    /// + per chunk: x,y,z as i32 LE (12B) + values [i8; 32768].
+    pub fn save_binary(&self, path: &Path) {
+        let mut file = std::fs::File::create(path).expect("Failed to create SDF file");
+
+        // Sort chunk coords for deterministic output
+        let mut coords: Vec<ChunkCoord> = self.chunks.keys().copied().collect();
+        coords.sort_by(|a, b| {
+            a.z.cmp(&b.z).then(a.y.cmp(&b.y)).then(a.x.cmp(&b.x))
+        });
+
+        file.write_all(b"SDF1").unwrap();
+        file.write_all(&self.cell_size.to_le_bytes()).unwrap();
+        file.write_all(&(coords.len() as u32).to_le_bytes()).unwrap();
+
+        for coord in &coords {
+            let leaf = &self.chunks[coord];
+            file.write_all(&coord.x.to_le_bytes()).unwrap();
+            file.write_all(&coord.y.to_le_bytes()).unwrap();
+            file.write_all(&coord.z.to_le_bytes()).unwrap();
+            // Safety: Sd8 is i8, same layout as u8 for byte writing
+            let bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(leaf.values.as_ptr() as *const u8, CHUNK_VOXELS)
+            };
+            file.write_all(bytes).unwrap();
+        }
+    }
+
+    /// Load an SDF from a binary file previously saved with `save_binary`.
+    pub fn load_binary(path: &Path) -> Self {
+        let mut file = std::fs::File::open(path).expect("Failed to open SDF file");
+
+        let mut magic = [0u8; 4];
+        file.read_exact(&mut magic).unwrap();
+        assert_eq!(&magic, b"SDF1", "Invalid SDF file magic");
+
+        let mut buf4 = [0u8; 4];
+        file.read_exact(&mut buf4).unwrap();
+        let cell_size = f32::from_le_bytes(buf4);
+
+        file.read_exact(&mut buf4).unwrap();
+        let num_chunks = u32::from_le_bytes(buf4) as usize;
+
+        let mut chunks = std::collections::HashMap::with_capacity(num_chunks);
+        let mut grid_min = [i32::MAX; 3];
+        let mut grid_max = [i32::MIN; 3];
+
+        for _ in 0..num_chunks {
+            let mut buf12 = [0u8; 12];
+            file.read_exact(&mut buf12).unwrap();
+            let x = i32::from_le_bytes([buf12[0], buf12[1], buf12[2], buf12[3]]);
+            let y = i32::from_le_bytes([buf12[4], buf12[5], buf12[6], buf12[7]]);
+            let z = i32::from_le_bytes([buf12[8], buf12[9], buf12[10], buf12[11]]);
+
+            let mut values = Box::new([0i8; CHUNK_VOXELS]);
+            let bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(values.as_mut_ptr() as *mut u8, CHUNK_VOXELS)
+            };
+            file.read_exact(bytes).unwrap();
+
+            let coord = ChunkCoord::new(x, y, z);
+            chunks.insert(coord, LeafData { values });
+
+            grid_min[0] = grid_min[0].min(x);
+            grid_min[1] = grid_min[1].min(y);
+            grid_min[2] = grid_min[2].min(z);
+            grid_max[0] = grid_max[0].max(x + 1);
+            grid_max[1] = grid_max[1].max(y + 1);
+            grid_max[2] = grid_max[2].max(z + 1);
+        }
+
+        Self {
+            cell_size,
+            chunks,
+            dirty_chunks: HashSet::new(),
+            grid_min,
+            grid_max,
+        }
     }
 }
 

@@ -9,6 +9,7 @@ members = [
     "crates/control",
     "crates/render",
     "crates/sim",
+    "crates/carver",
 ]
 
 [workspace.dependencies]

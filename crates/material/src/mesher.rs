@@ -298,6 +298,49 @@ pub fn remesh_dirty_capped(sdf: &mut OctreeSdf, max: usize) -> Vec<ChunkMesh> {
     meshes
 }
 
+/// Export the entire SDF as a Wavefront OBJ file.
+///
+/// Meshes all stored chunks and writes combined vertex/normal/face data.
+pub fn export_obj(sdf: &OctreeSdf, path: &std::path::Path) -> (usize, usize) {
+    use std::io::{BufWriter, Write};
+
+    let file = std::fs::File::create(path).expect("Failed to create OBJ file");
+    let mut w = BufWriter::new(file);
+    writeln!(w, "# SimuForge Direct Carver output").unwrap();
+
+    let mut vertex_offset = 0u32;
+    let mut total_verts = 0usize;
+    let mut total_tris = 0usize;
+
+    let coords: Vec<ChunkCoord> = sdf.chunks.keys().copied().collect();
+
+    for coord in &coords {
+        if let Some(mesh) = mesh_chunk(sdf, *coord) {
+            if mesh.is_empty() {
+                continue;
+            }
+
+            for (pos, norm) in mesh.positions.iter().zip(mesh.normals.iter()) {
+                writeln!(w, "v {} {} {}", pos[0], pos[1], pos[2]).unwrap();
+                writeln!(w, "vn {} {} {}", norm[0], norm[1], norm[2]).unwrap();
+            }
+
+            for tri in mesh.indices.chunks(3) {
+                let a = tri[0] + vertex_offset + 1;
+                let b = tri[1] + vertex_offset + 1;
+                let c = tri[2] + vertex_offset + 1;
+                writeln!(w, "f {}//{} {}//{} {}//{}", a, a, b, b, c, c).unwrap();
+            }
+
+            total_verts += mesh.positions.len();
+            total_tris += mesh.indices.len() / 3;
+            vertex_offset += mesh.positions.len() as u32;
+        }
+    }
+
+    (total_verts, total_tris)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

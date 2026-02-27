@@ -1,0 +1,14 @@
+[package]
+name = "simuforge-carver"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "simuforge-carve"
+path = "src/main.rs"
+
+[dependencies]
+simuforge-material = { path = "../material" }
+simuforge-cutting = { path = "../cutting" }
+simuforge-control = { path = "../control" }
+nalgebra = { workspace = true }
