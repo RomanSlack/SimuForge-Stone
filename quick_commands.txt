@@ -11,3 +11,8 @@ cargo run --release <example gcode file>
   - 2 — snap camera to robot arm
   - Esc — quit
   Alt+H toggles toolpath visualization on/off
+
+
+
+  https://sketchfab.com/3d-models/alexander-the-great-3dprint-daededd6d2ed414c9fafaa61aa2c348e#download
+  https://sketchfab.com/3d-models/alexander-the-great-erbach-type-c7eacd05083d436da8bbc67d7a988d63
