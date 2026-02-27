@@ -24,6 +24,7 @@ const GREEN: Color32 = Color32::from_rgb(61, 204, 96);
 const RED: Color32 = Color32::from_rgb(229, 69, 58);
 const YELLOW: Color32 = Color32::from_rgb(245, 200, 66);
 const CYAN: Color32 = Color32::from_rgb(66, 191, 217);
+const MAGENTA: Color32 = Color32::from_rgb(200, 80, 220);
 
 // Semi-transparent panel fills
 fn panel_fill() -> Color32 {
@@ -38,6 +39,7 @@ fn header_fill() -> Color32 {
 /// Read-only snapshot of all data the UI displays (populated each frame).
 pub struct UiData {
     pub mode_manual: bool,
+    pub mode_preview: bool,
     pub paused: bool,
     /// None = no carving session. 0=Idle, 1=Running, 2=Paused, 3=Complete.
     pub carving_state: Option<u8>,
@@ -73,6 +75,20 @@ pub struct UiData {
     pub gcode_file: Option<String>,
     pub gcode_waypoints: usize,
     pub gcode_est_time: f64,
+
+    // Preview mode
+    pub preview_progress: f32,
+    pub preview_current: usize,
+    pub preview_total: usize,
+    pub preview_target: usize,
+    pub preview_cuts: u64,
+    pub preview_done: bool,
+    /// True while background carving thread is running.
+    pub preview_carving: bool,
+    /// Seconds elapsed since carving started.
+    pub preview_elapsed: f64,
+    /// Estimated seconds remaining (-1.0 = not available yet).
+    pub preview_eta: f64,
 }
 
 /// Actions the UI wants the application to perform.
@@ -80,6 +96,9 @@ pub enum UiAction {
     TogglePause,
     SpeedUp,
     SpeedDown,
+    PreviewCarve,
+    PreviewSetTarget(usize),
+    PreviewReset,
 }
 
 // ────────────────────────── Theme Setup ──────────────────────────
@@ -213,7 +232,9 @@ fn header_panel(ctx: &egui::Context, data: &UiData, _actions: &mut Vec<UiAction>
                 ui.separator();
 
                 // Mode badge
-                let (mode_color, mode_text) = if data.mode_manual {
+                let (mode_color, mode_text) = if data.mode_preview {
+                    (MAGENTA, "PREVIEW")
+                } else if data.mode_manual {
                     (CYAN, "MANUAL")
                 } else {
                     (ORANGE, "CARVING")
@@ -228,8 +249,21 @@ fn header_panel(ctx: &egui::Context, data: &UiData, _actions: &mut Vec<UiAction>
                 let (status_color, status_text) = state_label(data);
                 ui.label(RichText::new(status_text).color(status_color).size(12.0));
 
+                // Preview progress (compact)
+                if data.mode_preview && data.preview_total > 0 {
+                    ui.separator();
+                    let bar_width = 100.0;
+                    progress_bar(ui, bar_width, 4.0, data.preview_progress, MAGENTA);
+                    ui.label(
+                        RichText::new(format!("{:.0}%", data.preview_progress * 100.0))
+                            .monospace()
+                            .color(TEXT_1)
+                            .size(11.0),
+                    );
+                }
+
                 // Carving progress (compact)
-                if !data.mode_manual && data.carving_total > 0 {
+                if !data.mode_manual && !data.mode_preview && data.carving_total > 0 {
                     ui.separator();
                     let bar_width = 100.0;
                     progress_bar(ui, bar_width, 4.0, data.carving_progress, GREEN);
@@ -242,7 +276,7 @@ fn header_panel(ctx: &egui::Context, data: &UiData, _actions: &mut Vec<UiAction>
                 }
 
                 // Speed
-                if !data.mode_manual {
+                if !data.mode_manual && !data.mode_preview {
                     ui.separator();
                     let spd_color =
                         if (data.speed_multiplier - 1.0).abs() < 0.01 { TEXT_2 } else { YELLOW };
@@ -277,8 +311,9 @@ fn header_panel(ctx: &egui::Context, data: &UiData, _actions: &mut Vec<UiAction>
 // ────────────────────────── Bottom Panel ──────────────────────────
 
 fn bottom_panel(ctx: &egui::Context, data: &UiData, actions: &mut Vec<UiAction>) {
+    let panel_height = if data.mode_preview { 64.0 } else { 40.0 };
     egui::TopBottomPanel::bottom("timeline")
-        .exact_height(40.0)
+        .exact_height(panel_height)
         .frame(
             Frame::new()
                 .fill(header_fill())
@@ -286,90 +321,207 @@ fn bottom_panel(ctx: &egui::Context, data: &UiData, actions: &mut Vec<UiAction>)
                 .stroke(Stroke::new(1.0, BORDER_0)),
         )
         .show(ctx, |ui| {
-            ui.horizontal_centered(|ui| {
-                // Play/pause toggle
-                let (btn_text, btn_color) = if is_running(data) {
-                    ("Pause", YELLOW)
-                } else {
-                    ("Play", GREEN)
-                };
-                let btn = ui.add(
-                    egui::Button::new(RichText::new(btn_text).color(btn_color).size(12.0))
-                        .min_size(egui::vec2(52.0, 24.0)),
-                );
-                if btn.clicked() {
-                    actions.push(UiAction::TogglePause);
-                }
+            if data.mode_preview {
+                // Preview mode bottom panel
+                ui.vertical(|ui| {
+                    ui.add_space(4.0);
 
-                ui.separator();
+                    if data.preview_carving {
+                        // Loading state — carving in background
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            let eta_text = if data.preview_eta >= 0.0 {
+                                format!(
+                                    "Carving... {:.1}s  (ETA ~{:.0}s)",
+                                    data.preview_elapsed, data.preview_eta
+                                )
+                            } else {
+                                format!("Carving... {:.1}s", data.preview_elapsed)
+                            };
+                            ui.label(
+                                RichText::new(eta_text)
+                                .color(YELLOW)
+                                .size(13.0),
+                            );
+                        });
+                        // Keep requesting redraws so the spinner animates
+                        ui.ctx().request_repaint();
+                    } else {
+                        // Row 1: Carve button + percentage + progress text + Reset
+                        ui.horizontal(|ui| {
+                            let btn = ui.add(
+                                egui::Button::new(RichText::new("Carve").color(GREEN).size(12.0))
+                                    .min_size(egui::vec2(56.0, 22.0)),
+                            );
+                            if btn.clicked() {
+                                actions.push(UiAction::PreviewCarve);
+                            }
 
-                // Speed controls
-                if ui
-                    .add(egui::Button::new(
-                        RichText::new(" - ").monospace().color(TEXT_1),
-                    ))
-                    .clicked()
-                {
-                    actions.push(UiAction::SpeedDown);
-                }
-                ui.label(
-                    RichText::new(format!("{}x", data.speed_multiplier))
-                        .monospace()
-                        .color(TEXT_0)
-                        .size(12.0),
-                );
-                if ui
-                    .add(egui::Button::new(
-                        RichText::new(" + ").monospace().color(TEXT_1),
-                    ))
-                    .clicked()
-                {
-                    actions.push(UiAction::SpeedUp);
-                }
+                            ui.separator();
 
-                ui.separator();
+                            // Show target percentage
+                            let pct = if data.preview_total > 0 {
+                                data.preview_target as f64 / data.preview_total as f64 * 100.0
+                            } else {
+                                100.0
+                            };
+                            ui.label(
+                                RichText::new(format!("{:.0}%", pct))
+                                    .monospace()
+                                    .color(MAGENTA)
+                                    .size(12.0)
+                                    .strong(),
+                            );
 
-                // Progress bar (wider)
-                if !data.mode_manual && data.carving_total > 0 {
-                    let available = ui.available_width() - 120.0;
-                    progress_bar(ui, available.max(60.0), 6.0, data.carving_progress, GREEN);
+                            ui.separator();
 
-                    ui.label(
-                        RichText::new(format!(
-                            "{}/{}",
-                            data.carving_done, data.carving_total
-                        ))
-                        .monospace()
-                        .color(TEXT_2)
-                        .size(11.0),
+                            if data.preview_done {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{}/{} ({} cuts)",
+                                        data.preview_current, data.preview_total, data.preview_cuts
+                                    ))
+                                    .monospace()
+                                    .color(TEXT_1)
+                                    .size(11.0),
+                                );
+                            } else {
+                                ui.label(
+                                    RichText::new("Set % then press Carve or Space")
+                                        .color(TEXT_2)
+                                        .size(11.0),
+                                );
+                            }
+
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                let reset_btn = ui.add(
+                                    egui::Button::new(RichText::new("Reset").color(RED).size(11.0))
+                                        .min_size(egui::vec2(44.0, 20.0)),
+                                );
+                                if reset_btn.clicked() {
+                                    actions.push(UiAction::PreviewReset);
+                                }
+
+                                // FPS
+                                let fps_color = if data.fps >= 55.0 { TEXT_2 } else if data.fps >= 30.0 { YELLOW } else { RED };
+                                ui.label(
+                                    RichText::new(format!("{:.0} FPS", data.fps))
+                                        .monospace()
+                                        .color(fps_color)
+                                        .size(11.0),
+                                );
+                            });
+                        });
+                        // Row 2: Slider to set target (does NOT auto-carve)
+                        ui.horizontal(|ui| {
+                            let total = data.preview_total;
+                            if total > 0 {
+                                let mut target = data.preview_target as f64;
+                                let slider = egui::Slider::new(&mut target, 0.0..=total as f64)
+                                    .integer()
+                                    .show_value(false);
+                                let available_width = ui.available_width();
+                                let resp = ui.add_sized(
+                                    egui::vec2(available_width, 18.0),
+                                    slider,
+                                );
+                                if resp.changed() {
+                                    actions.push(UiAction::PreviewSetTarget(target as usize));
+                                }
+                            }
+                        });
+                    }
+                });
+            } else {
+                // Normal mode bottom panel
+                ui.horizontal_centered(|ui| {
+                    // Play/pause toggle
+                    let (btn_text, btn_color) = if is_running(data) {
+                        ("Pause", YELLOW)
+                    } else {
+                        ("Play", GREEN)
+                    };
+                    let btn = ui.add(
+                        egui::Button::new(RichText::new(btn_text).color(btn_color).size(12.0))
+                            .min_size(egui::vec2(52.0, 24.0)),
                     );
-                }
+                    if btn.clicked() {
+                        actions.push(UiAction::TogglePause);
+                    }
 
-                // Right side: time/ETA
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if data.carving_eta > 0.0 && data.carving_state == Some(1) {
-                        let eta = data.carving_eta / data.speed_multiplier;
+                    ui.separator();
+
+                    // Speed controls
+                    if ui
+                        .add(egui::Button::new(
+                            RichText::new(" - ").monospace().color(TEXT_1),
+                        ))
+                        .clicked()
+                    {
+                        actions.push(UiAction::SpeedDown);
+                    }
+                    ui.label(
+                        RichText::new(format!("{}x", data.speed_multiplier))
+                            .monospace()
+                            .color(TEXT_0)
+                            .size(12.0),
+                    );
+                    if ui
+                        .add(egui::Button::new(
+                            RichText::new(" + ").monospace().color(TEXT_1),
+                        ))
+                        .clicked()
+                    {
+                        actions.push(UiAction::SpeedUp);
+                    }
+
+                    ui.separator();
+
+                    // Progress bar (wider)
+                    if !data.mode_manual && data.carving_total > 0 {
+                        let available = ui.available_width() - 120.0;
+                        progress_bar(ui, available.max(60.0), 6.0, data.carving_progress, GREEN);
+
                         ui.label(
-                            RichText::new(format!("ETA {:.0}s", eta))
+                            RichText::new(format!(
+                                "{}/{}",
+                                data.carving_done, data.carving_total
+                            ))
+                            .monospace()
+                            .color(TEXT_2)
+                            .size(11.0),
+                        );
+                    }
+
+                    // Right side: time/ETA
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if data.carving_eta > 0.0 && data.carving_state == Some(1) {
+                            let eta = data.carving_eta / data.speed_multiplier;
+                            ui.label(
+                                RichText::new(format!("ETA {:.0}s", eta))
+                                    .monospace()
+                                    .color(TEXT_2)
+                                    .size(11.0),
+                            );
+                        }
+                        ui.label(
+                            RichText::new(format!("{:.1}s", data.sim_time))
                                 .monospace()
                                 .color(TEXT_2)
                                 .size(11.0),
                         );
-                    }
-                    ui.label(
-                        RichText::new(format!("{:.1}s", data.sim_time))
-                            .monospace()
-                            .color(TEXT_2)
-                            .size(11.0),
-                    );
+                    });
                 });
-            });
+            }
         });
 }
 
 // ────────────────────────── Left Panel (Arm State) ──────────────────────────
 
 fn left_panel(ctx: &egui::Context, data: &UiData) {
+    if data.mode_preview {
+        return; // Hide left panel in preview mode
+    }
     egui::SidePanel::left("arm_state")
         .exact_width(280.0)
         .resizable(false)
@@ -564,6 +716,9 @@ fn left_panel(ctx: &egui::Context, data: &UiData) {
 // ────────────────────────── Right Panel (Properties) ──────────────────────────
 
 fn right_panel(ctx: &egui::Context, data: &UiData) {
+    if data.mode_preview {
+        return; // Hide right panel in preview mode
+    }
     egui::SidePanel::right("properties")
         .exact_width(240.0)
         .resizable(false)
@@ -663,7 +818,8 @@ fn right_panel(ctx: &egui::Context, data: &UiData) {
                     shortcut_row(ui, "+/-", "Speed up/down");
                     shortcut_row(ui, "1/2", "Camera presets");
                     shortcut_row(ui, "M", "Manual mode");
-                    shortcut_row(ui, "Esc", "Quit");
+                    shortcut_row(ui, "P", "Preview mode");
+                    shortcut_row(ui, "Esc", "Quit/Exit preview");
                 });
             });
         });
@@ -772,7 +928,17 @@ fn shortcut_row(ui: &mut egui::Ui, key: &str, desc: &str) {
 
 /// Get state label from data.
 fn state_label(data: &UiData) -> (Color32, &'static str) {
-    if data.mode_manual {
+    if data.mode_preview {
+        if data.preview_carving {
+            (YELLOW, "Carving...")
+        } else if data.preview_done && data.preview_current >= data.preview_total {
+            (CYAN, "Complete")
+        } else if data.preview_done {
+            (GREEN, "Carved")
+        } else {
+            (YELLOW, "Ready")
+        }
+    } else if data.mode_manual {
         if data.paused {
             (YELLOW, "Paused")
         } else {
@@ -791,7 +957,9 @@ fn state_label(data: &UiData) -> (Color32, &'static str) {
 
 /// Check if simulation is actively running.
 fn is_running(data: &UiData) -> bool {
-    if data.mode_manual {
+    if data.mode_preview {
+        false // preview carving is blocking, never "running"
+    } else if data.mode_manual {
         !data.paused
     } else {
         data.carving_state == Some(1)

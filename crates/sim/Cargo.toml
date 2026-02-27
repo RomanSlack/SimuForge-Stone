@@ -11,6 +11,7 @@ simuforge-material = { path = "../material" }
 simuforge-cutting = { path = "../cutting" }
 simuforge-control = { path = "../control" }
 simuforge-render = { path = "../render" }
+simuforge-carver = { path = "../carver" }
 nalgebra = { workspace = true }
 glam = { workspace = true }
 bytemuck = { workspace = true }

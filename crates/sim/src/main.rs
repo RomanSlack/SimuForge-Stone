@@ -3,6 +3,7 @@
 //! Main binary: fixed-timestep physics loop + wgpu rendering.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use glam::{Mat4, Quat, Vec3, Vec4};
@@ -13,7 +14,9 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
+use simuforge_carver::DirectCarver;
 use simuforge_control::carving::{CarvingSession, CarvingState};
+use simuforge_control::gcode::GCodeInterpreter;
 use simuforge_control::ik::IkSolver;
 use simuforge_core::{isometry_to_glam, Vertex};
 use simuforge_cutting::forces::{self, MaterialProps};
@@ -105,6 +108,7 @@ const MAX_FRAME_TIME: f64 = 0.05;
 enum SimMode {
     Manual,
     Carving,
+    Preview,
 }
 
 /// Speed multiplier presets for carving.
@@ -815,6 +819,17 @@ struct App {
     cached_line_progress: usize,
     /// Whether to show G-code toolpath lines (Alt+H to toggle).
     show_toolpath: bool,
+    // --- Preview mode ---
+    preview_carver: Option<DirectCarver>,
+    preview_target: usize,
+    /// Channel receiver for background carving result.
+    preview_rx: Option<std::sync::mpsc::Receiver<DirectCarver>>,
+    /// Timer for when background carving started (for UI display).
+    preview_carve_start: Option<Instant>,
+    /// Live progress counter updated by the background carving thread.
+    preview_progress_atomic: Option<Arc<AtomicUsize>>,
+    /// Total commands for current carve (for ETA calculation while carving).
+    preview_carve_total: usize,
 }
 
 impl App {
@@ -877,6 +892,12 @@ impl App {
             cached_line_verts: Vec::new(),
             cached_line_progress: usize::MAX, // force rebuild on first use
             show_toolpath: true,
+            preview_carver: None,
+            preview_target: 0,
+            preview_rx: None,
+            preview_carve_start: None,
+            preview_progress_atomic: None,
+            preview_carve_total: 0,
         }
     }
 
@@ -928,6 +949,44 @@ impl App {
         let (ok, _, _) = self.sim.ik_solver.solve_position(&mut test, &target_pos);
         if !ok {
             self.sim.cartesian_target = prev_target;
+        }
+    }
+
+    /// Kick off background carving to the current preview_target.
+    /// If already carving, does nothing.
+    fn preview_carve_to_target(&mut self) {
+        // Don't start if already carving in background
+        if self.preview_rx.is_some() {
+            return;
+        }
+        if let Some(mut carver) = self.preview_carver.take() {
+            let target = self.preview_target;
+            let total = carver.total_commands();
+            eprintln!("Preview: carving to {}/{}...", target, total);
+
+            // Swap workpiece into carver so it has the current mesh state
+            std::mem::swap(&mut self.sim.workpiece, &mut carver.workpiece);
+
+            self.preview_carve_start = Some(Instant::now());
+            self.preview_carve_total = total;
+            let progress = Arc::new(AtomicUsize::new(carver.current_command()));
+            self.preview_progress_atomic = Some(progress.clone());
+
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                // If target < current, carve_to resets internally
+                if target < carver.current_command() {
+                    carver.reset();
+                    progress.store(0, Ordering::Relaxed);
+                }
+                // Carve in batches of 5000, updating progress for ETA
+                while carver.current_command() < target.min(carver.total_commands()) {
+                    carver.carve_batch(5000);
+                    progress.store(carver.current_command(), Ordering::Relaxed);
+                }
+                tx.send(carver).ok();
+            });
+            self.preview_rx = Some(rx);
         }
     }
 
@@ -1322,6 +1381,7 @@ impl App {
             });
             pass.set_pipeline(&shadow.pipeline);
 
+            let draw_arm_shadow = self.sim.mode != SimMode::Preview;
             let mut si = 0usize; // shadow matrix index
 
             // Workpiece (single merged buffer, 1 draw call)
@@ -1334,6 +1394,7 @@ impl App {
             si += 1;
 
             // Arm links (6)
+            if draw_arm_shadow {
             if let Some(cyl) = &self.arm_cylinder {
                 for i in 0..6 {
                     pass.set_bind_group(0, &shadow.bind_group, &[ShadowPipeline::dynamic_offset(si + i)]);
@@ -1342,9 +1403,11 @@ impl App {
                     pass.draw_indexed(0..cyl.num_indices, 0, 0..1);
                 }
             }
+            }
             si += 6;
 
             // Joint spheres (7)
+            if draw_arm_shadow {
             if let Some(sph) = &self.arm_sphere {
                 for i in 0..7 {
                     pass.set_bind_group(0, &shadow.bind_group, &[ShadowPipeline::dynamic_offset(si + i)]);
@@ -1353,32 +1416,39 @@ impl App {
                     pass.draw_indexed(0..sph.num_indices, 0, 0..1);
                 }
             }
+            }
             si += 7;
 
             // Tool body
+            if draw_arm_shadow {
             if let Some(cyl) = &self.arm_cylinder {
                 pass.set_bind_group(0, &shadow.bind_group, &[ShadowPipeline::dynamic_offset(si)]);
                 pass.set_vertex_buffer(0, cyl.vertex_buffer.slice(..));
                 pass.set_index_buffer(cyl.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..cyl.num_indices, 0, 0..1);
+            }
             }
             si += 1;
 
             // Tool tip
+            if draw_arm_shadow {
             if let Some(cyl) = &self.arm_cylinder {
                 pass.set_bind_group(0, &shadow.bind_group, &[ShadowPipeline::dynamic_offset(si)]);
                 pass.set_vertex_buffer(0, cyl.vertex_buffer.slice(..));
                 pass.set_index_buffer(cyl.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..cyl.num_indices, 0, 0..1);
             }
+            }
             si += 1;
 
             // Base pedestal
+            if draw_arm_shadow {
             if let Some(bm) = &self.base_mesh {
                 pass.set_bind_group(0, &shadow.bind_group, &[ShadowPipeline::dynamic_offset(si)]);
                 pass.set_vertex_buffer(0, bm.vertex_buffer.slice(..));
                 pass.set_index_buffer(bm.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..bm.num_indices, 0, 0..1);
+            }
             }
             si += 1;
 
@@ -1392,20 +1462,24 @@ impl App {
             si += 1;
 
             // Track rail
+            if draw_arm_shadow {
             if let Some(rm) = &self.track_rail_mesh {
                 pass.set_bind_group(0, &shadow.bind_group, &[ShadowPipeline::dynamic_offset(si)]);
                 pass.set_vertex_buffer(0, rm.vertex_buffer.slice(..));
                 pass.set_index_buffer(rm.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..rm.num_indices, 0, 0..1);
             }
+            }
             si += 1;
 
             // Track carriage
+            if draw_arm_shadow {
             if let Some(cm) = &self.track_carriage_mesh {
                 pass.set_bind_group(0, &shadow.bind_group, &[ShadowPipeline::dynamic_offset(si)]);
                 pass.set_vertex_buffer(0, cm.vertex_buffer.slice(..));
                 pass.set_index_buffer(cm.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
                 pass.draw_indexed(0..cm.num_indices, 0, 0..1);
+            }
             }
         }
 
@@ -1460,7 +1534,11 @@ impl App {
                 render_pass.draw_indexed(0..self.chunk_meshes.merged_num_indices(), 0, 0..1);
             }
 
+            // In preview mode, skip arm/tool/base/track — show only workpiece + ground + stand
+            let draw_arm = self.sim.mode != SimMode::Preview;
+
             // 3) Arm links
+            if draw_arm {
             if let Some(cyl) = &self.arm_cylinder {
                 for link_mat in &self.arm_materials {
                     render_pass.set_bind_group(0, &link_mat.bind_group, &[]);
@@ -1529,6 +1607,7 @@ impl App {
                 );
                 render_pass.draw_indexed(0..bm.num_indices, 0, 0..1);
             }
+            } // draw_arm
 
             // 9) Workpiece stand
             if let (Some(sm), Some(smat)) = (&self.stand_mesh, &self.stand_material) {
@@ -1542,6 +1621,7 @@ impl App {
             }
 
             // 10) Track rail
+            if draw_arm {
             if let (Some(rm), Some(rmat)) = (&self.track_rail_mesh, &self.track_rail_material) {
                 render_pass.set_bind_group(0, &rmat.bind_group, &[]);
                 render_pass.set_vertex_buffer(0, rm.vertex_buffer.slice(..));
@@ -1562,6 +1642,7 @@ impl App {
                 );
                 render_pass.draw_indexed(0..cm.num_indices, 0, 0..1);
             }
+            } // draw_arm
         }
 
         // ====== Pass 4: SSAO → SSAO output texture ======
@@ -1769,6 +1850,21 @@ impl App {
                     let next_idx = if current_idx > 0 { current_idx - 1 } else { 0 };
                     self.speed_multiplier = SPEED_PRESETS[next_idx];
                 }
+                ui::UiAction::PreviewCarve => {
+                    self.preview_carve_to_target();
+                }
+                ui::UiAction::PreviewSetTarget(t) => {
+                    self.preview_target = t;
+                }
+                ui::UiAction::PreviewReset => {
+                    if let Some(carver) = &mut self.preview_carver {
+                        std::mem::swap(&mut self.sim.workpiece, &mut carver.workpiece);
+                        carver.reset();
+                        std::mem::swap(&mut self.sim.workpiece, &mut carver.workpiece);
+                        self.preview_target = carver.total_commands();
+                        self.chunk_meshes = ChunkMeshManager::new();
+                    }
+                }
             }
         }
 
@@ -1813,7 +1909,7 @@ impl App {
                 CarvingState::Paused => 2,
                 CarvingState::Complete => 3,
             }),
-            SimMode::Manual => None,
+            SimMode::Manual | SimMode::Preview => None,
         };
 
         let (carving_done, carving_total) = self.sim.carving.as_ref()
@@ -1835,8 +1931,39 @@ impl App {
         let gcode_est_time = self.sim.carving.as_ref()
             .map_or(0.0, |s| s.estimated_total_time);
 
+        let preview_carving = self.preview_rx.is_some();
+        let preview_elapsed = self.preview_carve_start
+            .map(|t| t.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
+        let (preview_current, preview_total, preview_cuts, preview_done) = match &self.preview_carver {
+            Some(c) => (c.current_command(), c.total_commands(), c.cut_count(), c.current_command() > 0),
+            None => (0, 0, 0, false),
+        };
+        // ETA: read live progress from background thread
+        let preview_eta = if preview_carving && preview_elapsed > 1.0 {
+            let live_progress = self.preview_progress_atomic
+                .as_ref()
+                .map(|a| a.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            let total = self.preview_carve_total;
+            if live_progress > 0 && total > 0 {
+                let frac = live_progress as f64 / total as f64;
+                if frac > 0.01 {
+                    let remaining = preview_elapsed * (1.0 - frac) / frac;
+                    remaining
+                } else {
+                    -1.0 // not enough data
+                }
+            } else {
+                -1.0
+            }
+        } else {
+            -1.0 // no ETA available
+        };
+
         ui::UiData {
             mode_manual: self.sim.mode == SimMode::Manual,
+            mode_preview: self.sim.mode == SimMode::Preview,
             paused: self.sim.paused,
             carving_state,
             speed_multiplier: self.speed_multiplier,
@@ -1865,6 +1992,19 @@ impl App {
             gcode_file,
             gcode_waypoints,
             gcode_est_time,
+            preview_progress: if preview_total > 0 {
+                preview_current as f32 / preview_total as f32
+            } else {
+                0.0
+            },
+            preview_current,
+            preview_total,
+            preview_target: self.preview_target,
+            preview_cuts,
+            preview_done,
+            preview_carving,
+            preview_elapsed,
+            preview_eta,
         }
     }
 
@@ -2317,7 +2457,9 @@ impl ApplicationHandler for App {
                 if pressed {
                     match logical_key.as_ref() {
                         Key::Named(NamedKey::Space) => {
-                            if self.sim.mode == SimMode::Carving {
+                            if self.sim.mode == SimMode::Preview {
+                                self.preview_carve_to_target();
+                            } else if self.sim.mode == SimMode::Carving {
                                 // Toggle carving session start/pause
                                 if let Some(session) = &mut self.sim.carving {
                                     session.toggle();
@@ -2337,7 +2479,15 @@ impl ApplicationHandler for App {
                             }
                         }
                         Key::Named(NamedKey::Escape) => {
-                            event_loop.exit();
+                            if self.sim.mode == SimMode::Preview {
+                                // Exit preview mode instead of quitting
+                                self.preview_carver = None;
+                                self.sim.mode = SimMode::Manual;
+                                self.sim.paused = true;
+                                eprintln!("Exited PREVIEW mode");
+                            } else {
+                                event_loop.exit();
+                            }
                         }
                         Key::Character("1") => {
                             self.camera.snap_to_workpiece();
@@ -2389,7 +2539,6 @@ impl ApplicationHandler for App {
                             eprintln!("Switched to MANUAL mode");
                         }
                         Key::Character("+") | Key::Character("=") => {
-                            // Speed up
                             let current_idx = SPEED_PRESETS.iter()
                                 .position(|&s| (s - self.speed_multiplier).abs() < 0.01)
                                 .unwrap_or_else(|| {
@@ -2402,7 +2551,6 @@ impl ApplicationHandler for App {
                             eprintln!("Speed: {}x", self.speed_multiplier);
                         }
                         Key::Character("-") => {
-                            // Slow down
                             let current_idx = SPEED_PRESETS.iter()
                                 .position(|&s| (s - self.speed_multiplier).abs() < 0.01)
                                 .unwrap_or_else(|| {
@@ -2425,6 +2573,43 @@ impl ApplicationHandler for App {
                         Key::Character("h") | Key::Character("H") if self.held_keys.alt => {
                             self.show_toolpath = !self.show_toolpath;
                             eprintln!("Toolpath visibility: {}", if self.show_toolpath { "ON" } else { "OFF" });
+                        }
+                        Key::Character("p") | Key::Character("P") => {
+                            if self.sim.mode == SimMode::Preview {
+                                // Exit preview: carved workpiece already in sim.workpiece, just drop carver
+                                self.preview_carver = None;
+                                self.sim.mode = SimMode::Manual;
+                                self.sim.paused = true;
+                                eprintln!("Exited PREVIEW mode (carved workpiece preserved)");
+                            } else if self.gcode_path.is_some() {
+                                // Enter preview: load G-code into DirectCarver
+                                let path = self.gcode_path.as_ref().unwrap().clone();
+                                match GCodeInterpreter::load_file(&path) {
+                                    Ok(interp) => {
+                                        let tool = self.sim.tool.clone();
+                                        let he = self.sim.workpiece_half_extent;
+                                        // 2x coarser resolution for fast preview
+                                        // (full detail via CLI: simuforge-carve)
+                                        let cs = self.sim.workpiece.cell_size as f64 * 2.0;
+                                        let mut carver = DirectCarver::new(
+                                            interp.commands, tool, he, cs,
+                                        );
+                                        let total = carver.total_commands();
+                                        // Swap fresh block into sim.workpiece (carver gets old workpiece, discarded)
+                                        std::mem::swap(&mut self.sim.workpiece, &mut carver.workpiece);
+                                        self.preview_target = total;
+                                        self.preview_carver = Some(carver);
+                                        self.sim.mode = SimMode::Preview;
+                                        self.sim.paused = true;
+                                        // Clear mesh cache to show fresh block
+                                        self.chunk_meshes = ChunkMeshManager::new();
+                                        eprintln!("Entered PREVIEW mode: {} commands, press Carve or Space", total);
+                                    }
+                                    Err(e) => eprintln!("Failed to load G-code for preview: {}", e),
+                                }
+                            } else {
+                                eprintln!("No G-code file loaded. Pass path as CLI argument.");
+                            }
                         }
                         _ => {}
                     }
@@ -2486,6 +2671,27 @@ impl ApplicationHandler for App {
                     || self.held_keys.i || self.held_keys.k
                     || self.held_keys.j || self.held_keys.l;
                 let sim_active = carving_active || (!self.sim.paused && any_movement_key) || !self.sim.paused;
+
+                // Poll for completed background preview carving
+                if let Some(rx) = &self.preview_rx {
+                    if let Ok(mut carver) = rx.try_recv() {
+                        let elapsed = self.preview_carve_start
+                            .map(|t| t.elapsed().as_secs_f64())
+                            .unwrap_or(0.0);
+                        eprintln!(
+                            "Preview: done — {} cuts in {:.2}s",
+                            carver.cut_count(), elapsed
+                        );
+                        // Swap carved workpiece back into sim
+                        std::mem::swap(&mut self.sim.workpiece, &mut carver.workpiece);
+                        self.preview_carver = Some(carver);
+                        self.preview_rx = None;
+                        self.preview_carve_start = None;
+                        self.preview_progress_atomic = None;
+                        // Clear mesh cache so all chunks rebuild
+                        self.chunk_meshes = ChunkMeshManager::new();
+                    }
+                }
 
                 // Carving mode: advance the carving session and set targets
                 if self.sim.mode == SimMode::Carving {
@@ -2625,44 +2831,42 @@ impl ApplicationHandler for App {
                     self.apply_held_keys(clamped_frame_time);
                 }
 
-                if sim_active {
-                    // IK solve: update joint targets from Cartesian target (once per frame)
-                    self.sim.update_ik();
+                // Physics/IK only in non-preview modes
+                if self.sim.mode != SimMode::Preview {
+                    if sim_active {
+                        // IK solve: update joint targets from Cartesian target (once per frame)
+                        self.sim.update_ik();
 
-                    // Scale physics accumulator by speed multiplier in carving mode
-                    let physics_dt_budget = if self.sim.mode == SimMode::Carving {
-                        clamped_frame_time * self.speed_multiplier
+                        // Scale physics accumulator by speed multiplier in carving mode
+                        let physics_dt_budget = if self.sim.mode == SimMode::Carving {
+                            clamped_frame_time * self.speed_multiplier
+                        } else {
+                            clamped_frame_time
+                        };
+                        self.accumulator += physics_dt_budget;
+
+                        let mut steps = 0u32;
+                        while self.accumulator >= PHYSICS_DT && steps < self.max_physics_steps {
+                            self.sim.physics_step();
+                            // Record tool position every physics step for sub-frame cutting.
+                            self.sim.record_tool_position();
+                            self.accumulator -= PHYSICS_DT;
+                            steps += 1;
+                        }
+                        // Drain excess to prevent spiral of death
+                        if self.accumulator > PHYSICS_DT * 10.0 {
+                            self.accumulator = 0.0;
+                        }
+
+                        // Final tool state update
+                        self.sim.update_tool_state();
+
+                        // Material removal: once per frame (not per physics step)
+                        self.sim.material_removal_step();
                     } else {
-                        clamped_frame_time
-                    };
-                    self.accumulator += physics_dt_budget;
-
-                    let mut steps = 0u32;
-                    while self.accumulator >= PHYSICS_DT && steps < self.max_physics_steps {
-                        self.sim.physics_step();
-                        // Record tool position every physics step for sub-frame cutting.
-                        // FK is ~1.4µs per call; at 25x this is ~0.5ms total — negligible.
-                        // This captures the actual curved tool trajectory instead of a
-                        // straight line from frame start to end, eliminating floating
-                        // polygons and missed material at high speed multipliers.
-                        self.sim.record_tool_position();
-                        self.accumulator -= PHYSICS_DT;
-                        steps += 1;
-                    }
-                    // Drain excess to prevent spiral of death
-                    if self.accumulator > PHYSICS_DT * 10.0 {
+                        // Idle: don't accumulate physics time
                         self.accumulator = 0.0;
                     }
-
-                    // Final tool state update (position is already recorded above,
-                    // but update_tool_state also sets prev_position for other uses)
-                    self.sim.update_tool_state();
-
-                    // Material removal: once per frame (not per physics step)
-                    self.sim.material_removal_step();
-                } else {
-                    // Idle: don't accumulate physics time
-                    self.accumulator = 0.0;
                 }
 
                 // Render (always — camera may have moved via mouse)
@@ -2671,8 +2875,9 @@ impl ApplicationHandler for App {
 
                 // Request next frame, but throttle when idle
                 let has_pending_meshes = !self.sim.workpiece.dirty_chunks.is_empty();
+                let preview_busy = self.preview_rx.is_some();
                 if let Some(window) = &self.window {
-                    if sim_active || has_pending_meshes {
+                    if sim_active || has_pending_meshes || preview_busy {
                         window.request_redraw();
                     } else {
                         // Idle: cap at ~30fps to save CPU/GPU

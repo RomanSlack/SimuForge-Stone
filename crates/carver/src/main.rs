@@ -6,10 +6,9 @@
 use std::path::Path;
 use std::time::Instant;
 
-use nalgebra::Vector3;
-use simuforge_control::gcode::{GCommand, GCodeInterpreter};
+use simuforge_control::gcode::GCodeInterpreter;
 use simuforge_cutting::tool::Tool;
-use simuforge_material::octree::OctreeSdf;
+use simuforge_carver::DirectCarver;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -41,10 +40,7 @@ fn main() {
     let cfg = CarverConfig::load(config_path.as_deref(), resolution_override);
 
     eprintln!("SimuForge Direct Carver");
-    eprintln!(
-        "  G-code:     {}",
-        gcode_path
-    );
+    eprintln!("  G-code:     {}", gcode_path);
     eprintln!(
         "  Tool:       {} r={:.1}mm cl={:.1}mm",
         cfg.tool_type, cfg.tool_radius_mm, cfg.tool_cutting_length_mm
@@ -62,16 +58,6 @@ fn main() {
         _ => Tool::flat_end(cfg.tool_radius_mm, cfg.tool_cutting_length_mm),
     };
 
-    // Create workpiece SDF
-    let he = cfg.half_extent as f32;
-    let t0 = Instant::now();
-    let mut workpiece = OctreeSdf::new_block([he, he, he], cfg.cell_size as f32);
-    eprintln!(
-        "  Workpiece created: {} chunks ({:.2}s)",
-        workpiece.chunk_count(),
-        t0.elapsed().as_secs_f64()
-    );
-
     // Load G-code
     let t0 = Instant::now();
     let interp = GCodeInterpreter::load_file(gcode_path).unwrap_or_else(|e| {
@@ -84,80 +70,25 @@ fn main() {
         t0.elapsed().as_secs_f64()
     );
 
-    // Walk commands directly — no CarvingSession, no TrajectoryPlanner, no physics
-    let mut position = Vector3::<f64>::zeros();
-    let mut a_axis = 0.0_f64;
-    let mut spindle_on = false;
-    let mut cut_count = 0u64;
-    let total_cmds = interp.commands.len();
+    // Create DirectCarver and carve everything
+    let mut carver = DirectCarver::new(interp.commands, tool, cfg.half_extent, cfg.cell_size);
+    eprintln!(
+        "  Workpiece created: {} chunks",
+        carver.workpiece.chunk_count(),
+    );
 
     let t0 = Instant::now();
+    let total = carver.total_commands();
 
-    for (i, cmd) in interp.commands.iter().enumerate() {
-        match cmd {
-            GCommand::SpindleOn { .. } => {
-                spindle_on = true;
-            }
-            GCommand::SpindleOff => {
-                spindle_on = false;
-            }
-            GCommand::Rapid { x, y, z, a, u: _ } => {
-                if let Some(v) = x { position.x = *v; }
-                if let Some(v) = y { position.y = *v; }
-                if let Some(v) = z { position.z = *v; }
-                if let Some(v) = a { a_axis = *v; }
-            }
-            GCommand::LinearFeed { x, y, z, a, u: _, f: _ } => {
-                let prev_pos = position;
-                let prev_a = a_axis;
-                if let Some(v) = x { position.x = *v; }
-                if let Some(v) = y { position.y = *v; }
-                if let Some(v) = z { position.z = *v; }
-                if let Some(v) = a { a_axis = *v; }
-
-                // Cut when spindle on and A-axis hasn't changed (rotation = repositioning)
-                if spindle_on && (a_axis - prev_a).abs() < 1e-6 {
-                    cut_segment(
-                        &tool,
-                        &mut workpiece,
-                        &prev_pos,
-                        &position,
-                        a_axis,
-                        cfg.half_extent,
-                    );
-                    cut_count += 1;
-                }
-            }
-            GCommand::ArcCW { x, y, z, f: _, .. }
-            | GCommand::ArcCCW { x, y, z, f: _, .. } => {
-                // Treat arcs as linear moves (same as GCodeInterpreter::next_target)
-                let prev_pos = position;
-                if let Some(v) = x { position.x = *v; }
-                if let Some(v) = y { position.y = *v; }
-                if let Some(v) = z { position.z = *v; }
-
-                if spindle_on {
-                    cut_segment(
-                        &tool,
-                        &mut workpiece,
-                        &prev_pos,
-                        &position,
-                        a_axis,
-                        cfg.half_extent,
-                    );
-                    cut_count += 1;
-                }
-            }
-            GCommand::Comment(_) => {}
-        }
-
-        if (i + 1) % 10000 == 0 || i + 1 == total_cmds {
+    // Carve in batches of 10000 for progress reporting
+    while carver.current_command() < total {
+        let before = carver.current_command();
+        carver.carve_batch(10000);
+        let after = carver.current_command();
+        if after == total || (after / 10000) != (before / 10000) {
             eprint!(
                 "\r  Carving: {}/{} commands, {} cuts, {:.1}s",
-                i + 1,
-                total_cmds,
-                cut_count,
-                t0.elapsed().as_secs_f64()
+                after, total, carver.cut_count(), t0.elapsed().as_secs_f64()
             );
         }
     }
@@ -166,67 +97,29 @@ fn main() {
     let carve_time = t0.elapsed().as_secs_f64();
     eprintln!(
         "  Carving complete: {} cuts in {:.2}s",
-        cut_count, carve_time
+        carver.cut_count(), carve_time
     );
 
     // Export OBJ mesh
     let t0 = Instant::now();
     let (verts, tris) =
-        simuforge_material::mesher::export_obj(&workpiece, Path::new(&output_path));
+        simuforge_material::mesher::export_obj(&carver.workpiece, Path::new(&output_path));
     eprintln!(
         "  OBJ exported: {} ({} verts, {} tris, {:.2}s)",
-        output_path,
-        verts,
-        tris,
-        t0.elapsed().as_secs_f64()
+        output_path, verts, tris, t0.elapsed().as_secs_f64()
     );
 
     // Save binary SDF
     if save_sdf {
         let sdf_path = Path::new(&output_path).with_extension("sdf");
         let t0 = Instant::now();
-        workpiece.save_binary(&sdf_path);
+        carver.workpiece.save_binary(&sdf_path);
         eprintln!(
             "  SDF saved: {} ({:.2}s)",
             sdf_path.display(),
             t0.elapsed().as_secs_f64()
         );
     }
-}
-
-/// Apply a single cut segment in SDF-local coordinates.
-///
-/// Coordinate transform: gcode_pos + (0,0,half_extent) → rotated by -a_angle around X.
-fn cut_segment(
-    tool: &Tool,
-    workpiece: &mut OctreeSdf,
-    start: &Vector3<f64>,
-    end: &Vector3<f64>,
-    a_angle: f64,
-    half_extent: f64,
-) {
-    let he_vec = Vector3::new(0.0, 0.0, half_extent);
-    let rot_inv = nalgebra::Rotation3::from_axis_angle(&Vector3::x_axis(), -a_angle);
-
-    let start_local = rot_inv * (*start + he_vec);
-    let end_local = rot_inv * (*end + he_vec);
-    let tool_axis_local = rot_inv * Vector3::new(0.0, 0.0, 1.0);
-
-    // Quick AABB reject — skip segments entirely outside workpiece bounds
-    let bound = half_extent + 0.02;
-    let s_inside = start_local.x.abs() <= bound
-        && start_local.y.abs() <= bound
-        && start_local.z.abs() <= bound;
-    let e_inside = end_local.x.abs() <= bound
-        && end_local.y.abs() <= bound
-        && end_local.z.abs() <= bound;
-    if !s_inside && !e_inside {
-        return;
-    }
-
-    let tool_sdf = tool.swept_sdf(&start_local, &end_local, &tool_axis_local);
-    let (bounds_min, bounds_max) = tool.swept_bounds(&start_local, &end_local, &tool_axis_local);
-    workpiece.subtract(bounds_min, bounds_max, tool_sdf);
 }
 
 /// Find a command-line argument value by flag name.

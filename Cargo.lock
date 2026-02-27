@@ -2185,6 +2185,7 @@ dependencies = [
  "glam",
  "nalgebra",
  "pollster",
+ "simuforge-carver",
  "simuforge-control",
  "simuforge-core",
  "simuforge-cutting",
