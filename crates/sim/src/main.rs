@@ -830,6 +830,10 @@ struct App {
     preview_progress_atomic: Option<Arc<AtomicUsize>>,
     /// Total commands for current carve (for ETA calculation while carving).
     preview_carve_total: usize,
+    /// Resolution multiplier for preview (1.0 = full, 2.0 = 2x coarser, etc.)
+    preview_coarseness: f64,
+    /// Tool radius in mm for preview carving.
+    preview_tool_radius_mm: f64,
 }
 
 impl App {
@@ -898,6 +902,8 @@ impl App {
             preview_carve_start: None,
             preview_progress_atomic: None,
             preview_carve_total: 0,
+            preview_coarseness: 2.0,
+            preview_tool_radius_mm: cfg.tool_radius_mm,
         }
     }
 
@@ -987,6 +993,38 @@ impl App {
                 tx.send(carver).ok();
             });
             self.preview_rx = Some(rx);
+        }
+    }
+
+    /// Recreate the preview carver with current coarseness/tool settings.
+    /// Reloads G-code and resets to a fresh block.
+    fn recreate_preview_carver(&mut self) {
+        if self.sim.mode != SimMode::Preview {
+            return;
+        }
+        if self.preview_rx.is_some() {
+            return; // don't interrupt active carve
+        }
+        if let Some(path) = &self.gcode_path {
+            let path = path.clone();
+            if let Ok(interp) = GCodeInterpreter::load_file(&path) {
+                let tool = Tool::ball_nose(
+                    self.preview_tool_radius_mm,
+                    self.sim.tool.cutting_length * 1000.0,
+                );
+                let he = self.sim.workpiece_half_extent;
+                let cs = self.sim.workpiece.cell_size as f64 * self.preview_coarseness;
+                let mut carver = DirectCarver::new(interp.commands, tool, he, cs);
+                let total = carver.total_commands();
+                std::mem::swap(&mut self.sim.workpiece, &mut carver.workpiece);
+                self.preview_target = total;
+                self.preview_carver = Some(carver);
+                self.chunk_meshes = ChunkMeshManager::new();
+                eprintln!(
+                    "Preview recreated: {}x coarseness, {:.1}mm tool radius",
+                    self.preview_coarseness, self.preview_tool_radius_mm
+                );
+            }
         }
     }
 
@@ -1865,6 +1903,14 @@ impl App {
                         self.chunk_meshes = ChunkMeshManager::new();
                     }
                 }
+                ui::UiAction::PreviewSetCoarseness(c) => {
+                    self.preview_coarseness = c;
+                    self.recreate_preview_carver();
+                }
+                ui::UiAction::PreviewSetToolRadius(r) => {
+                    self.preview_tool_radius_mm = r;
+                    self.recreate_preview_carver();
+                }
             }
         }
 
@@ -2005,6 +2051,8 @@ impl App {
             preview_carving,
             preview_elapsed,
             preview_eta,
+            preview_coarseness: self.preview_coarseness,
+            preview_tool_radius_mm: self.preview_tool_radius_mm,
         }
     }
 
@@ -2586,11 +2634,12 @@ impl ApplicationHandler for App {
                                 let path = self.gcode_path.as_ref().unwrap().clone();
                                 match GCodeInterpreter::load_file(&path) {
                                     Ok(interp) => {
-                                        let tool = self.sim.tool.clone();
+                                        let tool = Tool::ball_nose(
+                                            self.preview_tool_radius_mm,
+                                            self.sim.tool.cutting_length * 1000.0,
+                                        );
                                         let he = self.sim.workpiece_half_extent;
-                                        // 2x coarser resolution for fast preview
-                                        // (full detail via CLI: simuforge-carve)
-                                        let cs = self.sim.workpiece.cell_size as f64 * 2.0;
+                                        let cs = self.sim.workpiece.cell_size as f64 * self.preview_coarseness;
                                         let mut carver = DirectCarver::new(
                                             interp.commands, tool, he, cs,
                                         );

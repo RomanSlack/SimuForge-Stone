@@ -89,6 +89,10 @@ pub struct UiData {
     pub preview_elapsed: f64,
     /// Estimated seconds remaining (-1.0 = not available yet).
     pub preview_eta: f64,
+    /// Resolution multiplier (1.0 = full detail, 2.0 = 2x coarser).
+    pub preview_coarseness: f64,
+    /// Tool radius in mm for preview carving.
+    pub preview_tool_radius_mm: f64,
 }
 
 /// Actions the UI wants the application to perform.
@@ -99,6 +103,8 @@ pub enum UiAction {
     PreviewCarve,
     PreviewSetTarget(usize),
     PreviewReset,
+    PreviewSetCoarseness(f64),
+    PreviewSetToolRadius(f64),
 }
 
 // ────────────────────────── Theme Setup ──────────────────────────
@@ -311,7 +317,7 @@ fn header_panel(ctx: &egui::Context, data: &UiData, _actions: &mut Vec<UiAction>
 // ────────────────────────── Bottom Panel ──────────────────────────
 
 fn bottom_panel(ctx: &egui::Context, data: &UiData, actions: &mut Vec<UiAction>) {
-    let panel_height = if data.mode_preview { 64.0 } else { 40.0 };
+    let panel_height = if data.mode_preview { 88.0 } else { 40.0 };
     egui::TopBottomPanel::bottom("timeline")
         .exact_height(panel_height)
         .frame(
@@ -412,7 +418,38 @@ fn bottom_panel(ctx: &egui::Context, data: &UiData, actions: &mut Vec<UiAction>)
                                 );
                             });
                         });
-                        // Row 2: Slider to set target (does NOT auto-carve)
+                        // Row 2: Settings — coarseness + tool radius
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Res").color(TEXT_2).size(11.0));
+                            for &mult in &[1.0_f64, 2.0, 3.0, 4.0] {
+                                let label = format!("{}x", mult as u32);
+                                let active = (data.preview_coarseness - mult).abs() < 0.1;
+                                let color = if active { MAGENTA } else { TEXT_2 };
+                                let btn = ui.add(
+                                    egui::Button::new(
+                                        RichText::new(label).color(color).size(11.0)
+                                    )
+                                    .min_size(egui::vec2(28.0, 18.0)),
+                                );
+                                if btn.clicked() && !active {
+                                    actions.push(UiAction::PreviewSetCoarseness(mult));
+                                }
+                            }
+
+                            ui.separator();
+
+                            ui.label(RichText::new("Tool").color(TEXT_2).size(11.0));
+                            let mut radius = data.preview_tool_radius_mm;
+                            let slider = egui::Slider::new(&mut radius, 1.0..=16.0)
+                                .suffix("mm")
+                                .fixed_decimals(1)
+                                .clamping(egui::SliderClamping::Always);
+                            let resp = ui.add_sized(egui::vec2(140.0, 16.0), slider);
+                            if resp.drag_stopped() {
+                                actions.push(UiAction::PreviewSetToolRadius(radius));
+                            }
+                        });
+                        // Row 3: Slider to set target (does NOT auto-carve)
                         ui.horizontal(|ui| {
                             let total = data.preview_total;
                             if total > 0 {

@@ -27,12 +27,19 @@ except ImportError:
 # Heights in mm
 SAFE_Z = 5.0        # retract during cutting
 RETRACT_Z = 25.0    # retract for face transitions
-CLEARANCE = 20.0    # mm margin around bust profile to clear
 
 
-def load_and_fit(path, size):
-    """Load mesh, center, scale to 85% of workpiece."""
+def load_and_fit(path, size, rotate_x=90):
+    """Load mesh, orient to Z-up, center, scale to fit workpiece."""
     mesh = trimesh.load(path, force="mesh")
+
+    # Pre-rotate model (default: +90 around X converts Y-up OBJ to Z-up)
+    if rotate_x != 0:
+        rot = trimesh.transformations.rotation_matrix(
+            np.radians(rotate_x), [1, 0, 0]
+        )
+        mesh.apply_transform(rot)
+
     mesh.vertices -= mesh.centroid
     mesh.apply_scale(0.85 * size / mesh.extents.max())
     return mesh
@@ -159,17 +166,10 @@ def gen_face(mesh, a_deg, half, stepover, stepdown, max_depth, feed):
 
     floor = max(float(np.nanmin(surface)), -max_depth)
 
-    # Build clearance map: fill empty areas near geometry with floor depth
-    # so surrounding material gets removed to reveal the bust profile
+    # Fill ALL empty grid cells with floor depth so surrounding material
+    # is fully removed (no walls left around the bust)
     clearance = surface.copy()
-    rows, cols = np.where(geo)
-    pad = int(np.ceil(CLEARANCE / stepover))
-    r0 = max(0, rows.min() - pad)
-    r1 = min(surface.shape[0], rows.max() + pad + 1)
-    c0 = max(0, cols.min() - pad)
-    c1 = min(surface.shape[1], cols.max() + pad + 1)
-    sub = clearance[r0:r1, c0:c1]
-    sub[np.isnan(sub)] = floor
+    clearance[np.isnan(clearance)] = floor
 
     lines = [
         "",
@@ -199,25 +199,31 @@ def main():
     ap.add_argument("--workpiece", type=float, default=305, help="Cube side mm (305)")
     ap.add_argument("--stepover", type=float, default=4, help="XY spacing mm (4)")
     ap.add_argument("--stepdown", type=float, default=3, help="Z per roughing pass mm (3)")
-    ap.add_argument("--max-depth", type=float, default=80, help="Max cut depth mm (80)")
+    ap.add_argument("--max-depth", type=float, default=0,
+                    help="Max cut depth mm (0 = auto: workpiece/2 + 5)")
     ap.add_argument("--feed", type=float, default=800, help="Feed rate mm/min (800)")
     ap.add_argument("--faces", default="0,90,-90,180",
                     help="A-axis angles, comma-separated (0,90,-90,180)")
+    ap.add_argument("--rotate-x", type=float, default=90,
+                    help="Pre-rotate model around X axis (deg). 90 = Y-up to Z-up (default)")
     args = ap.parse_args()
 
     half = args.workpiece / 2
+    max_depth = args.max_depth if args.max_depth > 0 else half + 5
     faces = [float(f) for f in args.faces.split(",")]
 
     print(f"Loading {args.stl}...")
-    mesh = load_and_fit(args.stl, args.workpiece)
+    mesh = load_and_fit(args.stl, args.workpiece, rotate_x=args.rotate_x)
     print(f"  {len(mesh.vertices):,} verts, {len(mesh.faces):,} tris")
     print(f"  Fitted extents: {mesh.extents.round(1)} mm")
+    print(f"  Max depth: {max_depth:.0f}mm (half={half:.0f}mm)")
 
     gc = [
         "(STL-to-GCode for SimuForge-Stone)",
         f"(Model: {args.stl})",
         f"(Workpiece: {args.workpiece:.0f}mm cube)",
         f"(Stepover: {args.stepover}mm, Stepdown: {args.stepdown}mm, Feed: {args.feed:.0f}mm/min)",
+        f"(Max depth: {max_depth:.0f}mm, Rotate-X: {args.rotate_x:.0f}deg)",
         "",
         f"G0 Z{RETRACT_Z:.0f}",
     ]
@@ -226,7 +232,7 @@ def main():
     for a in faces:
         print(f"  A={a:+.0f}°...", end=" ", flush=True)
         face = gen_face(mesh, a, half, args.stepover, args.stepdown,
-                        args.max_depth, args.feed)
+                        max_depth, args.feed)
         gc.extend(face)
         print(f"{sum(1 for l in face if l.startswith('G1')):,} cuts")
 
