@@ -333,6 +333,76 @@ impl OctreeSdf {
         }
     }
 
+    /// Take up to `max` dirty chunks nearest to `tool_pos` (SDF-local coords),
+    /// removing them from the dirty set. Used for immediate sync meshing of
+    /// the most visible chunks to eliminate 1-frame latency.
+    pub fn take_nearest_dirty(&mut self, tool_pos: [f32; 3], max: usize) -> Vec<ChunkCoord> {
+        if self.dirty_chunks.is_empty() || max == 0 {
+            return Vec::new();
+        }
+
+        let chunk_half = CHUNK_SIZE as f32 * self.cell_size * 0.5;
+        let mut dirty_with_dist: Vec<(ChunkCoord, f32)> = self
+            .dirty_chunks
+            .iter()
+            .map(|&coord| {
+                let origin = coord.world_origin(self.cell_size);
+                let cx = origin[0] + chunk_half;
+                let cy = origin[1] + chunk_half;
+                let cz = origin[2] + chunk_half;
+                let dist = (cx - tool_pos[0]).powi(2)
+                    + (cy - tool_pos[1]).powi(2)
+                    + (cz - tool_pos[2]).powi(2);
+                (coord, dist)
+            })
+            .collect();
+
+        dirty_with_dist.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let taken: Vec<ChunkCoord> = dirty_with_dist
+            .iter()
+            .take(max)
+            .map(|(coord, _)| *coord)
+            .collect();
+
+        for coord in &taken {
+            self.dirty_chunks.remove(coord);
+        }
+
+        taken
+    }
+
+    /// Find all stored chunks that overlap the given world-space bounds.
+    /// Used for predictive lookahead along upcoming toolpaths.
+    pub fn chunks_in_bounds(&self, bounds_min: [f32; 3], bounds_max: [f32; 3]) -> Vec<ChunkCoord> {
+        let chunk_world = CHUNK_SIZE as f32 * self.cell_size;
+        let c_min = [
+            (bounds_min[0] / chunk_world).floor() as i32,
+            (bounds_min[1] / chunk_world).floor() as i32,
+            (bounds_min[2] / chunk_world).floor() as i32,
+        ];
+        let c_max = [
+            (bounds_max[0] / chunk_world).ceil() as i32,
+            (bounds_max[1] / chunk_world).ceil() as i32,
+            (bounds_max[2] / chunk_world).ceil() as i32,
+        ];
+        let mut coords = Vec::new();
+        for cz in c_min[2]..=c_max[2] {
+            for cy in c_min[1]..=c_max[1] {
+                for cx in c_min[0]..=c_max[0] {
+                    let coord = ChunkCoord::new(cx, cy, cz);
+                    if self.chunks.contains_key(&coord) {
+                        coords.push(coord);
+                    }
+                }
+            }
+        }
+        coords
+    }
+
     /// Number of stored chunks.
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()

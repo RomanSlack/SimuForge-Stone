@@ -261,6 +261,14 @@ pub struct ToolState {
     pub frame_start_position: Vector3<f64>,
     /// Whether any material removal happened this frame.
     pub frame_dirty: bool,
+    /// Intermediate positions recorded during physics steps for sub-frame cutting.
+    /// At high speed multipliers (25x+), hundreds of physics steps run per frame.
+    /// Recording the tool path as a polyline ensures material removal follows the
+    /// actual curved trajectory instead of a straight line from start to end.
+    pub frame_path: Vec<Vector3<f64>>,
+    /// Minimum distance between recorded path waypoints (m).
+    /// Set to tool_radius * 0.5 for good accuracy without excessive samples.
+    pub path_record_threshold: f64,
 }
 
 impl ToolState {
@@ -272,13 +280,29 @@ impl ToolState {
             spindle_on: false,
             frame_start_position: Vector3::zeros(),
             frame_dirty: false,
+            frame_path: Vec::with_capacity(64),
+            path_record_threshold: 0.0025, // 2.5mm default, overridden by tool radius
         }
     }
 
-    /// Update position (called each physics step).
+    /// Update position (called once per frame after all physics steps).
     pub fn update_position(&mut self, new_pos: Vector3<f64>) {
         self.prev_position = self.position;
         self.position = new_pos;
+    }
+
+    /// Record an intermediate tool position during the physics loop.
+    /// Only appends if the tool has moved more than `path_record_threshold`
+    /// since the last recorded point, keeping the polyline efficient.
+    pub fn record_position(&mut self, new_pos: Vector3<f64>) {
+        self.prev_position = self.position;
+        self.position = new_pos;
+
+        let last = self.frame_path.last().copied()
+            .unwrap_or(self.frame_start_position);
+        if (new_pos - last).norm_squared() > self.path_record_threshold * self.path_record_threshold {
+            self.frame_path.push(new_pos);
+        }
     }
 
     /// Total displacement accumulated since frame start.
@@ -286,20 +310,28 @@ impl ToolState {
         (self.position - self.frame_start_position).norm()
     }
 
-    /// Mark the start of a new render frame. Returns (start, end) if
-    /// the tool moved enough for material removal.
-    /// Small displacements accumulate across frames until the threshold is reached.
-    pub fn begin_frame(&mut self) -> Option<(Vector3<f64>, Vector3<f64>)> {
+    /// Mark the start of a new render frame. Returns the polyline path
+    /// (frame_start → intermediate waypoints → current position) if the
+    /// tool moved enough for material removal.
+    pub fn begin_frame(&mut self) -> Option<Vec<Vector3<f64>>> {
         let disp = self.frame_displacement();
         self.frame_dirty = false;
         if disp > 0.0001 {
-            // Tool moved at least 0.1mm — perform cut and reset accumulator
-            let start = self.frame_start_position;
-            let end = self.position;
+            // Build complete path: frame_start + recorded intermediates + current
+            let mut path = Vec::with_capacity(self.frame_path.len() + 2);
+            path.push(self.frame_start_position);
+            path.append(&mut self.frame_path);
+            // Ensure current position is included (may differ from last recorded)
+            let last = *path.last().unwrap();
+            if (self.position - last).norm() > 1e-6 {
+                path.push(self.position);
+            }
+
             self.frame_start_position = self.position;
-            Some((start, end))
+            // frame_path was drained by append, already empty
+            Some(path)
         } else {
-            // Below threshold — keep frame_start_position so movement accumulates
+            // Below threshold — keep accumulating
             None
         }
     }

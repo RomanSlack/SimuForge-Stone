@@ -246,6 +246,39 @@ impl AsyncMesher {
         }
     }
 
+    /// Snapshot dirty chunks and submit them sorted by distance to tool position
+    /// (nearest first). This ensures the most visible chunks complete first,
+    /// reducing perceived choppiness during fast cutting.
+    pub fn submit_dirty_prioritized(&self, sdf: &mut OctreeSdf, tool_pos: [f32; 3]) {
+        let mut dirty: Vec<ChunkCoord> = sdf.dirty_chunks.drain().collect();
+        if dirty.is_empty() {
+            return;
+        }
+
+        // Sort nearest-first so rayon workers process visible chunks first
+        let chunk_half = CHUNK_SIZE as f32 * sdf.cell_size * 0.5;
+        dirty.sort_by(|a, b| {
+            let dist = |coord: &ChunkCoord| -> f32 {
+                let origin = coord.world_origin(sdf.cell_size);
+                (origin[0] + chunk_half - tool_pos[0]).powi(2)
+                    + (origin[1] + chunk_half - tool_pos[1]).powi(2)
+                    + (origin[2] + chunk_half - tool_pos[2]).powi(2)
+            };
+            dist(a)
+                .partial_cmp(&dist(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let batch: Vec<MeshRequest> = dirty
+            .into_iter()
+            .filter_map(|coord| MeshRequest::snapshot(sdf, coord))
+            .collect();
+
+        if !batch.is_empty() {
+            let _ = self.req_tx.send(batch);
+        }
+    }
+
     /// Poll for completed meshes. Non-blocking — returns whatever is ready.
     pub fn poll_completed(&self) -> Vec<ChunkMesh> {
         let mut results = Vec::new();

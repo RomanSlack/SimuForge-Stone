@@ -19,6 +19,7 @@ use simuforge_core::{isometry_to_glam, Vertex};
 use simuforge_cutting::forces::{self, MaterialProps};
 use simuforge_cutting::tool::{Tool, ToolState};
 use simuforge_material::async_mesher::AsyncMesher;
+use simuforge_material::mesher::mesh_chunk;
 use simuforge_material::octree::OctreeSdf;
 use simuforge_motors::gearbox::Gearbox;
 use simuforge_motors::pid;
@@ -113,6 +114,11 @@ const SPEED_PRESETS: &[f64] = &[0.25, 0.5, 1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.
 /// At 0.72m, J3 ≈ -121° (comfortable margin from ±135° limit).
 /// The dynamic track auto-positions the arm base so arm-local X stays near this value.
 const OPTIMAL_LOCAL_X: f64 = 0.72;
+
+/// Number of dirty chunks to mesh synchronously per frame for instant visual feedback.
+/// Each sync chunk adds ~0.5-1ms to frame time but eliminates the 1-frame latency
+/// between material removal and mesh update for the most visible cuts.
+const SYNC_MESH_BUDGET: usize = 4;
 
 /// Full simulation state.
 #[allow(dead_code)]
@@ -221,6 +227,7 @@ impl SimState {
             _ => Tool::flat_end(cfg.tool_radius_mm, cfg.tool_cutting_length_mm),
         };
         let mut tool_state = ToolState::new();
+        tool_state.path_record_threshold = tool.radius * 0.5; // record every half-radius of movement
         let rotary_table = RotaryTable::new(5.0); // 5 kg·m² inertia
         let mut linear_track = LinearTrack::new(50.0); // 50 kg carriage
         linear_track.position = cfg.track_default_position;
@@ -386,6 +393,7 @@ impl SimState {
         self.tool_state.position = initial_tool_pos;
         self.tool_state.prev_position = initial_tool_pos;
         self.tool_state.frame_start_position = initial_tool_pos;
+        self.tool_state.frame_path.clear();
 
         // Reset cartesian target (full pose, world space)
         let mut fk = self.arm.forward_kinematics();
@@ -451,6 +459,16 @@ impl SimState {
         self.linear_track.step(PHYSICS_DT);
 
         self.sim_time += PHYSICS_DT;
+    }
+
+    /// Record tool position during physics loop for sub-frame cutting accuracy.
+    /// Computes FK and appends to the polyline path if the tool moved enough.
+    /// Called every physics step (~1.4µs per call, ~0.5ms total at 25x).
+    fn record_tool_position(&mut self) {
+        let tool_pose = self.arm.forward_kinematics();
+        let track_offset = Vector3::new(self.linear_track.position, 0.0, 0.0);
+        let tool_pos = tool_pose.translation.vector + track_offset;
+        self.tool_state.record_position(tool_pos);
     }
 
     /// Update tool position from current FK. Called once per frame after all physics steps.
@@ -562,6 +580,7 @@ impl SimState {
         self.tool_state.position = tool_pos;
         self.tool_state.prev_position = tool_pos;
         self.tool_state.frame_start_position = tool_pos;
+        self.tool_state.frame_path.clear();
         for pid in &mut self.pid_controllers {
             pid.reset();
         }
@@ -590,6 +609,7 @@ impl SimState {
         if !self.tool_state.spindle_on {
             self.cutting_force_magnitude = 0.0;
             self.tool_state.frame_start_position = self.tool_state.position;
+            self.tool_state.frame_path.clear(); // discard retract/idle path
             return;
         }
 
@@ -598,6 +618,7 @@ impl SimState {
         if is_rapid {
             self.cutting_force_magnitude = 0.0;
             self.tool_state.frame_start_position = self.tool_state.position;
+            self.tool_state.frame_path.clear(); // discard rapid repositioning path
             return;
         }
 
@@ -620,8 +641,9 @@ impl SimState {
             }
         }
 
-        // Get accumulated tool path for this frame
-        let (start_world, end_world) = match self.tool_state.begin_frame() {
+        // Get accumulated tool path for this frame (polyline with intermediate
+        // positions recorded during the physics loop for sub-frame accuracy).
+        let path_world = match self.tool_state.begin_frame() {
             Some(path) => path,
             None => {
                 self.cutting_force_magnitude = 0.0;
@@ -634,8 +656,13 @@ impl SimState {
         let wc = self.workpiece_center;
         let angle = self.rotary_table.angle;
         let rot_inv = nalgebra::Rotation3::from_axis_angle(&Vector3::x_axis(), -angle);
-        let start = rot_inv * (start_world - wc);
-        let end = rot_inv * (end_world - wc);
+
+        let path_local: Vec<Vector3<f64>> = path_world.iter()
+            .map(|p| rot_inv * (*p - wc))
+            .collect();
+
+        let start = path_local.first().unwrap();
+        let end = path_local.last().unwrap();
 
         // Diagnostic: detect face changes and log first cuts on each face
         let a_deg = angle.to_degrees();
@@ -646,45 +673,54 @@ impl SimState {
         }
         if self.diag_cut_count < 5 {
             let he = self.workpiece_half_extent;
-            // For A=0: depth from top = he - end.z (top face at z=+he)
-            // For A=90: depth from front = he - end.y (front face at y=+he)
             let (face_name, depth) = if angle.abs() < 0.1 {
                 ("TOP", he - end.z)
             } else if (angle - std::f64::consts::FRAC_PI_2).abs() < 0.1 {
                 ("FRONT", he - end.y)
             } else if (angle + std::f64::consts::FRAC_PI_2).abs() < 0.1 {
-                ("BACK", he + end.y) // back face at y=-he
+                ("BACK", he + end.y)
             } else {
-                ("BOTTOM", he + end.z) // bottom at z=-he
+                ("BOTTOM", he + end.z)
             };
-            eprintln!("  Cut #{} on {} (A={:.1}°): local=({:.1},{:.1},{:.1})mm, depth={:.1}mm, world_end=({:.3},{:.3},{:.3})",
+            let end_world = path_world.last().unwrap();
+            eprintln!("  Cut #{} on {} (A={:.1}°): local=({:.1},{:.1},{:.1})mm, depth={:.1}mm, world_end=({:.3},{:.3},{:.3}), path_pts={}",
                 self.diag_cut_count, face_name, a_deg,
                 end.x*1000.0, end.y*1000.0, end.z*1000.0,
                 depth*1000.0,
-                end_world.x, end_world.y, end_world.z);
+                end_world.x, end_world.y, end_world.z,
+                path_local.len());
             self.diag_cut_count += 1;
-        }
-
-        // Quick AABB check: is the tool anywhere near the workpiece?
-        // Check if EITHER endpoint is near the workpiece (tool may enter or exit).
-        let half = self.workpiece_half_extent + 0.02; // workpiece half-extent + margin
-        let start_inside = start.x.abs() <= half && start.y.abs() <= half && start.z.abs() <= half;
-        let end_inside = end.x.abs() <= half && end.y.abs() <= half && end.z.abs() <= half;
-        if !start_inside && !end_inside {
-            self.cutting_force_magnitude = 0.0;
-            return; // tool is entirely outside workpiece region
         }
 
         // Tool axis in workpiece-local coords: tool always points -Z in world,
         // so the body extends +Z (from tip toward shank). Rotate to local frame.
-        let tool_axis_world = Vector3::new(0.0, 0.0, 1.0); // tip→shank = +Z in world
+        let tool_axis_world = Vector3::new(0.0, 0.0, 1.0);
         let tool_axis_local = rot_inv * tool_axis_world;
-        let tool_sdf = self.tool.swept_sdf(&start, &end, &tool_axis_local);
-        let (bounds_min, bounds_max) = self.tool.swept_bounds(&start, &end, &tool_axis_local);
-        self.workpiece.subtract(bounds_min, bounds_max, tool_sdf);
+
+        // Cut along each segment of the polyline path.
+        // At 1x speed, path typically has 2 points (start + end).
+        // At 25x+, path has ~40 intermediate waypoints that follow the
+        // actual curved tool trajectory, eliminating floating polygons.
+        let half = self.workpiece_half_extent + 0.02;
+        for i in 0..path_local.len() - 1 {
+            let seg_start = &path_local[i];
+            let seg_end = &path_local[i + 1];
+
+            // Quick AABB check per segment — skip segments entirely outside workpiece
+            let s_inside = seg_start.x.abs() <= half && seg_start.y.abs() <= half && seg_start.z.abs() <= half;
+            let e_inside = seg_end.x.abs() <= half && seg_end.y.abs() <= half && seg_end.z.abs() <= half;
+            if !s_inside && !e_inside {
+                continue;
+            }
+
+            let tool_sdf = self.tool.swept_sdf(seg_start, seg_end, &tool_axis_local);
+            let (bounds_min, bounds_max) =
+                self.tool.swept_bounds(seg_start, seg_end, &tool_axis_local);
+            self.workpiece.subtract(bounds_min, bounds_max, tool_sdf);
+        }
 
         // Cutting forces (for display)
-        let diff = end - start;
+        let diff = *end - *start;
         if diff.norm() > 1e-9 {
             let feed_dir = diff.normalize();
             let force = forces::cutting_force(
@@ -1167,7 +1203,49 @@ impl App {
             });
         }
 
-        // Upload completed meshes from background workers.
+        // --- Mesh pipeline: sync nearest + async remaining + predictive ---
+        //
+        // Strategy: mesh the nearest dirty chunks SYNCHRONOUSLY on the main
+        // thread (eliminates 1-frame latency for the most visible cuts), then
+        // submit remaining dirty chunks to background workers sorted by
+        // distance (nearest first) so they complete in priority order.
+
+        // Compute tool position in SDF-local (workpiece-centered) coords
+        let tool_local_pos = {
+            let wc = self.sim.workpiece_center;
+            let angle = self.sim.rotary_table.angle;
+            let rot_inv =
+                nalgebra::Rotation3::from_axis_angle(&Vector3::x_axis(), -angle);
+            let track_off = Vector3::new(self.sim.linear_track.position, 0.0, 0.0);
+            let tool_world = self.sim.arm.tool_position() + track_off;
+            let local = rot_inv * (tool_world - wc);
+            [local.x as f32, local.y as f32, local.z as f32]
+        };
+
+        // 1) Sync mesh: take the N nearest dirty chunks and mesh them NOW.
+        //    This adds ~2-4ms per frame but the cuts appear instantly.
+        let sync_coords =
+            self.sim.workpiece.take_nearest_dirty(tool_local_pos, SYNC_MESH_BUDGET);
+        for coord in &sync_coords {
+            if let Some(mesh) = mesh_chunk(&self.sim.workpiece, *coord) {
+                let c = (mesh.coord.x, mesh.coord.y, mesh.coord.z);
+                self.chunk_meshes.upload_chunk(
+                    &ctx.device,
+                    &ctx.queue,
+                    c,
+                    &mesh.positions,
+                    &mesh.normals,
+                    &mesh.indices,
+                );
+            }
+        }
+
+        // 2) Async submit: remaining dirty chunks go to background workers,
+        //    sorted nearest-first so the most visible ones complete soonest.
+        self.async_mesher
+            .submit_dirty_prioritized(&mut self.sim.workpiece, tool_local_pos);
+
+        // 3) Upload completed meshes from background workers (previous frame's work).
         let async_meshes = self.async_mesher.poll_completed();
         for mesh in &async_meshes {
             let coord = (mesh.coord.x, mesh.coord.y, mesh.coord.z);
@@ -1180,6 +1258,7 @@ impl App {
                 &mesh.indices,
             );
         }
+
         // Rebuild merged GPU buffer if any chunks changed (persistent buffer, no alloc).
         self.chunk_meshes.rebuild_if_dirty(&ctx.device, &ctx.queue);
 
@@ -2449,9 +2528,10 @@ impl ApplicationHandler for App {
                                         && self.sim.rotary_table.velocity.abs() < 0.1
                                     {
                                         self.retract_phase = 0;
-                                        // Reset frame_start to prevent accumulated swept path
-                                        // from retract leaking into the first cut of the new face.
+                                        // Reset frame_start and clear accumulated path to prevent
+                                        // retract trajectory leaking into the first cut of the new face.
                                         self.sim.tool_state.frame_start_position = self.sim.tool_state.position;
+                                        self.sim.tool_state.frame_path.clear();
                                         eprintln!("Table settled at A={:.1}°, resuming carving",
                                             self.prev_a_axis.to_degrees());
                                     }
@@ -2560,6 +2640,12 @@ impl ApplicationHandler for App {
                     let mut steps = 0u32;
                     while self.accumulator >= PHYSICS_DT && steps < self.max_physics_steps {
                         self.sim.physics_step();
+                        // Record tool position every physics step for sub-frame cutting.
+                        // FK is ~1.4µs per call; at 25x this is ~0.5ms total — negligible.
+                        // This captures the actual curved tool trajectory instead of a
+                        // straight line from frame start to end, eliminating floating
+                        // polygons and missed material at high speed multipliers.
+                        self.sim.record_tool_position();
                         self.accumulator -= PHYSICS_DT;
                         steps += 1;
                     }
@@ -2568,8 +2654,8 @@ impl ApplicationHandler for App {
                         self.accumulator = 0.0;
                     }
 
-                    // FK → tool position: once per frame after all physics steps
-                    // (not per physics step — saves N-1 FK computations)
+                    // Final tool state update (position is already recorded above,
+                    // but update_tool_state also sets prev_position for other uses)
                     self.sim.update_tool_state();
 
                     // Material removal: once per frame (not per physics step)
@@ -2579,11 +2665,8 @@ impl ApplicationHandler for App {
                     self.accumulator = 0.0;
                 }
 
-                // Always submit dirty chunks for background meshing
-                // (needed during startup even when paused, and after cuts complete)
-                self.async_mesher.submit_dirty(&mut self.sim.workpiece);
-
                 // Render (always — camera may have moved via mouse)
+                // Note: dirty chunk submission moved into render() for sync mesh + priority ordering.
                 self.render();
 
                 // Request next frame, but throttle when idle

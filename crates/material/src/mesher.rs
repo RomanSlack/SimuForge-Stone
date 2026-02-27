@@ -162,10 +162,115 @@ fn sample_neighbor(sdf: &OctreeSdf, coord: ChunkCoord, lx: i32, ly: i32, lz: i32
     }
 }
 
+// --- LOD1: Half-resolution meshing (16³ effective, 18³ padded) ---
+
+/// Padded grid for LOD1 (half-resolution): (CHUNK_SIZE/2) + 2
+const LOD1_PADDED: u32 = (CHUNK_SIZE as u32 / 2) + 2; // 18
+const LOD1_TOTAL: usize = (LOD1_PADDED * LOD1_PADDED * LOD1_PADDED) as usize;
+
+type Lod1Shape = ConstShape3u32<18, 18, 18>;
+
+struct Lod1Buffers {
+    grid: Vec<f32>,
+    sn_buffer: SurfaceNetsBuffer,
+}
+
+thread_local! {
+    static LOD1_BUFFERS: RefCell<Lod1Buffers> = RefCell::new(Lod1Buffers {
+        grid: vec![1.0f32; LOD1_TOTAL],
+        sn_buffer: SurfaceNetsBuffer::default(),
+    });
+}
+
+/// Mesh a chunk at half resolution (LOD1). Produces ~4x fewer vertices than full.
+/// Each LOD1 grid cell covers 2 original voxels, giving a smoother but less detailed surface.
+pub fn mesh_chunk_lod1(sdf: &OctreeSdf, coord: ChunkCoord) -> Option<ChunkMesh> {
+    let leaf = sdf.chunks.get(&coord)?;
+
+    LOD1_BUFFERS.with(|bufs| {
+        let mut bufs = bufs.borrow_mut();
+        let Lod1Buffers { grid, sn_buffer } = &mut *bufs;
+
+        grid.fill(1.0f32);
+
+        let cs = sdf.cell_size;
+        let stride = 2i32;
+
+        for gz in 0..LOD1_PADDED {
+            for gy in 0..LOD1_PADDED {
+                for gx in 0..LOD1_PADDED {
+                    // Map LOD1 grid coord to original chunk coord (stride=2)
+                    let lx = (gx as i32 - 1) * stride;
+                    let ly = (gy as i32 - 1) * stride;
+                    let lz = (gz as i32 - 1) * stride;
+
+                    let value = if lx >= 0
+                        && lx < CHUNK_SIZE as i32
+                        && ly >= 0
+                        && ly < CHUNK_SIZE as i32
+                        && lz >= 0
+                        && lz < CHUNK_SIZE as i32
+                    {
+                        crate::octree::dequantize_sdf(
+                            leaf.get(lx as usize, ly as usize, lz as usize),
+                            cs,
+                        )
+                    } else {
+                        sample_neighbor(sdf, coord, lx, ly, lz)
+                    };
+
+                    let idx = Lod1Shape::linearize([gx, gy, gz]) as usize;
+                    grid[idx] = value;
+                }
+            }
+        }
+
+        surface_nets(
+            grid,
+            &Lod1Shape {},
+            [0; 3],
+            [LOD1_PADDED - 1; 3],
+            sn_buffer,
+        );
+
+        if sn_buffer.positions.is_empty() {
+            return None;
+        }
+
+        // LOD1 cell covers 2 original voxels, so world-space step = cell_size * 2
+        let origin = coord.world_origin(cs);
+        let lod_cs = cs * stride as f32;
+
+        let positions: Vec<[f32; 3]> = sn_buffer
+            .positions
+            .iter()
+            .map(|p| {
+                [
+                    origin[0] + (p[0] - 1.0) * lod_cs,
+                    origin[1] + (p[1] - 1.0) * lod_cs,
+                    origin[2] + (p[2] - 1.0) * lod_cs,
+                ]
+            })
+            .collect();
+
+        let mut normals = Vec::new();
+        std::mem::swap(&mut normals, &mut sn_buffer.normals);
+        let mut indices = Vec::new();
+        std::mem::swap(&mut indices, &mut sn_buffer.indices);
+
+        Some(ChunkMesh {
+            coord,
+            positions,
+            normals,
+            indices,
+        })
+    })
+}
+
 /// Remesh dirty chunks and return the meshes.
 /// Caps at `max_per_frame` to avoid render stalls; remaining stay dirty for next frame.
 pub fn remesh_dirty(sdf: &mut OctreeSdf) -> Vec<ChunkMesh> {
-    remesh_dirty_capped(sdf, 8)
+    remesh_dirty_capped(sdf, 32)
 }
 
 /// Remesh up to `max` dirty chunks. Remaining chunks stay in the dirty set.

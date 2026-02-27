@@ -10,3 +10,4 @@ cargo run --release <example gcode file>
   - 1 — snap camera to workpiece
   - 2 — snap camera to robot arm
   - Esc — quit
+  Alt+H toggles toolpath visualization on/off
