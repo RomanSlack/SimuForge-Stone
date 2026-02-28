@@ -840,6 +840,12 @@ struct App {
     timelapse_duration: f64,
     timelapse_elapsed: f64,
     timelapse_mesh_counter: u32,
+    timelapse_ramp_enabled: bool,
+    timelapse_trail_enabled: bool,
+    trail_points: Vec<([f32; 3], f64)>,
+    trail_pipeline: Option<LinePipeline>,
+    /// Pre-carved ground truth SDF for artifact clamping during timelapse.
+    ground_truth_sdf: Option<OctreeSdf>,
 }
 
 impl App {
@@ -915,6 +921,11 @@ impl App {
             timelapse_duration: 60.0,
             timelapse_elapsed: 0.0,
             timelapse_mesh_counter: 0,
+            timelapse_ramp_enabled: true,
+            timelapse_trail_enabled: true,
+            trail_points: Vec::new(),
+            trail_pipeline: None,
+            ground_truth_sdf: None,
         }
     }
 
@@ -1039,6 +1050,29 @@ impl App {
         }
     }
 
+    /// Smoothstep speed profile for timelapse ramp up/down.
+    /// Returns a speed multiplier in [min_speed, 1.0].
+    fn timelapse_speed_at(elapsed: f64, duration: f64) -> f64 {
+        let min_speed = 0.15;
+        let ramp_up = 8.0_f64;  // 2s slow start + 6s ramp
+        let ramp_down = 6.0_f64;
+
+        fn smoothstep(edge0: f64, edge1: f64, x: f64) -> f64 {
+            let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+            t * t * (3.0 - 2.0 * t)
+        }
+
+        if elapsed < ramp_up {
+            let s = smoothstep(0.0, ramp_up, elapsed);
+            min_speed + (1.0 - min_speed) * s
+        } else if elapsed > duration - ramp_down {
+            let s = smoothstep(duration - ramp_down, duration, elapsed);
+            1.0 - (1.0 - min_speed) * s
+        } else {
+            1.0
+        }
+    }
+
     /// Advance one timelapse frame: batch-carve N commands, solve IK, set arm joints kinematically.
     fn timelapse_step(&mut self, frame_dt: f64) {
         if !self.timelapse_active {
@@ -1057,17 +1091,28 @@ impl App {
 
         self.timelapse_elapsed += frame_dt;
 
-        // Compute how many commands to process this frame
+        // Compute how many commands to process this frame.
+        // Use fixed average rate × speed_mult so ramp actually controls instantaneous speed
+        // (the old remaining/time formula was self-correcting and cancelled out the ramp).
         let target_fps = 60.0;
-        let remaining_cmds = total.saturating_sub(carver.current_command());
-        let remaining_time = (self.timelapse_duration - self.timelapse_elapsed).max(1.0);
-        let cmds_per_sec = remaining_cmds as f64 / remaining_time;
-        let commands_this_frame = (cmds_per_sec / target_fps).ceil().max(1.0) as usize;
+        let avg_cmds_per_sec = total as f64 / self.timelapse_duration;
+        let speed_mult = if self.timelapse_ramp_enabled {
+            Self::timelapse_speed_at(self.timelapse_elapsed, self.timelapse_duration)
+        } else {
+            1.0
+        };
+        let cmds_this_sec = avg_cmds_per_sec * speed_mult;
+        let commands_this_frame = (cmds_this_sec / target_fps).ceil().max(1.0) as usize;
 
         // Swap workpiece into carver, batch carve, swap back
         std::mem::swap(&mut self.sim.workpiece, &mut carver.workpiece);
         carver.carve_batch(commands_this_frame);
         std::mem::swap(&mut self.sim.workpiece, &mut carver.workpiece);
+
+        // Clamp dirty voxels against ground truth — eliminates floating artifacts
+        if let Some(gt) = &self.ground_truth_sdf {
+            self.sim.workpiece.clamp_to_ground_truth(gt);
+        }
 
         // Read carver state
         let gcode_pos = carver.position();
@@ -1099,8 +1144,42 @@ impl App {
         self.sim.linear_track.position = desired_track;
         self.sim.linear_track.target_position = desired_track;
 
-        // Solve IK (uses velocity limiting for smooth arm motion)
-        self.sim.update_ik();
+        // Solve IK with carving-mode guards (weighted + J3 guard) to prevent arm
+        // phasing through the workpiece. Preview-mode IK has no J3 guard and allows
+        // forward-wrist solutions where the arm approaches from the side.
+        {
+            let mut scratch = self.sim.arm.clone();
+            scratch.set_joint_angles(&self.sim.joint_targets);
+
+            let track_offset = Vector3::new(self.sim.linear_track.position, 0.0, 0.0);
+            let mut local_target = self.sim.cartesian_target;
+            local_target.translation.vector -= track_offset;
+
+            let (converged, _, _) = self.sim.ik_solver.solve_weighted(
+                &mut scratch, &local_target, self.sim.orientation_weight,
+            );
+
+            let new_angles = scratch.joint_angles();
+
+            // Reject forward-wrist solutions (J3 > 0) — arm approaches from side, phases through block
+            if new_angles[2] > 0.0 {
+                self.sim.ik_converged = false;
+            } else if !scratch.is_collision_free() {
+                self.sim.ik_converged = false;
+            } else {
+                self.sim.ik_converged = converged;
+
+                let frame_dt_ik = 1.0 / 60.0;
+                let mut deltas: Vec<f64> = new_angles.iter().zip(self.sim.joint_targets.iter())
+                    .map(|(new, old)| new - old)
+                    .collect();
+                IkSolver::apply_velocity_limits(&mut deltas, &self.sim.arm, frame_dt_ik);
+
+                for i in 0..self.sim.joint_targets.len() {
+                    self.sim.joint_targets[i] += deltas[i];
+                }
+            }
+        }
 
         // Set arm joints directly (kinematic — no physics)
         for i in 0..self.sim.arm.num_joints() {
@@ -1112,6 +1191,34 @@ impl App {
         self.sim.rotary_table.angle = a_axis;
         self.sim.rotary_table.target_angle = a_axis;
 
+        // Record trail point at carving position (cartesian_target = green ball position)
+        if self.timelapse_trail_enabled {
+            let swap = coord_swap_matrix();
+            let ct = &self.sim.cartesian_target.translation.vector;
+            let dh_pos = Vec3::new(ct.x as f32, ct.y as f32, ct.z as f32);
+            let render_pos = swap.transform_point3(dh_pos);
+            let pos = [render_pos.x, render_pos.y, render_pos.z];
+            let t = self.timelapse_elapsed;
+
+            // Only add if moved at least 0.5mm from last point
+            let should_add = match self.trail_points.last() {
+                Some((last_pos, _)) => {
+                    let dx = pos[0] - last_pos[0];
+                    let dy = pos[1] - last_pos[1];
+                    let dz = pos[2] - last_pos[2];
+                    (dx * dx + dy * dy + dz * dz) > 0.0005 * 0.0005
+                }
+                None => true,
+            };
+            if should_add {
+                self.trail_points.push((pos, t));
+            }
+
+            // Discard points older than 8 seconds
+            let cutoff = t - 8.0;
+            self.trail_points.retain(|&(_, pt)| pt > cutoff);
+        }
+
         // Throttle mesh updates: only process dirty chunks every 6 frames
         self.timelapse_mesh_counter += 1;
         if self.timelapse_mesh_counter % 6 != 0 {
@@ -1119,17 +1226,10 @@ impl App {
             // (Don't clear dirty_chunks — just skip the sync mesh budget in render)
         }
 
-        // Periodically clean thin shells during timelapse (every 60 frames ≈ 1s)
-        if self.timelapse_mesh_counter % 60 == 0 {
-            self.sim.workpiece.remove_thin_shells();
-        }
-
         // Check completion
         if carver.current_command() >= total {
             self.timelapse_active = false;
-            let removed = self.sim.workpiece.remove_thin_shells();
-            eprintln!("Timelapse complete: {} commands in {:.1}s ({} shell voxels removed)",
-                total, self.timelapse_elapsed, removed);
+            eprintln!("Timelapse complete: {} commands in {:.1}s", total, self.timelapse_elapsed);
         }
     }
 
@@ -1185,6 +1285,40 @@ impl App {
                 tool_down,
             );
         }
+    }
+
+    /// Pre-carve the entire G-code to produce a ground truth SDF.
+    /// This runs all carving commands without rendering, then stores the result
+    /// so timelapse frames can clamp artifacts against the known final shape.
+    fn precompute_ground_truth(&mut self) {
+        let carver = match &mut self.preview_carver {
+            Some(c) => c,
+            None => return,
+        };
+        let target = self.preview_target.min(carver.total_commands());
+        eprintln!("Pre-carving ground truth ({} commands)...", target);
+        let t0 = std::time::Instant::now();
+
+        // Build a temporary carver clone, carve everything, steal its workpiece
+        let saved_cmd = carver.current_command();
+        std::mem::swap(&mut self.sim.workpiece, &mut carver.workpiece);
+        carver.carve_to(target);
+        // The carver's workpiece is now fully carved — clone it as ground truth
+        let gt = carver.workpiece.clone();
+        // Reset carver back to where it was
+        carver.carve_to(0); // reset
+        if saved_cmd > 0 {
+            carver.carve_to(saved_cmd);
+        }
+        std::mem::swap(&mut self.sim.workpiece, &mut carver.workpiece);
+
+        // Clear dirty chunks from the ground truth (it's read-only reference data)
+        let mut ground_truth = gt;
+        ground_truth.dirty_chunks.clear();
+
+        eprintln!("Ground truth ready: {} chunks in {:.1}s",
+            ground_truth.chunk_count(), t0.elapsed().as_secs_f64());
+        self.ground_truth_sdf = Some(ground_truth);
     }
 
     /// Initialize the line pipeline (for toolpath visualization).
@@ -1953,6 +2087,59 @@ impl App {
         }
         } // show_toolpath
 
+        // ====== Pass 7b: Timelapse trail → swapchain (Load) ======
+        if self.timelapse_trail_enabled && self.trail_points.len() >= 2 {
+            // Lazy-init trail pipeline (inline to avoid &mut self borrow conflict)
+            if self.trail_pipeline.is_none() {
+                self.trail_pipeline = Some(LinePipeline::new(ctx, &pbr.camera_buffer));
+            }
+            // Build trail vertices with fading alpha
+            let now = self.timelapse_elapsed;
+            let trail_max_age = 8.0_f64;
+            let mut trail_verts: Vec<LineVertex> = Vec::with_capacity(self.trail_points.len() * 2);
+            for i in 0..self.trail_points.len() - 1 {
+                let (p0, t0) = self.trail_points[i];
+                let (p1, t1) = self.trail_points[i + 1];
+                let age0 = (now - t0) / trail_max_age;
+                let age1 = (now - t1) / trail_max_age;
+                let alpha0 = (1.0 - age0).clamp(0.0, 1.0) as f32;
+                let alpha1 = (1.0 - age1).clamp(0.0, 1.0) as f32;
+                trail_verts.push(LineVertex { position: p0, color: [0.3, 0.8, 1.0, alpha0] });
+                trail_verts.push(LineVertex { position: p1, color: [0.3, 0.8, 1.0, alpha1] });
+            }
+            if let Some(trail_pipe) = &mut self.trail_pipeline {
+                if !trail_verts.is_empty() {
+                    trail_pipe.upload(&ctx.queue, &trail_verts);
+                }
+                if trail_pipe.num_vertices > 0 {
+                    let mut trail_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("Trail Pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &ctx.depth_texture,
+                            depth_ops: Some(wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: None,
+                        }),
+                        ..Default::default()
+                    });
+                    trail_pass.set_pipeline(&trail_pipe.pipeline);
+                    trail_pass.set_bind_group(0, &trail_pipe.bind_group, &[]);
+                    trail_pass.set_vertex_buffer(0, trail_pipe.vertex_buffer.slice(..));
+                    trail_pass.draw(0..trail_pipe.num_vertices, 0..1);
+                }
+            }
+        }
+
         // ====== Pass 8: egui UI → swapchain (Load) ======
         let ui_data = self.collect_ui_data();
         let egui_input = self.egui_state.as_mut().unwrap().take_egui_input(
@@ -2066,6 +2253,8 @@ impl App {
                             self.timelapse_active = true;
                             if self.timelapse_elapsed == 0.0 {
                                 self.timelapse_mesh_counter = 0;
+                                self.trail_points.clear();
+                                self.precompute_ground_truth();
                                 self.timelapse_preposition_arm();
                             }
                         }
@@ -2080,6 +2269,8 @@ impl App {
                     self.timelapse_active = false;
                     self.timelapse_elapsed = 0.0;
                     self.timelapse_mesh_counter = 0;
+                    self.trail_points.clear();
+                    self.ground_truth_sdf = None;
                     if let Some(carver) = &mut self.preview_carver {
                         std::mem::swap(&mut self.sim.workpiece, &mut carver.workpiece);
                         carver.reset();
@@ -2103,6 +2294,15 @@ impl App {
                 ui::UiAction::PreviewSetToolRadius(r) => {
                     self.preview_tool_radius_mm = r;
                     self.recreate_preview_carver();
+                }
+                ui::UiAction::PreviewToggleRamp => {
+                    self.timelapse_ramp_enabled = !self.timelapse_ramp_enabled;
+                }
+                ui::UiAction::PreviewToggleTrail => {
+                    self.timelapse_trail_enabled = !self.timelapse_trail_enabled;
+                    if !self.timelapse_trail_enabled {
+                        self.trail_points.clear();
+                    }
                 }
             }
         }
@@ -2253,6 +2453,8 @@ impl App {
             timelapse_enabled: self.timelapse_enabled,
             timelapse_active: self.timelapse_active,
             timelapse_duration: self.timelapse_duration,
+            timelapse_ramp_enabled: self.timelapse_ramp_enabled,
+            timelapse_trail_enabled: self.timelapse_trail_enabled,
         }
     }
 
@@ -2715,6 +2917,8 @@ impl ApplicationHandler for App {
                                         self.timelapse_active = true;
                                         if self.timelapse_elapsed == 0.0 {
                                             self.timelapse_mesh_counter = 0;
+                                            self.trail_points.clear();
+                                            self.precompute_ground_truth();
                                             // Pre-position the arm for timelapse start
                                             self.timelapse_preposition_arm();
                                         }
@@ -2953,11 +3157,6 @@ impl ApplicationHandler for App {
                         );
                         // Swap carved workpiece back into sim
                         std::mem::swap(&mut self.sim.workpiece, &mut carver.workpiece);
-                        // Remove thin SDF shells (floating plane artifacts)
-                        let removed = self.sim.workpiece.remove_thin_shells();
-                        if removed > 0 {
-                            eprintln!("  Cleaned {} thin shell voxels", removed);
-                        }
                         self.preview_carver = Some(carver);
                         self.preview_rx = None;
                         self.preview_carve_start = None;

@@ -97,6 +97,8 @@ pub struct UiData {
     pub timelapse_enabled: bool,
     pub timelapse_active: bool,
     pub timelapse_duration: f64,
+    pub timelapse_ramp_enabled: bool,
+    pub timelapse_trail_enabled: bool,
 }
 
 /// Actions the UI wants the application to perform.
@@ -111,6 +113,8 @@ pub enum UiAction {
     PreviewSetToolRadius(f64),
     PreviewToggleTimelapse,
     PreviewSetDuration(f64),
+    PreviewToggleRamp,
+    PreviewToggleTrail,
 }
 
 // ────────────────────────── Theme Setup ──────────────────────────
@@ -491,6 +495,32 @@ fn bottom_panel(ctx: &egui::Context, data: &UiData, actions: &mut Vec<UiAction>)
                             }
 
                             if data.timelapse_enabled {
+                                ui.separator();
+
+                                // Ramp toggle
+                                let ramp_color = if data.timelapse_ramp_enabled { MAGENTA } else { TEXT_2 };
+                                let ramp_label = if data.timelapse_ramp_enabled { "Ramp \u{2713}" } else { "Ramp" };
+                                let ramp_btn = ui.add_enabled(
+                                    controls_enabled,
+                                    egui::Button::new(RichText::new(ramp_label).color(ramp_color).size(11.0))
+                                        .min_size(egui::vec2(44.0, 18.0)),
+                                );
+                                if ramp_btn.clicked() {
+                                    actions.push(UiAction::PreviewToggleRamp);
+                                }
+
+                                // Trail toggle
+                                let trail_color = if data.timelapse_trail_enabled { CYAN } else { TEXT_2 };
+                                let trail_label = if data.timelapse_trail_enabled { "Trail \u{2713}" } else { "Trail" };
+                                let trail_btn = ui.add_enabled(
+                                    controls_enabled,
+                                    egui::Button::new(RichText::new(trail_label).color(trail_color).size(11.0))
+                                        .min_size(egui::vec2(44.0, 18.0)),
+                                );
+                                if trail_btn.clicked() {
+                                    actions.push(UiAction::PreviewToggleTrail);
+                                }
+
                                 ui.separator();
                                 ui.label(RichText::new("Duration").color(TEXT_2).size(11.0));
                                 let mut dur = data.timelapse_duration;
