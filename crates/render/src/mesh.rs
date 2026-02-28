@@ -69,6 +69,17 @@ impl ChunkMeshManager {
             return;
         }
 
+        // Cull floating slivers: if the mesh is paper-thin in any axis,
+        // it's a residual SDF shell (not real geometry). These appear as
+        // floating planes after aggressive carving and would fall off in
+        // real physics anyway.
+        if Self::is_degenerate_sliver(positions, indices) {
+            if self.chunks.remove(&coord).is_some() {
+                self.dirty = true;
+            }
+            return;
+        }
+
         let vertices: Vec<Vertex> = positions
             .iter()
             .zip(normals.iter())
@@ -171,6 +182,14 @@ impl ChunkMeshManager {
         if self.chunks.remove(&coord).is_some() {
             self.dirty = true;
         }
+    }
+
+    /// Check if a chunk mesh is a degenerate sliver (tiny floating fragment).
+    ///
+    /// Only catches trivially small meshes (< 4 triangles). The main floating
+    /// plane cleanup happens at the SDF level via `OctreeSdf::remove_thin_shells()`.
+    fn is_degenerate_sliver(_positions: &[[f32; 3]], indices: &[u32]) -> bool {
+        indices.len() / 3 < 4
     }
 
     /// Number of chunks with mesh data.

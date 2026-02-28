@@ -93,6 +93,10 @@ pub struct UiData {
     pub preview_coarseness: f64,
     /// Tool radius in mm for preview carving.
     pub preview_tool_radius_mm: f64,
+    // Timelapse sub-mode
+    pub timelapse_enabled: bool,
+    pub timelapse_active: bool,
+    pub timelapse_duration: f64,
 }
 
 /// Actions the UI wants the application to perform.
@@ -105,6 +109,8 @@ pub enum UiAction {
     PreviewReset,
     PreviewSetCoarseness(f64),
     PreviewSetToolRadius(f64),
+    PreviewToggleTimelapse,
+    PreviewSetDuration(f64),
 }
 
 // ────────────────────────── Theme Setup ──────────────────────────
@@ -332,8 +338,8 @@ fn bottom_panel(ctx: &egui::Context, data: &UiData, actions: &mut Vec<UiAction>)
                 ui.vertical(|ui| {
                     ui.add_space(4.0);
 
-                    if data.preview_carving {
-                        // Loading state — carving in background
+                    if data.preview_carving && !data.timelapse_active {
+                        // Loading state — instant carving in background
                         ui.horizontal(|ui| {
                             ui.spinner();
                             let eta_text = if data.preview_eta >= 0.0 {
@@ -353,14 +359,31 @@ fn bottom_panel(ctx: &egui::Context, data: &UiData, actions: &mut Vec<UiAction>)
                         // Keep requesting redraws so the spinner animates
                         ui.ctx().request_repaint();
                     } else {
-                        // Row 1: Carve button + percentage + progress text + Reset
+                        // Row 1: Carve/Pause button + Timelapse toggle + percentage + progress text + Reset + FPS
                         ui.horizontal(|ui| {
+                            let (btn_label, btn_color) = if data.timelapse_active {
+                                ("Pause", YELLOW)
+                            } else {
+                                ("Carve", GREEN)
+                            };
                             let btn = ui.add(
-                                egui::Button::new(RichText::new("Carve").color(GREEN).size(12.0))
+                                egui::Button::new(RichText::new(btn_label).color(btn_color).size(12.0))
                                     .min_size(egui::vec2(56.0, 22.0)),
                             );
                             if btn.clicked() {
                                 actions.push(UiAction::PreviewCarve);
+                            }
+
+                            // Timelapse toggle
+                            let tl_color = if data.timelapse_enabled { MAGENTA } else { TEXT_2 };
+                            let tl_label = if data.timelapse_enabled { "Timelapse \u{2713}" } else { "Timelapse" };
+                            let tl_btn = ui.add_enabled(
+                                !data.timelapse_active,
+                                egui::Button::new(RichText::new(tl_label).color(tl_color).size(11.0))
+                                    .min_size(egui::vec2(80.0, 22.0)),
+                            );
+                            if tl_btn.clicked() {
+                                actions.push(UiAction::PreviewToggleTimelapse);
                             }
 
                             ui.separator();
@@ -381,7 +404,21 @@ fn bottom_panel(ctx: &egui::Context, data: &UiData, actions: &mut Vec<UiAction>)
 
                             ui.separator();
 
-                            if data.preview_done {
+                            if data.timelapse_active {
+                                ui.spinner();
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{}/{} — {:.0}s",
+                                        data.preview_current, data.preview_total,
+                                        data.preview_elapsed
+                                    ))
+                                    .monospace()
+                                    .color(YELLOW)
+                                    .size(11.0),
+                                );
+                                // Keep requesting redraws during timelapse
+                                ui.ctx().request_repaint();
+                            } else if data.preview_done {
                                 ui.label(
                                     RichText::new(format!(
                                         "{}/{} ({} cuts)",
@@ -418,14 +455,16 @@ fn bottom_panel(ctx: &egui::Context, data: &UiData, actions: &mut Vec<UiAction>)
                                 );
                             });
                         });
-                        // Row 2: Settings — coarseness + tool radius
+                        // Row 2: Settings — coarseness + tool radius + duration (when timelapse enabled)
                         ui.horizontal(|ui| {
+                            let controls_enabled = !data.timelapse_active;
                             ui.label(RichText::new("Res").color(TEXT_2).size(11.0));
                             for &mult in &[1.0_f64, 2.0, 3.0, 4.0] {
                                 let label = format!("{}x", mult as u32);
                                 let active = (data.preview_coarseness - mult).abs() < 0.1;
                                 let color = if active { MAGENTA } else { TEXT_2 };
-                                let btn = ui.add(
+                                let btn = ui.add_enabled(
+                                    controls_enabled,
                                     egui::Button::new(
                                         RichText::new(label).color(color).size(11.0)
                                     )
@@ -444,9 +483,27 @@ fn bottom_panel(ctx: &egui::Context, data: &UiData, actions: &mut Vec<UiAction>)
                                 .suffix("mm")
                                 .fixed_decimals(1)
                                 .clamping(egui::SliderClamping::Always);
-                            let resp = ui.add_sized(egui::vec2(140.0, 16.0), slider);
-                            if resp.drag_stopped() {
+                            let resp = ui.add_enabled_ui(controls_enabled, |ui| {
+                                ui.add_sized(egui::vec2(140.0, 16.0), slider)
+                            });
+                            if resp.inner.drag_stopped() {
                                 actions.push(UiAction::PreviewSetToolRadius(radius));
+                            }
+
+                            if data.timelapse_enabled {
+                                ui.separator();
+                                ui.label(RichText::new("Duration").color(TEXT_2).size(11.0));
+                                let mut dur = data.timelapse_duration;
+                                let dur_slider = egui::Slider::new(&mut dur, 15.0..=300.0)
+                                    .suffix("s")
+                                    .fixed_decimals(0)
+                                    .clamping(egui::SliderClamping::Always);
+                                let dur_resp = ui.add_enabled_ui(controls_enabled, |ui| {
+                                    ui.add_sized(egui::vec2(120.0, 16.0), dur_slider)
+                                });
+                                if dur_resp.inner.drag_stopped() {
+                                    actions.push(UiAction::PreviewSetDuration(dur));
+                                }
                             }
                         });
                         // Row 3: Slider to set target (does NOT auto-carve)
@@ -966,7 +1023,9 @@ fn shortcut_row(ui: &mut egui::Ui, key: &str, desc: &str) {
 /// Get state label from data.
 fn state_label(data: &UiData) -> (Color32, &'static str) {
     if data.mode_preview {
-        if data.preview_carving {
+        if data.timelapse_active {
+            (YELLOW, "Timelapse...")
+        } else if data.preview_carving {
             (YELLOW, "Carving...")
         } else if data.preview_done && data.preview_current >= data.preview_total {
             (CYAN, "Complete")

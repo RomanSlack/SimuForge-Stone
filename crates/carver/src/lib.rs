@@ -58,6 +58,18 @@ impl DirectCarver {
         self.cut_count
     }
 
+    pub fn position(&self) -> Vector3<f64> {
+        self.position
+    }
+
+    pub fn a_axis(&self) -> f64 {
+        self.a_axis
+    }
+
+    pub fn spindle_on(&self) -> bool {
+        self.spindle_on
+    }
+
     /// Process up to `count` commands. Returns the number actually processed.
     pub fn carve_batch(&mut self, count: usize) -> usize {
         let start = self.current_cmd;

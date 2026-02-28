@@ -405,6 +405,107 @@ impl OctreeSdf {
         coords
     }
 
+    /// Remove thin SDF shells: voxels that are inside material but have air on
+    /// both sides along any axis. These create floating planes after carving.
+    ///
+    /// For each negative (inside) voxel, checks neighbors ±1 along X, Y, Z.
+    /// If both neighbors in any axis are positive (outside), the voxel is in a
+    /// thin shell and gets snapped to outside. This is a morphological opening
+    /// that preserves solid geometry (block faces have solid on one side).
+    ///
+    /// Returns the number of voxels removed.
+    pub fn remove_thin_shells(&mut self) -> usize {
+        // Collect voxels to flip (can't mutate while iterating).
+        // Each entry: (chunk_coord, local_x, local_y, local_z).
+        let mut to_flip: Vec<(ChunkCoord, usize, usize, usize)> = Vec::new();
+
+        let coords: Vec<ChunkCoord> = self.chunks.keys().copied().collect();
+
+        for &coord in &coords {
+            let leaf = match self.chunks.get(&coord) {
+                Some(l) => l,
+                None => continue,
+            };
+
+            for lz in 0..CHUNK_SIZE {
+                for ly in 0..CHUNK_SIZE {
+                    for lx in 0..CHUNK_SIZE {
+                        let val = leaf.get(lx, ly, lz);
+                        // Only check voxels that are inside material (negative SDF)
+                        if val >= 0 {
+                            continue;
+                        }
+
+                        // Check each axis: are both neighbors positive (outside)?
+                        let thin_x = self.neighbor_val(coord, lx, ly, lz, 0) > 0
+                            && self.neighbor_val_neg(coord, lx, ly, lz, 0) > 0;
+                        let thin_y = self.neighbor_val(coord, lx, ly, lz, 1) > 0
+                            && self.neighbor_val_neg(coord, lx, ly, lz, 1) > 0;
+                        let thin_z = self.neighbor_val(coord, lx, ly, lz, 2) > 0
+                            && self.neighbor_val_neg(coord, lx, ly, lz, 2) > 0;
+
+                        if thin_x || thin_y || thin_z {
+                            to_flip.push((coord, lx, ly, lz));
+                        }
+                    }
+                }
+            }
+        }
+
+        let count = to_flip.len();
+        for (coord, lx, ly, lz) in &to_flip {
+            if let Some(leaf) = self.chunks.get_mut(coord) {
+                leaf.set(*lx, *ly, *lz, 1); // just outside surface
+                self.dirty_chunks.insert(*coord);
+            }
+        }
+
+        count
+    }
+
+    /// Get the SDF value of the neighbor at +1 along `axis` (0=X, 1=Y, 2=Z).
+    /// Handles cross-chunk boundary lookups. Returns 127 (outside) if chunk missing.
+    fn neighbor_val(&self, coord: ChunkCoord, lx: usize, ly: usize, lz: usize, axis: usize) -> Sd8 {
+        let (mut nlx, mut nly, mut nlz) = (lx, ly, lz);
+        let mut nc = coord;
+        match axis {
+            0 => {
+                if lx + 1 < CHUNK_SIZE { nlx = lx + 1; }
+                else { nc.x += 1; nlx = 0; }
+            }
+            1 => {
+                if ly + 1 < CHUNK_SIZE { nly = ly + 1; }
+                else { nc.y += 1; nly = 0; }
+            }
+            _ => {
+                if lz + 1 < CHUNK_SIZE { nlz = lz + 1; }
+                else { nc.z += 1; nlz = 0; }
+            }
+        }
+        self.chunks.get(&nc).map_or(127, |l| l.get(nlx, nly, nlz))
+    }
+
+    /// Get the SDF value of the neighbor at -1 along `axis` (0=X, 1=Y, 2=Z).
+    fn neighbor_val_neg(&self, coord: ChunkCoord, lx: usize, ly: usize, lz: usize, axis: usize) -> Sd8 {
+        let (mut nlx, mut nly, mut nlz) = (lx, ly, lz);
+        let mut nc = coord;
+        match axis {
+            0 => {
+                if lx > 0 { nlx = lx - 1; }
+                else { nc.x -= 1; nlx = CHUNK_SIZE - 1; }
+            }
+            1 => {
+                if ly > 0 { nly = ly - 1; }
+                else { nc.y -= 1; nly = CHUNK_SIZE - 1; }
+            }
+            _ => {
+                if lz > 0 { nlz = lz - 1; }
+                else { nc.z -= 1; nlz = CHUNK_SIZE - 1; }
+            }
+        }
+        self.chunks.get(&nc).map_or(127, |l| l.get(nlx, nly, nlz))
+    }
+
     /// Number of stored chunks.
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()

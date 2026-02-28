@@ -834,6 +834,12 @@ struct App {
     preview_coarseness: f64,
     /// Tool radius in mm for preview carving.
     preview_tool_radius_mm: f64,
+    // --- Timelapse sub-mode ---
+    timelapse_enabled: bool,
+    timelapse_active: bool,
+    timelapse_duration: f64,
+    timelapse_elapsed: f64,
+    timelapse_mesh_counter: u32,
 }
 
 impl App {
@@ -904,6 +910,11 @@ impl App {
             preview_carve_total: 0,
             preview_coarseness: 2.0,
             preview_tool_radius_mm: cfg.tool_radius_mm,
+            timelapse_enabled: false,
+            timelapse_active: false,
+            timelapse_duration: 60.0,
+            timelapse_elapsed: 0.0,
+            timelapse_mesh_counter: 0,
         }
     }
 
@@ -1025,6 +1036,154 @@ impl App {
                     self.preview_coarseness, self.preview_tool_radius_mm
                 );
             }
+        }
+    }
+
+    /// Advance one timelapse frame: batch-carve N commands, solve IK, set arm joints kinematically.
+    fn timelapse_step(&mut self, frame_dt: f64) {
+        if !self.timelapse_active {
+            return;
+        }
+        let carver = match &mut self.preview_carver {
+            Some(c) => c,
+            None => { self.timelapse_active = false; return; }
+        };
+        let total = self.preview_target.min(carver.total_commands());
+        if carver.current_command() >= total {
+            self.timelapse_active = false;
+            eprintln!("Timelapse complete: {} commands", total);
+            return;
+        }
+
+        self.timelapse_elapsed += frame_dt;
+
+        // Compute how many commands to process this frame
+        let target_fps = 60.0;
+        let remaining_cmds = total.saturating_sub(carver.current_command());
+        let remaining_time = (self.timelapse_duration - self.timelapse_elapsed).max(1.0);
+        let cmds_per_sec = remaining_cmds as f64 / remaining_time;
+        let commands_this_frame = (cmds_per_sec / target_fps).ceil().max(1.0) as usize;
+
+        // Swap workpiece into carver, batch carve, swap back
+        std::mem::swap(&mut self.sim.workpiece, &mut carver.workpiece);
+        carver.carve_batch(commands_this_frame);
+        std::mem::swap(&mut self.sim.workpiece, &mut carver.workpiece);
+
+        // Read carver state
+        let gcode_pos = carver.position();
+        let a_axis = carver.a_axis();
+
+        // Convert G-code position to DH world coords:
+        // gcode origin = top-center of workpiece, so offset = workpiece_center + (0,0,half_extent)
+        let wc = self.sim.workpiece_center;
+        let he = self.sim.workpiece_half_extent;
+        let world_pos = Vector3::new(
+            wc.x + gcode_pos.x,
+            wc.y + gcode_pos.y,
+            wc.z + he + gcode_pos.z,
+        );
+
+        // Build Isometry3 target with tool-down orientation (Rx(π))
+        let tool_down = UnitQuaternion::from_axis_angle(
+            &Vector3::x_axis(),
+            std::f64::consts::PI,
+        );
+        self.sim.cartesian_target = nalgebra::Isometry3::from_parts(
+            nalgebra::Translation3::from(world_pos),
+            tool_down,
+        );
+
+        // Update linear track to keep arm-local X near optimal
+        let desired_track = (world_pos.x - OPTIMAL_LOCAL_X)
+            .clamp(self.sim.linear_track.min_position, self.sim.linear_track.max_position);
+        self.sim.linear_track.position = desired_track;
+        self.sim.linear_track.target_position = desired_track;
+
+        // Solve IK (uses velocity limiting for smooth arm motion)
+        self.sim.update_ik();
+
+        // Set arm joints directly (kinematic — no physics)
+        for i in 0..self.sim.arm.num_joints() {
+            self.sim.arm.joints[i].angle = self.sim.joint_targets[i];
+            self.sim.arm.joints[i].velocity = 0.0;
+        }
+
+        // Set rotary table directly
+        self.sim.rotary_table.angle = a_axis;
+        self.sim.rotary_table.target_angle = a_axis;
+
+        // Throttle mesh updates: only process dirty chunks every 6 frames
+        self.timelapse_mesh_counter += 1;
+        if self.timelapse_mesh_counter % 6 != 0 {
+            // Suppress dirty chunks this frame — they'll be picked up next mesh frame
+            // (Don't clear dirty_chunks — just skip the sync mesh budget in render)
+        }
+
+        // Periodically clean thin shells during timelapse (every 60 frames ≈ 1s)
+        if self.timelapse_mesh_counter % 60 == 0 {
+            self.sim.workpiece.remove_thin_shells();
+        }
+
+        // Check completion
+        if carver.current_command() >= total {
+            self.timelapse_active = false;
+            let removed = self.sim.workpiece.remove_thin_shells();
+            eprintln!("Timelapse complete: {} commands in {:.1}s ({} shell voxels removed)",
+                total, self.timelapse_elapsed, removed);
+        }
+    }
+
+    /// Pre-position arm for timelapse start using IK seeds (same logic as load_gcode).
+    fn timelapse_preposition_arm(&mut self) {
+        let pi = std::f64::consts::PI;
+        let pi2 = std::f64::consts::FRAC_PI_2;
+        let tool_down = UnitQuaternion::from_axis_angle(&Vector3::x_axis(), pi);
+
+        let wc = self.sim.workpiece_center;
+        let he = self.sim.workpiece_half_extent;
+        let start_world = Vector3::new(wc.x, wc.y, wc.z + he + 0.015);
+
+        // Position linear track for optimal reachability
+        let desired_track = (start_world.x - OPTIMAL_LOCAL_X)
+            .clamp(self.sim.linear_track.min_position, self.sim.linear_track.max_position);
+        self.sim.linear_track.position = desired_track;
+        self.sim.linear_track.target_position = desired_track;
+
+        let track_offset = Vector3::new(desired_track, 0.0, 0.0);
+        let start_local = start_world - track_offset;
+        let start_target = nalgebra::Isometry3::from_parts(
+            nalgebra::Translation3::from(start_local),
+            tool_down,
+        );
+
+        let seeds: &[[f64; 6]] = &[
+            [0.0, 0.8, -2.0, 0.0, pi2, 0.0],
+            [0.0, 0.9, -2.1, 0.0, pi2, 0.0],
+            [0.0, 1.0, -2.2, 0.0, pi2, 0.0],
+            [0.0, 0.7, -1.8, 0.0, pi2, 0.0],
+        ];
+
+        let mut best_angles: Option<Vec<f64>> = None;
+        let mut best_err = f64::MAX;
+        for seed in seeds {
+            let mut scratch = self.sim.arm.clone();
+            scratch.set_joint_angles(&seed.to_vec());
+            let (ok, _, final_err) = self.sim.ik_solver.solve_weighted(&mut scratch, &start_target, 0.5);
+            if !ok || scratch.joints[2].angle > 0.0 { continue; }
+            if final_err < best_err {
+                best_err = final_err;
+                best_angles = Some(scratch.joint_angles());
+            }
+        }
+
+        if let Some(angles) = best_angles {
+            self.sim.arm.set_joint_angles(&angles);
+            self.sim.joint_targets = angles;
+            for j in self.sim.arm.joints.iter_mut() { j.velocity = 0.0; }
+            self.sim.cartesian_target = nalgebra::Isometry3::from_parts(
+                nalgebra::Translation3::from(start_world),
+                tool_down,
+            );
         }
     }
 
@@ -1321,8 +1480,14 @@ impl App {
 
         // 1) Sync mesh: take the N nearest dirty chunks and mesh them NOW.
         //    This adds ~2-4ms per frame but the cuts appear instantly.
+        //    During timelapse, throttle to every 6th frame (~10fps mesh updates).
+        let mesh_budget = if self.timelapse_active && self.timelapse_mesh_counter % 6 != 0 {
+            0
+        } else {
+            SYNC_MESH_BUDGET
+        };
         let sync_coords =
-            self.sim.workpiece.take_nearest_dirty(tool_local_pos, SYNC_MESH_BUDGET);
+            self.sim.workpiece.take_nearest_dirty(tool_local_pos, mesh_budget);
         for coord in &sync_coords {
             if let Some(mesh) = mesh_chunk(&self.sim.workpiece, *coord) {
                 let c = (mesh.coord.x, mesh.coord.y, mesh.coord.z);
@@ -1339,8 +1504,11 @@ impl App {
 
         // 2) Async submit: remaining dirty chunks go to background workers,
         //    sorted nearest-first so the most visible ones complete soonest.
-        self.async_mesher
-            .submit_dirty_prioritized(&mut self.sim.workpiece, tool_local_pos);
+        //    During timelapse, only submit on mesh frames to avoid flooding workers.
+        if !self.timelapse_active || self.timelapse_mesh_counter % 6 == 0 {
+            self.async_mesher
+                .submit_dirty_prioritized(&mut self.sim.workpiece, tool_local_pos);
+        }
 
         // 3) Upload completed meshes from background workers (previous frame's work).
         let async_meshes = self.async_mesher.poll_completed();
@@ -1419,7 +1587,7 @@ impl App {
             });
             pass.set_pipeline(&shadow.pipeline);
 
-            let draw_arm_shadow = self.sim.mode != SimMode::Preview;
+            let draw_arm_shadow = self.sim.mode != SimMode::Preview || self.timelapse_active;
             let mut si = 0usize; // shadow matrix index
 
             // Workpiece (single merged buffer, 1 draw call)
@@ -1573,7 +1741,8 @@ impl App {
             }
 
             // In preview mode, skip arm/tool/base/track — show only workpiece + ground + stand
-            let draw_arm = self.sim.mode != SimMode::Preview;
+            // Exception: show arm during timelapse playback
+            let draw_arm = self.sim.mode != SimMode::Preview || self.timelapse_active;
 
             // 3) Arm links
             if draw_arm {
@@ -1889,12 +2058,28 @@ impl App {
                     self.speed_multiplier = SPEED_PRESETS[next_idx];
                 }
                 ui::UiAction::PreviewCarve => {
-                    self.preview_carve_to_target();
+                    if self.timelapse_enabled {
+                        // Toggle timelapse playback (same as Space)
+                        if self.timelapse_active {
+                            self.timelapse_active = false;
+                        } else {
+                            self.timelapse_active = true;
+                            if self.timelapse_elapsed == 0.0 {
+                                self.timelapse_mesh_counter = 0;
+                                self.timelapse_preposition_arm();
+                            }
+                        }
+                    } else {
+                        self.preview_carve_to_target();
+                    }
                 }
                 ui::UiAction::PreviewSetTarget(t) => {
                     self.preview_target = t;
                 }
                 ui::UiAction::PreviewReset => {
+                    self.timelapse_active = false;
+                    self.timelapse_elapsed = 0.0;
+                    self.timelapse_mesh_counter = 0;
                     if let Some(carver) = &mut self.preview_carver {
                         std::mem::swap(&mut self.sim.workpiece, &mut carver.workpiece);
                         carver.reset();
@@ -1902,6 +2087,14 @@ impl App {
                         self.preview_target = carver.total_commands();
                         self.chunk_meshes = ChunkMeshManager::new();
                     }
+                }
+                ui::UiAction::PreviewToggleTimelapse => {
+                    self.timelapse_enabled = !self.timelapse_enabled;
+                    eprintln!("Timelapse: {}", if self.timelapse_enabled { "ON" } else { "OFF" });
+                }
+                ui::UiAction::PreviewSetDuration(d) => {
+                    self.timelapse_duration = d;
+                    eprintln!("Timelapse duration: {:.0}s", d);
                 }
                 ui::UiAction::PreviewSetCoarseness(c) => {
                     self.preview_coarseness = c;
@@ -1978,9 +2171,13 @@ impl App {
             .map_or(0.0, |s| s.estimated_total_time);
 
         let preview_carving = self.preview_rx.is_some();
-        let preview_elapsed = self.preview_carve_start
-            .map(|t| t.elapsed().as_secs_f64())
-            .unwrap_or(0.0);
+        let preview_elapsed = if self.timelapse_active || self.timelapse_elapsed > 0.0 {
+            self.timelapse_elapsed
+        } else {
+            self.preview_carve_start
+                .map(|t| t.elapsed().as_secs_f64())
+                .unwrap_or(0.0)
+        };
         let (preview_current, preview_total, preview_cuts, preview_done) = match &self.preview_carver {
             Some(c) => (c.current_command(), c.total_commands(), c.cut_count(), c.current_command() > 0),
             None => (0, 0, 0, false),
@@ -2053,6 +2250,9 @@ impl App {
             preview_eta,
             preview_coarseness: self.preview_coarseness,
             preview_tool_radius_mm: self.preview_tool_radius_mm,
+            timelapse_enabled: self.timelapse_enabled,
+            timelapse_active: self.timelapse_active,
+            timelapse_duration: self.timelapse_duration,
         }
     }
 
@@ -2506,7 +2706,23 @@ impl ApplicationHandler for App {
                     match logical_key.as_ref() {
                         Key::Named(NamedKey::Space) => {
                             if self.sim.mode == SimMode::Preview {
-                                self.preview_carve_to_target();
+                                if self.timelapse_enabled {
+                                    // Toggle timelapse playback
+                                    if self.timelapse_active {
+                                        self.timelapse_active = false;
+                                        eprintln!("Timelapse paused");
+                                    } else {
+                                        self.timelapse_active = true;
+                                        if self.timelapse_elapsed == 0.0 {
+                                            self.timelapse_mesh_counter = 0;
+                                            // Pre-position the arm for timelapse start
+                                            self.timelapse_preposition_arm();
+                                        }
+                                        eprintln!("Timelapse playing ({:.0}s)", self.timelapse_duration);
+                                    }
+                                } else {
+                                    self.preview_carve_to_target();
+                                }
                             } else if self.sim.mode == SimMode::Carving {
                                 // Toggle carving session start/pause
                                 if let Some(session) = &mut self.sim.carving {
@@ -2529,6 +2745,8 @@ impl ApplicationHandler for App {
                         Key::Named(NamedKey::Escape) => {
                             if self.sim.mode == SimMode::Preview {
                                 // Exit preview mode instead of quitting
+                                self.timelapse_active = false;
+                                self.timelapse_elapsed = 0.0;
                                 self.preview_carver = None;
                                 self.sim.mode = SimMode::Manual;
                                 self.sim.paused = true;
@@ -2625,6 +2843,8 @@ impl ApplicationHandler for App {
                         Key::Character("p") | Key::Character("P") => {
                             if self.sim.mode == SimMode::Preview {
                                 // Exit preview: carved workpiece already in sim.workpiece, just drop carver
+                                self.timelapse_active = false;
+                                self.timelapse_elapsed = 0.0;
                                 self.preview_carver = None;
                                 self.sim.mode = SimMode::Manual;
                                 self.sim.paused = true;
@@ -2733,6 +2953,11 @@ impl ApplicationHandler for App {
                         );
                         // Swap carved workpiece back into sim
                         std::mem::swap(&mut self.sim.workpiece, &mut carver.workpiece);
+                        // Remove thin SDF shells (floating plane artifacts)
+                        let removed = self.sim.workpiece.remove_thin_shells();
+                        if removed > 0 {
+                            eprintln!("  Cleaned {} thin shell voxels", removed);
+                        }
                         self.preview_carver = Some(carver);
                         self.preview_rx = None;
                         self.preview_carve_start = None;
@@ -2740,6 +2965,11 @@ impl ApplicationHandler for App {
                         // Clear mesh cache so all chunks rebuild
                         self.chunk_meshes = ChunkMeshManager::new();
                     }
+                }
+
+                // Timelapse: advance carver + arm each frame (kinematic, no physics)
+                if self.timelapse_active {
+                    self.timelapse_step(clamped_frame_time);
                 }
 
                 // Carving mode: advance the carving session and set targets
@@ -2925,8 +3155,9 @@ impl ApplicationHandler for App {
                 // Request next frame, but throttle when idle
                 let has_pending_meshes = !self.sim.workpiece.dirty_chunks.is_empty();
                 let preview_busy = self.preview_rx.is_some();
+                let timelapse_busy = self.timelapse_active;
                 if let Some(window) = &self.window {
-                    if sim_active || has_pending_meshes || preview_busy {
+                    if sim_active || has_pending_meshes || preview_busy || timelapse_busy {
                         window.request_redraw();
                     } else {
                         // Idle: cap at ~30fps to save CPU/GPU
