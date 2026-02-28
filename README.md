@@ -1,5 +1,7 @@
 # SimuForge-Stone
 
+![SimuForge-Stone](progress-screenshots/simuforge_thumnail_viedo_2.jpg)
+
 ![Rust](https://img.shields.io/badge/Rust-000000?style=flat&logo=rust&logoColor=white)
 ![wgpu](https://img.shields.io/badge/wgpu-4B8BBE?style=flat)
 ![nalgebra](https://img.shields.io/badge/nalgebra-f64-blue?style=flat)
@@ -7,9 +9,9 @@
 ![Vulkan](https://img.shields.io/badge/Vulkan-AC162C?style=flat&logo=vulkan&logoColor=white)
 ![License](https://img.shields.io/badge/License-Apache_2.0-green?style=flat)
 
-A fully custom digital twin platform simulating a 6DOF robot arm carving stone sculptures. Physics engine, material simulation, and renderer are all built from scratch in Rust. No game engine, no ECS, no external physics library.
+A fully agentic digital twin CNC simulation — a 6DOF robot arm carving stone sculptures, built entirely from scratch in Rust with zero human code. Physics engine, material simulation, and renderer are all custom. No game engine, no ECS, no external physics library.
 
-The first validated use case is a NEMA-stepper-driven articulated arm carving a marble bust of Alexander the Great from a 1ft block. The platform generalizes to any robot arm and any subtractive manufacturing process.
+Every line of code was written by Claude Opus 4.6 via voice-to-AI, with the human directing architecture and design decisions. The first validated use case is a NEMA-stepper-driven articulated arm carving a marble bust of Alexander the Great from a 1ft block — 1.3M+ tool cuts with real-time SDF boolean subtraction at 0.5mm resolution.
 
 See [`refs/`](refs/) for the original design conversation and research notes that led to this architecture.
 
@@ -44,10 +46,11 @@ Physics runs at a **1 kHz fixed timestep** on the CPU. Rendering is decoupled at
 | `core` | Shared types, DH parameters, coordinate conversions (nalgebra <-> glam) |
 | `physics` | Featherstone ABA, spatial vectors, revolute joints, robot arm model |
 | `motors` | Stepper motor speed-torque curves, planetary gearboxes, PID controllers |
-| `material` | Sparse octree SDF (Sd8 leaves), CSG subtraction, chunk-based surface nets meshing |
+| `material` | Sparse octree SDF (i16 quantized), CSG subtraction, async surface nets meshing, Fast Sweeping redistancing |
 | `cutting` | Specific cutting energy model for stone, tool geometry (ball nose, flat, tapered) |
 | `control` | Damped least-squares IK, trapezoidal trajectory planner, G-code interpreter |
 | `render` | wgpu Vulkan renderer: PBR, shadow maps, SSAO, subsurface scattering, compositing |
+| `carver` | Direct G-code → SDF carving engine (batch processing, G-code → STL export) |
 | `sim` | Main binary: simulation loop, state orchestration, Cartesian IK control, overlays |
 
 ## Dependencies
@@ -117,24 +120,27 @@ Requires Vulkan-capable GPU. Tested on Ubuntu 24.04 with standard Mesa/NVIDIA dr
 
 ## Current Status
 
-Phase 1 and Phase 2 are complete. Phase 3 is in progress.
-
 **Done:**
 - Featherstone ABA with reflected motor inertia
 - RNEA gravity compensation
 - PID position control with motor/gearbox chain
-- Sparse octree SDF with CSG subtraction and chunk-based surface nets meshing
+- Sparse octree SDF (i16 quantized) with CSG subtraction and chunk-based surface nets meshing
+- Async multi-threaded chunk meshing with prioritized dirty-chunk processing
+- SDF redistancing (connectivity cleanup + Fast Sweeping Eikonal solver)
 - Cutting force model (specific cutting energy for marble)
 - wgpu PBR renderer with shadow maps, SSAO, SSS, and ACES tonemapping
 - Cartesian IK control (WASD/QE moves a target point, arm follows via damped least-squares IK)
-- Real-time overlay (joint angles, torques, tool position, IK status, cutting force)
-- 41 tests across all crates, all passing
+- G-code interpreter with full toolpath execution and A-axis rotary table support
+- Timelapse preview mode with speed ramping and trail visualization
+- Direct carving pipeline: G-code → STL conversion for fast result preview
+- Linear track for extended workspace reach
+- egui overlay (joint angles, torques, tool position, IK status, cutting force)
+- 53 tests across all crates, all passing
 
 **Remaining:**
-- G-code toolpath execution (interpreter exists, not yet wired to sim loop)
-- Rotary table integration (A-axis, modeled but not yet driven)
 - Auto-toolpath generation from STL (slice + roughing + finishing passes)
-- Alexander bust carving end-to-end validation
+- Multi-tool support and automatic tool changes
+- Physical build validation against simulation
 
 ## Project Vision
 
