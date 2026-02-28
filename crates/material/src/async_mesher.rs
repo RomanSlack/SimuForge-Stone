@@ -214,8 +214,18 @@ impl AsyncMesher {
                         for req in batch {
                             let tx = tx.clone();
                             s.spawn(move |_| {
+                                let coord = req.coord;
                                 if let Some(mesh) = mesh_from_snapshot(&req) {
                                     let _ = tx.send(mesh);
+                                } else {
+                                    // Chunk is now empty — send an empty mesh so the
+                                    // caller removes stale geometry from the GPU buffer.
+                                    let _ = tx.send(ChunkMesh {
+                                        coord,
+                                        positions: Vec::new(),
+                                        normals: Vec::new(),
+                                        indices: Vec::new(),
+                                    });
                                 }
                             });
                         }

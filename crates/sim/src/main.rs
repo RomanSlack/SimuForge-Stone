@@ -1600,8 +1600,8 @@ impl App {
         let sync_coords =
             self.sim.workpiece.take_nearest_dirty(tool_local_pos, mesh_budget);
         for coord in &sync_coords {
+            let c = (coord.x, coord.y, coord.z);
             if let Some(mesh) = mesh_chunk(&self.sim.workpiece, *coord) {
-                let c = (mesh.coord.x, mesh.coord.y, mesh.coord.z);
                 self.chunk_meshes.upload_chunk(
                     &ctx.device,
                     &ctx.queue,
@@ -1609,6 +1609,12 @@ impl App {
                     &mesh.positions,
                     &mesh.normals,
                     &mesh.indices,
+                );
+            } else {
+                // Chunk is now empty — remove its stale mesh from the GPU buffer.
+                // Without this, old geometry persists as floating planes.
+                self.chunk_meshes.upload_chunk(
+                    &ctx.device, &ctx.queue, c, &[], &[], &[],
                 );
             }
         }
