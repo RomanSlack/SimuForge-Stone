@@ -8,19 +8,19 @@ use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::Path;
 
-/// Quantized signed distance: i8 maps to [-1.0, 1.0] range scaled by cell size.
+/// Quantized signed distance: i16 maps to [-1.0, 1.0] range scaled by cell size.
 /// Negative = inside, Positive = outside, 0 ≈ surface.
-pub type Sd8 = i8;
+pub type Sd8 = i16;
 
 /// Convert f32 SDF value to quantized Sd8, given the cell size for scaling.
 pub fn quantize_sdf(value: f32, cell_size: f32) -> Sd8 {
     let normalized = (value / cell_size).clamp(-1.0, 1.0);
-    (normalized * 127.0) as i8
+    (normalized * 32767.0) as i16
 }
 
 /// Convert quantized Sd8 back to f32 SDF value.
 pub fn dequantize_sdf(value: Sd8, cell_size: f32) -> f32 {
-    (value as f32 / 127.0) * cell_size
+    (value as f32 / 32767.0) * cell_size
 }
 
 /// Octree node.
@@ -110,6 +110,8 @@ pub struct OctreeSdf {
     pub chunks: std::collections::HashMap<ChunkCoord, LeafData>,
     /// Set of chunks that have been modified and need remeshing.
     pub dirty_chunks: HashSet<ChunkCoord>,
+    /// Set of chunks directly carved by subtract() (excludes neighbor notifications).
+    pub carved_chunks: HashSet<ChunkCoord>,
     /// Grid extents in chunks (min inclusive).
     pub grid_min: [i32; 3],
     /// Grid extents in chunks (max exclusive).
@@ -144,7 +146,7 @@ impl OctreeSdf {
                     let coord = ChunkCoord::new(cx, cy, cz);
                     let origin = coord.world_origin(cell_size);
 
-                    let mut leaf = LeafData::uniform(127); // default: outside
+                    let mut leaf = LeafData::uniform(32767); // default: outside
 
                     let mut has_surface = false;
                     let mut all_inside = true;
@@ -195,6 +197,7 @@ impl OctreeSdf {
             cell_size,
             chunks,
             dirty_chunks: dirty,
+            carved_chunks: HashSet::new(),
             grid_min,
             grid_max,
         }
@@ -283,7 +286,7 @@ impl OctreeSdf {
                             for lx in lx_min..lx_max {
                                 let old_q = leaf.get(lx, ly, lz);
                                 // Skip voxels already fully outside (air)
-                                if old_q >= 126 {
+                                if old_q >= 32766 {
                                     continue;
                                 }
 
@@ -315,6 +318,7 @@ impl OctreeSdf {
 
                     if modified {
                         self.dirty_chunks.insert(coord);
+                        self.carved_chunks.insert(coord);
                         // Only dirty face-adjacent neighbors whose shared boundary
                         // actually had voxels modified.
                         const FACE_OFFSETS: [(i32, i32, i32); 6] = [
@@ -406,38 +410,6 @@ impl OctreeSdf {
         coords
     }
 
-    /// Clamp this SDF so no voxel is more "inside" than the ground truth.
-    ///
-    /// For each dirty chunk, sets `voxel = max(voxel, ground_truth_voxel)`.
-    /// This eliminates floating material artifacts: any voxel that should be air
-    /// in the final carved result cannot persist as material in intermediate frames.
-    pub fn clamp_to_ground_truth(&mut self, ground_truth: &OctreeSdf) {
-        let dirty: Vec<ChunkCoord> = self.dirty_chunks.iter().copied().collect();
-        for coord in dirty {
-            let current = match self.chunks.get_mut(&coord) {
-                Some(c) => c,
-                None => continue,
-            };
-            if let Some(gt) = ground_truth.chunks.get(&coord) {
-                for i in 0..CHUNK_VOXELS {
-                    let cv = current.values[i];
-                    let gv = gt.values[i];
-                    // max: push toward "outside" (positive) — can't be more inside than ground truth
-                    if gv > cv {
-                        current.values[i] = gv;
-                    }
-                }
-            }
-            // If ground truth has no chunk here (all air), the entire chunk is outside
-            // in the final result — clear it to air.
-            else {
-                for i in 0..CHUNK_VOXELS {
-                    current.values[i] = 127;
-                }
-            }
-        }
-    }
-
     /// Number of stored chunks.
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
@@ -455,8 +427,8 @@ impl OctreeSdf {
 
     /// Save the SDF to a binary file.
     ///
-    /// Format: "SDF1" magic (4B) + cell_size f32 LE (4B) + num_chunks u32 LE (4B)
-    /// + per chunk: x,y,z as i32 LE (12B) + values [i8; 32768].
+    /// Format: "SDF2" magic (4B) + cell_size f32 LE (4B) + num_chunks u32 LE (4B)
+    /// + per chunk: x,y,z as i32 LE (12B) + values [i16; 32768] (65536 bytes LE).
     pub fn save_binary(&self, path: &Path) {
         let mut file = std::fs::File::create(path).expect("Failed to create SDF file");
 
@@ -466,7 +438,7 @@ impl OctreeSdf {
             a.z.cmp(&b.z).then(a.y.cmp(&b.y)).then(a.x.cmp(&b.x))
         });
 
-        file.write_all(b"SDF1").unwrap();
+        file.write_all(b"SDF2").unwrap();
         file.write_all(&self.cell_size.to_le_bytes()).unwrap();
         file.write_all(&(coords.len() as u32).to_le_bytes()).unwrap();
 
@@ -475,9 +447,9 @@ impl OctreeSdf {
             file.write_all(&coord.x.to_le_bytes()).unwrap();
             file.write_all(&coord.y.to_le_bytes()).unwrap();
             file.write_all(&coord.z.to_le_bytes()).unwrap();
-            // Safety: Sd8 is i8, same layout as u8 for byte writing
+            // Safety: Sd8 is i16, 2 bytes per value in native endian
             let bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(leaf.values.as_ptr() as *const u8, CHUNK_VOXELS)
+                std::slice::from_raw_parts(leaf.values.as_ptr() as *const u8, CHUNK_VOXELS * 2)
             };
             file.write_all(bytes).unwrap();
         }
@@ -489,7 +461,7 @@ impl OctreeSdf {
 
         let mut magic = [0u8; 4];
         file.read_exact(&mut magic).unwrap();
-        assert_eq!(&magic, b"SDF1", "Invalid SDF file magic");
+        assert_eq!(&magic, b"SDF2", "Invalid SDF file magic (expected SDF2 for i16 format)");
 
         let mut buf4 = [0u8; 4];
         file.read_exact(&mut buf4).unwrap();
@@ -509,9 +481,9 @@ impl OctreeSdf {
             let y = i32::from_le_bytes([buf12[4], buf12[5], buf12[6], buf12[7]]);
             let z = i32::from_le_bytes([buf12[8], buf12[9], buf12[10], buf12[11]]);
 
-            let mut values = Box::new([0i8; CHUNK_VOXELS]);
+            let mut values = Box::new([0i16; CHUNK_VOXELS]);
             let bytes: &mut [u8] = unsafe {
-                std::slice::from_raw_parts_mut(values.as_mut_ptr() as *mut u8, CHUNK_VOXELS)
+                std::slice::from_raw_parts_mut(values.as_mut_ptr() as *mut u8, CHUNK_VOXELS * 2)
             };
             file.read_exact(bytes).unwrap();
 
@@ -530,6 +502,7 @@ impl OctreeSdf {
             cell_size,
             chunks,
             dirty_chunks: HashSet::new(),
+            carved_chunks: HashSet::new(),
             grid_min,
             grid_max,
         }

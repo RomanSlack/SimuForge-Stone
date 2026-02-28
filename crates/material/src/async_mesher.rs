@@ -103,6 +103,9 @@ fn mesh_from_snapshot(req: &MeshRequest) -> Option<ChunkMesh> {
                 }
             }
 
+            let bias = cs * 0.15;
+            for v in grid.iter_mut() { *v -= bias; }
+
             surface_nets(
                 &grid,
                 &PaddedShape {},

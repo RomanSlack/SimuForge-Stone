@@ -842,10 +842,10 @@ struct App {
     timelapse_mesh_counter: u32,
     timelapse_ramp_enabled: bool,
     timelapse_trail_enabled: bool,
+    /// Commands processed since last redistancing pass.
+    redistance_cmd_counter: usize,
     trail_points: Vec<([f32; 3], f64)>,
     trail_pipeline: Option<LinePipeline>,
-    /// Pre-carved ground truth SDF for artifact clamping during timelapse.
-    ground_truth_sdf: Option<OctreeSdf>,
 }
 
 impl App {
@@ -923,9 +923,9 @@ impl App {
             timelapse_mesh_counter: 0,
             timelapse_ramp_enabled: true,
             timelapse_trail_enabled: true,
+            redistance_cmd_counter: 0,
             trail_points: Vec::new(),
             trail_pipeline: None,
-            ground_truth_sdf: None,
         }
     }
 
@@ -1109,9 +1109,14 @@ impl App {
         carver.carve_batch(commands_this_frame);
         std::mem::swap(&mut self.sim.workpiece, &mut carver.workpiece);
 
-        // Clamp dirty voxels against ground truth — eliminates floating artifacts
-        if let Some(gt) = &self.ground_truth_sdf {
-            self.sim.workpiece.clamp_to_ground_truth(gt);
+        // Periodically redistance the SDF to fix corruption from repeated max() CSG.
+        // Every ~500 carve commands, run a Fast Sweeping pass that recomputes proper
+        // signed distances from zero-crossings, eliminating isolated negative pockets
+        // (the source of floating geometry artifacts).
+        self.redistance_cmd_counter += commands_this_frame;
+        if self.redistance_cmd_counter >= 500 {
+            self.redistance_cmd_counter = 0;
+            simuforge_material::redistance::redistance(&mut self.sim.workpiece);
         }
 
         // Read carver state
@@ -1229,6 +1234,9 @@ impl App {
         // Check completion
         if carver.current_command() >= total {
             self.timelapse_active = false;
+            // Final redistance pass to clean up any remaining SDF corruption
+            simuforge_material::redistance::redistance(&mut self.sim.workpiece);
+            self.redistance_cmd_counter = 0;
             eprintln!("Timelapse complete: {} commands in {:.1}s", total, self.timelapse_elapsed);
         }
     }
@@ -1290,37 +1298,6 @@ impl App {
     /// Pre-carve the entire G-code to produce a ground truth SDF.
     /// This runs all carving commands without rendering, then stores the result
     /// so timelapse frames can clamp artifacts against the known final shape.
-    fn precompute_ground_truth(&mut self) {
-        let carver = match &mut self.preview_carver {
-            Some(c) => c,
-            None => return,
-        };
-        let target = self.preview_target.min(carver.total_commands());
-        eprintln!("Pre-carving ground truth ({} commands)...", target);
-        let t0 = std::time::Instant::now();
-
-        // Build a temporary carver clone, carve everything, steal its workpiece
-        let saved_cmd = carver.current_command();
-        std::mem::swap(&mut self.sim.workpiece, &mut carver.workpiece);
-        carver.carve_to(target);
-        // The carver's workpiece is now fully carved — clone it as ground truth
-        let gt = carver.workpiece.clone();
-        // Reset carver back to where it was
-        carver.carve_to(0); // reset
-        if saved_cmd > 0 {
-            carver.carve_to(saved_cmd);
-        }
-        std::mem::swap(&mut self.sim.workpiece, &mut carver.workpiece);
-
-        // Clear dirty chunks from the ground truth (it's read-only reference data)
-        let mut ground_truth = gt;
-        ground_truth.dirty_chunks.clear();
-
-        eprintln!("Ground truth ready: {} chunks in {:.1}s",
-            ground_truth.chunk_count(), t0.elapsed().as_secs_f64());
-        self.ground_truth_sdf = Some(ground_truth);
-    }
-
     /// Initialize the line pipeline (for toolpath visualization).
     fn init_line_pipeline(&mut self) {
         if self.line_pipeline.is_some() {
@@ -2254,7 +2231,6 @@ impl App {
                             if self.timelapse_elapsed == 0.0 {
                                 self.timelapse_mesh_counter = 0;
                                 self.trail_points.clear();
-                                self.precompute_ground_truth();
                                 self.timelapse_preposition_arm();
                             }
                         }
@@ -2269,8 +2245,8 @@ impl App {
                     self.timelapse_active = false;
                     self.timelapse_elapsed = 0.0;
                     self.timelapse_mesh_counter = 0;
+                    self.redistance_cmd_counter = 0;
                     self.trail_points.clear();
-                    self.ground_truth_sdf = None;
                     if let Some(carver) = &mut self.preview_carver {
                         std::mem::swap(&mut self.sim.workpiece, &mut carver.workpiece);
                         carver.reset();
@@ -2918,7 +2894,6 @@ impl ApplicationHandler for App {
                                         if self.timelapse_elapsed == 0.0 {
                                             self.timelapse_mesh_counter = 0;
                                             self.trail_points.clear();
-                                            self.precompute_ground_truth();
                                             // Pre-position the arm for timelapse start
                                             self.timelapse_preposition_arm();
                                         }

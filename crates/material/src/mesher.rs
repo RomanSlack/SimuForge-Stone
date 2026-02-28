@@ -62,6 +62,10 @@ pub fn mesh_chunk(sdf: &OctreeSdf, coord: ChunkCoord) -> Option<ChunkMesh> {
 
         fill_padded_grid(sdf, coord, leaf, grid);
 
+        // Small inward bias to close chunk boundary gaps from surface nets padding.
+        let bias = sdf.cell_size * 0.15;
+        for v in grid.iter_mut() { *v -= bias; }
+
         // Run surface nets (internally calls reset() on sn_buffer to clear+reuse)
         surface_nets(
             grid,
@@ -224,6 +228,9 @@ pub fn mesh_chunk_lod1(sdf: &OctreeSdf, coord: ChunkCoord) -> Option<ChunkMesh> 
                 }
             }
         }
+
+        let bias = cs * 0.15;
+        for v in grid.iter_mut() { *v -= bias; }
 
         surface_nets(
             grid,
