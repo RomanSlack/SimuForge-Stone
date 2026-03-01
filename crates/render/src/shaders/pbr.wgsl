@@ -44,6 +44,16 @@ struct VertexOutput {
     @location(2) object_pos: vec3<f32>,
 };
 
+// Cofactor matrix: correct normal transform under non-uniform scaling.
+// After normalization this equals inverse-transpose, which preserves surface perpendicularity.
+fn cofactor_mat3(m: mat3x3<f32>) -> mat3x3<f32> {
+    return mat3x3<f32>(
+        cross(m[1], m[2]),
+        cross(m[2], m[0]),
+        cross(m[0], m[1])
+    );
+}
+
 @vertex
 fn vs_main(in: VertexInput) -> VertexOutput {
     var out: VertexOutput;
@@ -51,13 +61,13 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     out.clip_position = camera.view_proj * world_pos;
     out.world_pos = world_pos.xyz;
     out.object_pos = in.position;
-    // Transform normal by the upper-left 3x3 of model matrix
-    let normal_matrix = mat3x3<f32>(
+    // Transform normal by cofactor (= inverse-transpose up to scale) of model 3x3
+    let model3 = mat3x3<f32>(
         material.model[0].xyz,
         material.model[1].xyz,
         material.model[2].xyz,
     );
-    out.world_normal = normalize(normal_matrix * in.normal);
+    out.world_normal = normalize(cofactor_mat3(model3) * in.normal);
     return out;
 }
 

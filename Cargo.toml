@@ -10,6 +10,8 @@ members = [
     "crates/render",
     "crates/sim",
     "crates/carver",
+    "crates/audio",
+    "crates/pingpong",
 ]
 
 [workspace.dependencies]
@@ -23,3 +25,4 @@ rayon = "1"
 egui = "0.31"
 egui-wgpu = "0.31"
 egui-winit = "0.31"
+cpal = "0.15"
