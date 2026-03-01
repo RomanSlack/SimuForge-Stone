@@ -19,10 +19,13 @@ pub const TABLE_HEIGHT: f64 = 0.76;
 /// Player 1 at -1.5m, Player 2 at +1.5m.
 pub const ARM_X_OFFSET: f64 = 1.5;
 
-/// Paddle half-extents for collision (m). Standard paddle is ~15cm diameter.
-pub const PADDLE_RADIUS: f64 = 0.075;
+/// Paddle collision radius (m). Matches head semi-diagonal (~8.5cm).
+pub const PADDLE_RADIUS: f64 = 0.085;
 /// Paddle thickness (m).
 pub const PADDLE_THICKNESS: f64 = 0.008;
+/// Offset from end-effector (grip) to paddle face center along FK X (m).
+/// = handle_length + head_height / 2 = 0.10 + 0.085
+pub const PADDLE_FACE_OFFSET: f64 = 0.185;
 
 /// Arm link rendering radii (m).
 pub const ARM_LINK_RADII: [f32; 5] = [0.05, 0.04, 0.035, 0.03, 0.025];

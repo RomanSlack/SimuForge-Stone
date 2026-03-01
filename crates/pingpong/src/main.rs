@@ -77,7 +77,11 @@ fn link_model(from: Vec3, to: Vec3, radius: f32) -> Mat4 {
 /// Extract paddle state from a player arm for collision detection.
 fn paddle_state_from_arm(player: &PlayerArm, player_id: u8) -> collision::PaddleState {
     let fk = player.arm.forward_kinematics();
-    let pos = fk.translation.vector + player.base_position;
+    let fk_x = fk.rotation * Vector3::x();
+    // Face center is offset from end-effector along FK X (handle sticks out sideways)
+    let face_center = fk.translation.vector + player.base_position
+        + fk_x * arm_config::PADDLE_FACE_OFFSET;
+    // Face normal points along FK Z (along the arm's last link direction)
     let normal = fk.rotation * Vector3::z();
     // Estimate paddle velocity from end-effector Jacobian * joint velocities
     let jac = player.arm.jacobian();
@@ -90,7 +94,7 @@ fn paddle_state_from_arm(player: &PlayerArm, player_id: u8) -> collision::Paddle
     let ang_vel = Vector3::new(v_full[0], v_full[1], v_full[2]);
 
     collision::PaddleState {
-        position: pos,
+        position: face_center,
         normal,
         velocity: vel,
         angular_velocity: ang_vel,
@@ -168,14 +172,20 @@ impl PlayerArm {
         player
     }
 
-    /// Run one physics step.
     /// Update joint targets to track a world-space position using IK.
+    /// The target is where the paddle **face center** should be.
+    /// We offset by the paddle face offset along FK X so IK solves for the wrist.
     fn track_position(&mut self, world_target: Vector3<f64>) {
-        // Convert world target to arm-local frame
-        let local_target = world_target - self.base_position;
-
+        // Use current FK X direction to estimate where the wrist should be
+        // so the paddle face center ends up at world_target.
         let mut scratch = self.arm.clone();
         scratch.set_joint_angles(&self.joint_targets);
+        let fk = scratch.forward_kinematics();
+        let fk_x = fk.rotation * Vector3::x();
+        let wrist_target = world_target - fk_x * arm_config::PADDLE_FACE_OFFSET;
+
+        // Convert to arm-local frame
+        let local_target = wrist_target - self.base_position;
 
         let (converged, _, _) = self.ik_solver.solve_position(&mut scratch, &local_target);
         if converged {
@@ -438,9 +448,9 @@ impl App {
         // Paddle mesh: +Y = handle direction, +Z = face normal, +X = face width.
         // Desired orientation:
         //   Handle (paddle +Y) → FK X (sticks out sideways from arm)
-        //   Face normal (paddle +Z) → FK Y (face forward, swingable via wrist roll)
-        //   Face width (paddle +X) → FK Z (along arm segment)
-        let rot_mat = Mat3::from_cols(render_fk_z, render_fk_x, render_fk_y);
+        //   Face normal (paddle +Z) → FK Z (perpendicular to arm = hitting direction)
+        //   Face width (paddle +X) → -FK Y (right-handed frame)
+        let rot_mat = Mat3::from_cols(-render_fk_y, render_fk_x, render_fk_z);
         let rot = Quat::from_mat3(&rot_mat);
 
         Mat4::from_rotation_translation(rot, render_pos)
