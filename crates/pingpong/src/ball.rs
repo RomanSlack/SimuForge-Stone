@@ -12,8 +12,8 @@ pub const BALL_INERTIA: f64 = 2.0 / 3.0 * BALL_MASS * BALL_RADIUS * BALL_RADIUS;
 
 /// Drag coefficient for a smooth sphere.
 pub const DRAG_CD: f64 = 0.40;
-/// Magnus coefficient.
-pub const MAGNUS_CL: f64 = 0.60;
+/// Magnus coefficient (realistic for ping pong ball).
+pub const MAGNUS_CL: f64 = 0.12;
 /// Air density (kg/m^3).
 pub const AIR_DENSITY: f64 = 1.225;
 /// Cross-sectional area.
@@ -27,6 +27,8 @@ pub struct Ball {
     pub spin: Vector3<f64>,      // angular velocity (rad/s)
     pub active: bool,            // false = ball is dead/out-of-play
     pub floor_bounces: u32,      // ball dead after 3 floor bounces
+    /// X position of the last table bounce (for AI bounce-side tracking).
+    pub last_bounce_x: f64,
 }
 
 impl Ball {
@@ -37,6 +39,7 @@ impl Ball {
             spin: Vector3::zeros(),
             active: false,
             floor_bounces: 0,
+            last_bounce_x: 0.0,
         }
     }
 
@@ -47,6 +50,7 @@ impl Ball {
         self.spin = spin;
         self.active = true;
         self.floor_bounces = 0;
+        self.last_bounce_x = 0.0;
     }
 
     /// Compute net force on ball (gravity + drag + Magnus).

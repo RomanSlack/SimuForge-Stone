@@ -9,7 +9,7 @@ use simuforge_motors::gearbox::Gearbox;
 use simuforge_motors::pid::PidController;
 use simuforge_motors::servo::{ServoMotor, ServoState};
 use simuforge_physics::arm::RobotArm;
-use simuforge_physics::joint::RevoluteJoint;
+use simuforge_physics::joint::{LinearTrack, RevoluteJoint};
 use simuforge_physics::spatial::spatial_inertia;
 
 /// Table height in meters (standard ping pong table).
@@ -167,6 +167,18 @@ pub fn create_pid_controllers() -> Vec<PidController> {
         PidController::new(40.0, 8.0, 1.0, 80.0),     // J4: wrist pitch
         PidController::new(40.0, 8.0, 1.0, 80.0),     // J5: wrist roll
     ]
+}
+
+/// Create a linear rail for lateral movement (Y-axis in DH space).
+/// 8kg carriage, ±0.8m range covers full table width (1.525m).
+pub fn create_rail() -> LinearTrack {
+    let mut rail = LinearTrack::new(8.0);
+    rail.min_position = -0.8;
+    rail.max_position = 0.8;
+    rail.kp = 5000.0;
+    rail.kd = 300.0;
+    rail.max_velocity = 3.0;
+    rail
 }
 
 /// Paddle head dimensions for collision (keep original for physics).

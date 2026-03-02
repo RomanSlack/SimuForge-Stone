@@ -21,6 +21,7 @@ use simuforge_motors::pid::PidController;
 use simuforge_motors::servo::ServoState;
 use simuforge_physics::aba::{articulated_body_algorithm, gravity_compensation_rnea};
 use simuforge_physics::arm::RobotArm;
+use simuforge_physics::joint::LinearTrack;
 use simuforge_render::arm_visual::{generate_box, generate_cylinder, generate_sphere};
 use simuforge_render::camera::{CameraUniform, OrbitCamera};
 use simuforge_render::context::RenderContext;
@@ -128,9 +129,13 @@ struct PlayerArm {
     pid_controllers: Vec<PidController>,
     joint_targets: Vec<f64>,
     base_position: Vector3<f64>,
+    /// Linear rail for lateral (Y-axis) movement.
+    rail: LinearTrack,
     ai_controlled: bool,
     ai: ai::AiController,
     ik_solver: simuforge_control::ik::IkSolver,
+    /// Scratch arm for IK solving (avoids clone every call).
+    ik_scratch: RobotArm,
 }
 
 impl PlayerArm {
@@ -146,6 +151,7 @@ impl PlayerArm {
         };
 
         let player_id = if mirror { 2 } else { 1 };
+        let ik_scratch = arm.clone();
         let mut player = Self {
             arm,
             motors,
@@ -153,16 +159,18 @@ impl PlayerArm {
             pid_controllers,
             joint_targets: targets.clone(),
             base_position: base_pos,
+            rail: arm_config::create_rail(),
             ai_controlled: true,
             ai: ai::AiController::new(player_id),
             ik_solver: simuforge_control::ik::IkSolver {
                 damping: 0.05,
-                max_iterations: 30,
-                position_tolerance: 0.005,
+                max_iterations: 20, // reduced from 30 for perf
+                position_tolerance: 0.008,
                 orientation_tolerance: 0.02,
                 max_step: 0.3,
                 nullspace_gain: 0.3,
             },
+            ik_scratch,
         };
         player.arm.set_joint_angles(&targets);
         // Zero velocities
@@ -174,32 +182,42 @@ impl PlayerArm {
 
     /// Update joint targets to track a world-space position using IK.
     /// The target is where the paddle **face center** should be.
-    /// We offset by the paddle face offset along FK Y so IK solves for the wrist.
+    /// We offset by a FIXED paddle direction so the wrist target is stable
+    /// (using the rotating FK Y caused a feedback loop → scooping motion).
     fn track_position(&mut self, world_target: Vector3<f64>) {
-        // Use current FK Y direction to estimate where the wrist should be
-        // so the paddle face center ends up at world_target.
-        let mut scratch = self.arm.clone();
-        scratch.set_joint_angles(&self.joint_targets);
-        let fk = scratch.forward_kinematics();
-        let fk_y = fk.rotation * Vector3::y();
-        let wrist_target = world_target - fk_y * arm_config::PADDLE_FACE_OFFSET;
+        // Fixed paddle offset direction: FK Y is approximately ±Y for each player.
+        // P1 (theta_offset=0): FK Y ≈ +Y, P2 (theta_offset=π): FK Y ≈ -Y.
+        // Using a fixed direction prevents the wrist target from shifting every
+        // IK call as FK Y rotates with the arm.
+        let paddle_y_sign = if self.arm.dh_params[0].theta_offset.abs() > 1.0 {
+            1.0  // P2: FK Y ≈ (0, +1, 0) at ready position
+        } else {
+            -1.0 // P1: FK Y ≈ (0, -1, 0) at ready position
+        };
+        let fixed_fk_y = Vector3::new(0.0, paddle_y_sign, 0.0);
+        let wrist_target = world_target - fixed_fk_y * arm_config::PADDLE_FACE_OFFSET;
 
         // Convert to arm-local frame
         let local_target = wrist_target - self.base_position;
 
-        let (converged, _, _) = self.ik_solver.solve_position(&mut scratch, &local_target);
-        if converged {
-            let new_angles = scratch.joint_angles();
-            // Rate-limit joint deltas — generous for fast ping pong response
-            let max_delta = 0.25; // rad per frame at 60fps = 15 rad/s
-            for i in 0..self.joint_targets.len() {
-                let delta = (new_angles[i] - self.joint_targets[i]).clamp(-max_delta, max_delta);
-                self.joint_targets[i] += delta;
-            }
+        let (converged, _, _) = self.ik_solver.solve_position(&mut self.ik_scratch, &local_target);
+        let new_angles = self.ik_scratch.joint_angles();
+        // Rate-limit joint deltas — very generous for fast ping pong swings.
+        // Called at 200Hz, so 0.08 rad/call = 16 rad/s max joint velocity.
+        // Accept IK result even if not fully converged — partial progress is
+        // better than freezing in place.
+        let max_delta = if converged { 0.08 } else { 0.04 };
+        for i in 0..self.joint_targets.len() {
+            let delta = (new_angles[i] - self.joint_targets[i]).clamp(-max_delta, max_delta);
+            self.joint_targets[i] += delta;
         }
     }
 
     fn physics_step(&mut self) {
+        // Step rail and update base position
+        self.rail.step(PHYSICS_DT);
+        self.base_position.y = self.rail.position;
+
         let n = self.arm.num_joints();
         let gravity = Vector3::new(0.0, 0.0, -9.81);
 
@@ -257,6 +275,8 @@ struct App {
     // Game
     game: GameState,
     ball: ball::Ball,
+    /// Time the ball has been nearly stationary (for stall detection).
+    ball_stall_time: f64,
     // Timing
     last_frame: Instant,
     accumulator: f64,
@@ -353,6 +373,7 @@ impl App {
             player2: PlayerArm::new(true, p2_base),
             game: GameState::new(),
             ball: ball::Ball::new(),
+            ball_stall_time: 0.0,
             last_frame: Instant::now(),
             accumulator: 0.0,
             frame_count: 0,
@@ -1726,13 +1747,24 @@ impl ApplicationHandler for App {
                 match logical_key {
                     Key::Named(NamedKey::Escape) => event_loop.exit(),
                     Key::Named(NamedKey::Space) => {
-                        // Serve ball
+                        // Serve ball from the correct side
                         if !self.ball.active {
-                            let serve_pos = Vector3::new(-1.0, 0.0, table::TABLE_HEIGHT as f64 + 0.3);
-                            let serve_vel = Vector3::new(3.0, 0.2, 1.5);
-                            let topspin = Vector3::new(0.0, -50.0, 0.0);
+                            let (serve_x, serve_vx) = match self.game.serving {
+                                game::Player::Player1 => (-1.0, 3.0),
+                                game::Player::Player2 => (1.0, -3.0),
+                            };
+                            let server = match self.game.serving {
+                                game::Player::Player1 => &self.player1,
+                                game::Player::Player2 => &self.player2,
+                            };
+                            let rail_y = server.rail.position;
+                            let serve_pos = Vector3::new(serve_x, rail_y, table::TABLE_HEIGHT as f64 + 0.30);
+                            let serve_vel = Vector3::new(serve_vx, 0.0, 1.5);
+                            let topspin = Vector3::new(0.0, -10.0, 0.0);
                             self.ball.serve(serve_pos, serve_vel, topspin);
                             self.trail_points.clear();
+                            self.ball_stall_time = 0.0;
+                            self.game.last_table_bounce_side = None;
                             self.game.phase = game::GamePhase::Rally;
                         }
                     }
@@ -1848,32 +1880,34 @@ impl ApplicationHandler for App {
                 let frame_dt = raw_dt.min(MAX_FRAME_TIME);
                 self.last_frame = now;
 
-                // AI update (once per frame, before physics)
-                if !self.paused {
-                    // Player 1 AI
-                    if self.player1.ai_controlled {
-                        let target = self.player1.ai.update(&self.ball, frame_dt);
-                        self.player1.track_position(target);
-                    }
-                    // Player 2 AI
-                    if self.player2.ai_controlled {
-                        let target = self.player2.ai.update(&self.ball, frame_dt);
-                        self.player2.track_position(target);
-                    }
-                }
-
-                // Physics accumulator
+                // Physics accumulator with interleaved AI updates
                 if !self.paused {
                     self.accumulator += frame_dt;
-                    let max_steps = 200; // safety limit
+                    let max_steps = 80; // cap to ~80ms of physics per frame
                     let mut steps = 0;
+                    let ai_update_interval = 10; // AI + IK every 10 physics steps = 100Hz
                     while self.accumulator >= PHYSICS_DT && steps < max_steps {
+                        // AI + IK update at 200Hz (every 5 physics steps)
+                        if steps % ai_update_interval == 0 {
+                            let ai_dt = PHYSICS_DT * ai_update_interval as f64;
+                            if self.player1.ai_controlled {
+                                let target = self.player1.ai.update(&self.ball, ai_dt);
+                                self.player1.rail.target_position = target.y;
+                                self.player1.track_position(target);
+                            }
+                            if self.player2.ai_controlled {
+                                let target = self.player2.ai.update(&self.ball, ai_dt);
+                                self.player2.rail.target_position = target.y;
+                                self.player2.track_position(target);
+                            }
+                        }
+
                         self.player1.physics_step();
                         self.player2.physics_step();
                         self.ball.step(PHYSICS_DT);
                         if self.ball.active {
-                            // Build paddle states for collision
-                            let paddles = vec![
+                            // Build paddle states for collision (fixed array, no heap alloc)
+                            let paddles = [
                                 paddle_state_from_arm(&self.player1, 1),
                                 paddle_state_from_arm(&self.player2, 2),
                             ];
@@ -1889,11 +1923,38 @@ impl ApplicationHandler for App {
                                         self.audio_engine.play(Box::new(
                                             TableBounceVoice::new(pan, intensity),
                                         ));
+                                        // Track which side the ball bounced on
+                                        if self.ball.position.x < 0.0 {
+                                            self.game.last_table_bounce_side =
+                                                Some(game::Player::Player1);
+                                        } else {
+                                            self.game.last_table_bounce_side =
+                                                Some(game::Player::Player2);
+                                        }
                                     }
-                                    collision::CollisionEvent::Paddle { .. } => {
+                                    collision::CollisionEvent::Paddle { player } => {
                                         self.audio_engine.play(Box::new(
                                             PaddleHitVoice::new(pan, intensity),
                                         ));
+                                        // Volley foul: if the ball hasn't bounced on
+                                        // the hitter's side, opponent gets the point.
+                                        if self.game.phase == game::GamePhase::Rally {
+                                            let hitter_side = match player {
+                                                1 => game::Player::Player1,
+                                                _ => game::Player::Player2,
+                                            };
+                                            let bounced_on_hitter_side =
+                                                self.game.last_table_bounce_side == Some(hitter_side);
+                                            if !bounced_on_hitter_side {
+                                                // Foul — award point to opponent
+                                                let opponent = match hitter_side {
+                                                    game::Player::Player1 => game::Player::Player2,
+                                                    game::Player::Player2 => game::Player::Player1,
+                                                };
+                                                self.game.score_point(opponent);
+                                                self.ball.active = false;
+                                            }
+                                        }
                                     }
                                     collision::CollisionEvent::Net => {
                                         self.audio_engine.play(Box::new(
@@ -1914,6 +1975,28 @@ impl ApplicationHandler for App {
                                     }
                                 }
                             }
+
+                            // Ball stall detection: if ball is barely moving during
+                            // a rally, award point after 2 seconds.
+                            if self.game.phase == game::GamePhase::Rally {
+                                if self.ball.velocity.norm() < 0.1 {
+                                    self.ball_stall_time += PHYSICS_DT;
+                                    if self.ball_stall_time > 2.0 {
+                                        // Ball stalled — point to whichever player
+                                        // the ball is NOT on the side of
+                                        if self.ball.position.x < 0.0 {
+                                            self.game.score_point(game::Player::Player2);
+                                        } else {
+                                            self.game.score_point(game::Player::Player1);
+                                        }
+                                        self.ball.active = false;
+                                        self.ball_stall_time = 0.0;
+                                    }
+                                } else {
+                                    self.ball_stall_time = 0.0;
+                                }
+                            }
+
                             // Record trail point every ~5ms (every 5th step)
                             if steps % 5 == 0 {
                                 let swap = coord_swap_matrix();
@@ -1962,4 +2045,181 @@ fn main() {
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::new();
     event_loop.run_app(&mut app).expect("Event loop failed");
+}
+
+// ── Headless rally simulation for tuning ─────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::game;
+
+    /// Simulate a full rally headlessly. Returns the number of successful
+    /// paddle hits (rally count). Prints a detailed log.
+    fn simulate_rally(serve_vx: f64, serve_vz: f64, serve_z: f64, max_sim_time: f64) -> u32 {
+        let p1_base = Vector3::new(-arm_config::ARM_X_OFFSET, 0.0, arm_config::TABLE_HEIGHT);
+        let p2_base = Vector3::new(arm_config::ARM_X_OFFSET, 0.0, arm_config::TABLE_HEIGHT);
+
+        let mut p1 = PlayerArm::new(false, p1_base);
+        let mut p2 = PlayerArm::new(true, p2_base);
+        let mut ball_obj = ball::Ball::new();
+        let mut game_state = GameState::new();
+
+        // Serve from P1
+        let serve_pos = Vector3::new(-1.0, 0.0, arm_config::TABLE_HEIGHT + serve_z);
+        let serve_vel = Vector3::new(serve_vx, 0.0, serve_vz);
+        let spin = Vector3::new(0.0, -10.0, 0.0);
+        ball_obj.serve(serve_pos, serve_vel, spin);
+        game_state.phase = game::GamePhase::Rally;
+        game_state.last_table_bounce_side = None;
+
+        let mut sim_time = 0.0;
+        let mut step = 0_u64;
+        let ai_interval = 10;
+        let mut hits = 0_u32;
+        let mut last_hit_player = 0_u8;
+        let mut table_bounces = 0_u32;
+        let net_z = arm_config::TABLE_HEIGHT + 0.1525;
+
+        // Track net crossings
+        let mut prev_ball_x = ball_obj.position.x;
+        let mut net_crossings = 0_u32;
+
+        while sim_time < max_sim_time && ball_obj.active {
+            // AI + IK update
+            if step % ai_interval as u64 == 0 {
+                let ai_dt = PHYSICS_DT * ai_interval as f64;
+                let t1 = p1.ai.update(&ball_obj, ai_dt);
+                p1.rail.target_position = t1.y;
+                p1.track_position(t1);
+
+                let t2 = p2.ai.update(&ball_obj, ai_dt);
+                p2.rail.target_position = t2.y;
+                p2.track_position(t2);
+
+                // Log P2's AI state every 100ms
+                if step % 100 == 0 && sim_time > 0.1 {
+                    let fk = p2.arm.forward_kinematics();
+                    let paddle_pos = fk.translation.vector + p2.base_position
+                        + fk.rotation * Vector3::y() * arm_config::PADDLE_FACE_OFFSET;
+                    eprintln!(
+                        "  [{:.2}s] P2 ai={:?} intercept={} tgt=({:.2},{:.2},{:.2}) paddle=({:.2},{:.2},{:.2}) ball=({:.2},{:.2},{:.2})",
+                        sim_time,
+                        p2.ai.phase,
+                        if p2.ai.intercept.is_some() { format!("({:.2},{:.2},{:.2})", p2.ai.intercept.unwrap().x, p2.ai.intercept.unwrap().y, p2.ai.intercept.unwrap().z) } else { "None".into() },
+                        p2.ai.target_position.x, p2.ai.target_position.y, p2.ai.target_position.z,
+                        paddle_pos.x, paddle_pos.y, paddle_pos.z,
+                        ball_obj.position.x, ball_obj.position.y, ball_obj.position.z,
+                    );
+                }
+            }
+
+            p1.physics_step();
+            p2.physics_step();
+            ball_obj.step(PHYSICS_DT);
+
+            if ball_obj.active {
+                let paddles = [
+                    paddle_state_from_arm(&p1, 1),
+                    paddle_state_from_arm(&p2, 2),
+                ];
+                let events = collision::resolve_collisions(&mut ball_obj, &paddles);
+
+                for event in &events {
+                    match event {
+                        collision::CollisionEvent::Table => {
+                            table_bounces += 1;
+                            if ball_obj.position.x < 0.0 {
+                                game_state.last_table_bounce_side = Some(game::Player::Player1);
+                            } else {
+                                game_state.last_table_bounce_side = Some(game::Player::Player2);
+                            }
+                        }
+                        collision::CollisionEvent::Paddle { player } => {
+                            if *player != last_hit_player {
+                                hits += 1;
+                                last_hit_player = *player;
+                                eprintln!(
+                                    "  [{:.3}s] P{} HIT at ({:.2}, {:.2}, {:.2}) vel=({:.1}, {:.1}, {:.1})",
+                                    sim_time, player,
+                                    ball_obj.position.x, ball_obj.position.y, ball_obj.position.z,
+                                    ball_obj.velocity.x, ball_obj.velocity.y, ball_obj.velocity.z,
+                                );
+                            }
+                        }
+                        collision::CollisionEvent::Net => {
+                            eprintln!("  [{:.3}s] NET HIT at z={:.3}", sim_time, ball_obj.position.z);
+                        }
+                        collision::CollisionEvent::Floor => {
+                            eprintln!("  [{:.3}s] FLOOR at x={:.2}", sim_time, ball_obj.position.x);
+                            if game_state.phase == game::GamePhase::Rally {
+                                ball_obj.active = false;
+                            }
+                        }
+                    }
+                }
+
+                // Track net crossings
+                if prev_ball_x * ball_obj.position.x < 0.0 && ball_obj.position.z > net_z {
+                    net_crossings += 1;
+                    eprintln!(
+                        "  [{:.3}s] CROSSED NET (#{}) z={:.3} (net={:.3})",
+                        sim_time, net_crossings, ball_obj.position.z, net_z
+                    );
+                }
+                prev_ball_x = ball_obj.position.x;
+
+                // Stall detection
+                if ball_obj.velocity.norm() < 0.1 {
+                    if sim_time > 1.0 { // give initial serve time
+                        eprintln!("  [{:.3}s] STALL", sim_time);
+                        ball_obj.active = false;
+                    }
+                }
+            }
+
+            sim_time += PHYSICS_DT;
+            step += 1;
+        }
+
+        eprintln!(
+            "  Result: {} hits, {} table bounces, {} net crossings, {:.2}s sim time",
+            hits, table_bounces, net_crossings, sim_time
+        );
+        hits
+    }
+
+    #[test]
+    fn test_serve_clears_net() {
+        eprintln!("\n=== Serve net clearance test ===");
+        // Test various serve parameters
+        for (vx, vz, z0, label) in [
+            (3.0, 1.5, 0.30, "original"),
+            (3.5, 1.2, 0.25, "moderate"),
+            (4.0, 1.0, 0.25, "fast-flat"),
+            (3.0, 2.0, 0.20, "high-arc"),
+            (4.0, 0.5, 0.25, "too-flat"),
+        ] {
+            let net_z = arm_config::TABLE_HEIGHT + 0.1525;
+            let z_start = arm_config::TABLE_HEIGHT + z0;
+            let t_net = 1.0 / vx; // time to reach net from x=-1.0
+            let z_at_net = z_start + vz * t_net - 0.5 * 9.81 * t_net * t_net;
+            let clears = z_at_net > net_z;
+            let margin = z_at_net - net_z;
+            eprintln!(
+                "  {}: vx={}, vz={}, z0={} → z_at_net={:.3} (margin={:.3}cm) {}",
+                label, vx, vz, z0, z_at_net, margin * 100.0,
+                if clears { "✓" } else { "✗" }
+            );
+        }
+    }
+
+    #[test]
+    fn test_headless_rally() {
+        eprintln!("\n=== Headless rally simulation ===");
+
+        eprintln!("\nServe: vx=3.0, vz=1.5, z0=0.30");
+        let hits = simulate_rally(3.0, 1.5, 0.30, 20.0);
+        eprintln!("Rally hits: {}\n", hits);
+        assert!(hits >= 5, "Should rally at least 5 times");
+    }
 }

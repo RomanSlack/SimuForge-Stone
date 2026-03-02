@@ -162,7 +162,7 @@ impl RotaryTable {
     }
 }
 
-/// Linear track (U-axis) — translates the arm base along X.
+/// Linear track (U-axis) — translates the arm base along one axis.
 /// Mechanically independent from the 6DOF arm (like RotaryTable).
 #[derive(Debug, Clone)]
 pub struct LinearTrack {
@@ -174,6 +174,12 @@ pub struct LinearTrack {
     pub inertia: f64,
     pub min_position: f64,
     pub max_position: f64,
+    /// Proportional gain (N/m).
+    pub kp: f64,
+    /// Derivative gain (N·s/m).
+    pub kd: f64,
+    /// Maximum carriage velocity (m/s).
+    pub max_velocity: f64,
 }
 
 impl LinearTrack {
@@ -185,18 +191,19 @@ impl LinearTrack {
             inertia,
             min_position: -0.5,
             max_position: 0.5,
+            kp: 2000.0,
+            kd: 800.0,
+            max_velocity: 1.0,
         }
     }
 
-    /// Step with internal overdamped PD control at physics rate.
-    /// kp=2000, kd=800 — overdamped (ζ≈1.3) for ~50kg carriage.
-    /// Settles 75mm step in ~0.3s sim time.
+    /// Step with internal PD control at physics rate.
     pub fn step(&mut self, dt: f64) {
         let err = self.target_position - self.position;
-        let pd_force = 2000.0 * err - 800.0 * self.velocity;
+        let pd_force = self.kp * err - self.kd * self.velocity;
         let accel = pd_force / self.inertia;
         self.velocity += accel * dt;
-        self.velocity = self.velocity.clamp(-1.0, 1.0); // 1 m/s max
+        self.velocity = self.velocity.clamp(-self.max_velocity, self.max_velocity);
         self.position += self.velocity * dt;
         self.position = self.position.clamp(self.min_position, self.max_position);
     }
