@@ -219,57 +219,104 @@ pub fn generate_all_tiles(cam_x: f32, cam_z: f32) -> (Vec<Vertex>, Vec<u32>) {
     (verts, idxs)
 }
 
-/// Generate the target building (small shed beside the bullseye).
-pub fn generate_target_building() -> (Vec<Vertex>, Vec<u32>) {
-    generate_box(1.0, 1.0, 1.5)
+/// Sandstone hut color (warm sandy beige).
+pub const HUT_COLOR: [f32; 4] = [0.72, 0.62, 0.45, 1.0];
+/// Darker sandstone for roof.
+pub const HUT_ROOF_COLOR: [f32; 4] = [0.58, 0.50, 0.38, 1.0];
+
+/// Generate a sandstone hut at the target — main body + flat roof + doorway.
+/// Returns (body_verts, body_indices, roof_verts, roof_indices).
+pub fn generate_target_hut() -> ((Vec<Vertex>, Vec<u32>), (Vec<Vertex>, Vec<u32>)) {
+    // Main body: 6m wide, 5m deep, 3.5m tall
+    let body = generate_box(3.0, 1.75, 2.5);
+
+    // Flat roof slab: slightly wider overhang, 0.3m thick
+    let (mut rv, ri) = generate_box(3.3, 0.15, 2.8);
+    // Shift roof up to sit on top of body (body top = 1.75, roof bottom should be there)
+    for v in &mut rv {
+        v.position[1] += 1.75 + 0.15;
+    }
+
+    (body, (rv, ri))
 }
 
 /// Generate a terrain-conforming extruded ring around the target center (world-space vertices).
 /// `cx`, `cz` are the ring center in render world space (Y-up).
 /// The ring has vertical thickness (`height`) to avoid z-fighting with terrain.
+/// Each face (top, bottom, inner wall, outer wall) has its own vertices with correct normals.
 fn generate_target_ring(cx: f32, cz: f32, inner_r: f32, outer_r: f32) -> (Vec<Vertex>, Vec<u32>) {
     let segments = 96_u32;
-    let height = 1.5_f32; // vertical thickness of the ring
+    let height = 1.5_f32;
     let n = segments + 1;
 
-    // 4 rows of vertices per segment: inner-bottom, inner-top, outer-top, outer-bottom
-    let mut verts = Vec::with_capacity(n as usize * 4);
+    let mut verts = Vec::new();
     let mut idxs = Vec::new();
 
+    // Pre-compute positions
+    struct RingPos { ix: f32, iz: f32, iy: f32, ox: f32, oz: f32, oy: f32 }
+    let mut positions = Vec::with_capacity(n as usize);
     for i in 0..n {
         let theta = i as f32 / segments as f32 * std::f32::consts::TAU;
         let (s, c) = theta.sin_cos();
-
         let ix = cx + c * inner_r;
         let iz = cz + s * inner_r;
-        let iy_base = terrain_height_visual(ix, iz) - 0.3;
-
+        let iy = terrain_height_visual(ix, iz) - 0.3;
         let ox = cx + c * outer_r;
         let oz = cz + s * outer_r;
-        let oy_base = terrain_height_visual(ox, oz) - 0.3;
-
-        // Row 0: inner bottom
-        verts.push(Vertex { position: [ix, iy_base, iz], normal: [-c, 0.0, -s] });
-        // Row 1: inner top
-        verts.push(Vertex { position: [ix, iy_base + height, iz], normal: [-c, 0.0, -s] });
-        // Row 2: outer top
-        verts.push(Vertex { position: [ox, oy_base + height, oz], normal: [c, 0.0, s] });
-        // Row 3: outer bottom
-        verts.push(Vertex { position: [ox, oy_base, oz], normal: [c, 0.0, s] });
+        let oy = terrain_height_visual(ox, oz) - 0.3;
+        positions.push(RingPos { ix, iz, iy, ox, oz, oy });
     }
 
+    // ── Top face: normal (0, 1, 0) ──
+    let top_base = verts.len() as u32;
+    for p in &positions {
+        verts.push(Vertex { position: [p.ix, p.iy + height, p.iz], normal: [0.0, 1.0, 0.0] });
+        verts.push(Vertex { position: [p.ox, p.oy + height, p.oz], normal: [0.0, 1.0, 0.0] });
+    }
     for i in 0..segments {
-        let b = i * 4;
-        let nb = b + 4; // next segment
+        let b = top_base + i * 2;
+        let nb = b + 2;
+        idxs.extend_from_slice(&[b, nb, b + 1, b + 1, nb, nb + 1]);
+    }
 
-        // Top face (row 1 inner → row 2 outer)
-        idxs.extend_from_slice(&[b + 1, nb + 1, b + 2, b + 2, nb + 1, nb + 2]);
-        // Inner wall (row 0 → row 1)
+    // ── Bottom face: normal (0, -1, 0) ──
+    let bot_base = verts.len() as u32;
+    for p in &positions {
+        verts.push(Vertex { position: [p.ix, p.iy, p.iz], normal: [0.0, -1.0, 0.0] });
+        verts.push(Vertex { position: [p.ox, p.oy, p.oz], normal: [0.0, -1.0, 0.0] });
+    }
+    for i in 0..segments {
+        let b = bot_base + i * 2;
+        let nb = b + 2;
         idxs.extend_from_slice(&[b, b + 1, nb, nb, b + 1, nb + 1]);
-        // Outer wall (row 2 → row 3)
-        idxs.extend_from_slice(&[b + 2, nb + 2, b + 3, b + 3, nb + 2, nb + 3]);
-        // Bottom face (row 0 inner → row 3 outer)
-        idxs.extend_from_slice(&[b, nb, b + 3, b + 3, nb, nb + 3]);
+    }
+
+    // ── Inner wall: normal points inward (-c, 0, -s) ──
+    let iw_base = verts.len() as u32;
+    for (i, p) in positions.iter().enumerate() {
+        let theta = i as f32 / segments as f32 * std::f32::consts::TAU;
+        let (s, c) = theta.sin_cos();
+        verts.push(Vertex { position: [p.ix, p.iy, p.iz], normal: [-c, 0.0, -s] });
+        verts.push(Vertex { position: [p.ix, p.iy + height, p.iz], normal: [-c, 0.0, -s] });
+    }
+    for i in 0..segments {
+        let b = iw_base + i * 2;
+        let nb = b + 2;
+        idxs.extend_from_slice(&[b, nb, b + 1, b + 1, nb, nb + 1]);
+    }
+
+    // ── Outer wall: normal points outward (c, 0, s) ──
+    let ow_base = verts.len() as u32;
+    for (i, p) in positions.iter().enumerate() {
+        let theta = i as f32 / segments as f32 * std::f32::consts::TAU;
+        let (s, c) = theta.sin_cos();
+        verts.push(Vertex { position: [p.ox, p.oy, p.oz], normal: [c, 0.0, s] });
+        verts.push(Vertex { position: [p.ox, p.oy + height, p.oz], normal: [c, 0.0, s] });
+    }
+    for i in 0..segments {
+        let b = ow_base + i * 2;
+        let nb = b + 2;
+        idxs.extend_from_slice(&[b, b + 1, nb, nb, b + 1, nb + 1]);
     }
 
     (verts, idxs)

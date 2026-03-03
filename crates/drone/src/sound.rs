@@ -435,9 +435,9 @@ impl ImpactVoice {
         ((*state >> 16) as f64 / 32768.0) - 1.0
     }
 
-    /// Soft-clip saturation (tanh approximation)
+    /// Warm saturation — hard tanh, preserves loudness
     fn saturate(x: f64) -> f64 {
-        if x.abs() < 1.0 { x - x * x * x / 3.0 } else { x.signum() * (2.0 / 3.0) }
+        x.tanh()
     }
 }
 
@@ -454,76 +454,72 @@ impl Voice for ImpactVoice {
 
         let tau = std::f64::consts::TAU;
 
-        // ── Layer 1: Shockwave transient (< 2ms) ──
-        // Single sharp pressure spike — a decaying sinusoid burst
-        let shock = if t < 0.003 {
-            let shock_env = (1.0 - t / 0.003) * (-t * 800.0).exp();
-            let shock_wave = (t * 200.0 * tau).sin() + 0.5 * (t * 350.0 * tau).sin();
-            shock_wave * shock_env * 1.5
+        // ── Layer 1: Shockwave transient (0-15ms) ──
+        // Hard pressure spike — full-bandwidth noise burst that slams speakers
+        let shock = if t < 0.015 {
+            let shock_raw = Self::noise(&mut self.noise_echo); // reuse a noise gen
+            let shock_env = (-t * 200.0).exp(); // 5ms time constant
+            shock_raw * shock_env * 4.0
         } else {
             0.0
         };
 
-        // ── Layer 2: Primary blast wave (20-80 Hz) ──
-        // White noise → cascaded 2-pole LP at 80 Hz, decays over ~300ms
+        // ── Layer 2: Primary blast wave (20-100 Hz) ──
+        // White noise → cascaded 2-pole LP, slower decay for chest punch
         let blast_raw = Self::noise(&mut self.noise_blast);
-        let blast_cutoff = 80.0 - t * 60.0; // pitch drops as blast expands
-        let blast_alpha = (blast_cutoff.max(20.0) * dt * tau).min(0.5);
+        let blast_cutoff = 100.0 - t * 50.0; // 100→50 Hz over 1s
+        let blast_alpha = (blast_cutoff.max(30.0) * dt * tau).min(0.5);
         self.blast_lp1 += blast_alpha * (blast_raw - self.blast_lp1);
         self.blast_lp2 += blast_alpha * (self.blast_lp1 - self.blast_lp2);
-        let blast_env = (-t * 6.0).exp(); // fast ~170ms decay
-        let blast = self.blast_lp2 * blast_env * 3.0;
+        let blast_env = (-t * 3.0).exp(); // ~330ms decay — sustains the thump
+        let blast = self.blast_lp2 * blast_env * 8.0;
 
-        // ── Layer 3: Debris / fragmentation crackle (200-2000 Hz) ──
-        // White noise → LP at 2kHz → HP at 200Hz = band-pass
+        // ── Layer 3: Debris / fragmentation crackle (300-3000 Hz) ──
         let debris_raw = Self::noise(&mut self.noise_debris);
-        let debris_lp_alpha = (2000.0 * dt * tau).min(0.8);
+        let debris_lp_alpha = (3000.0 * dt * tau).min(0.8);
         self.debris_lp1 += debris_lp_alpha * (debris_raw - self.debris_lp1);
         self.debris_lp2 += debris_lp_alpha * (self.debris_lp1 - self.debris_lp2);
-        let debris_hp_alpha = (200.0 * dt * tau).min(0.5);
+        let debris_hp_alpha = (300.0 * dt * tau).min(0.5);
         self.debris_hp += debris_hp_alpha * (self.debris_lp2 - self.debris_hp);
         let debris_bp = self.debris_lp2 - self.debris_hp;
-        // Envelope: delayed onset (20ms), peaks at 50ms, decays over ~800ms
-        let debris_onset = (t / 0.05).min(1.0);
-        let debris_decay = (-((t - 0.05).max(0.0)) * 2.5).exp();
-        let debris = debris_bp * debris_onset * debris_decay * 0.7;
+        // Envelope: sharp onset at 5ms, decays over ~600ms
+        let debris_onset = (t / 0.005).min(1.0);
+        let debris_decay = (-((t - 0.005).max(0.0)) * 3.0).exp();
+        let debris = debris_bp * debris_onset * debris_decay * 3.0;
 
-        // ── Layer 4: Fireball sub-bass rumble (15-40 Hz) ──
-        // Noise → triple-cascaded LP for very steep rolloff
+        // ── Layer 4: Fireball sub-bass rumble (20-50 Hz) ──
         let fire_raw = Self::noise(&mut self.noise_fireball);
-        let fire_freq = 25.0 + 15.0 * (-t * 2.0).exp(); // starts at 40Hz, settles to 25Hz
+        let fire_freq = 35.0 + 15.0 * (-t * 1.5).exp(); // 50→35 Hz
         let fire_alpha = (fire_freq * dt * tau).min(0.3);
         self.fire_lp1 += fire_alpha * (fire_raw - self.fire_lp1);
         self.fire_lp2 += fire_alpha * (self.fire_lp1 - self.fire_lp2);
         self.fire_lp3 += fire_alpha * (self.fire_lp2 - self.fire_lp3);
-        // Envelope: slow swell over 100ms, sustain, decay over 2s
-        let fire_swell = (t / 0.1).min(1.0);
-        let fire_decay = (-((t - 0.1).max(0.0)) * 0.8).exp();
-        let fireball = self.fire_lp3 * fire_swell * fire_decay * 2.5;
+        // Slow swell, long sustain
+        let fire_swell = (t / 0.05).min(1.0);
+        let fire_decay = (-((t - 0.2).max(0.0)) * 0.6).exp();
+        let fireball = self.fire_lp3 * fire_swell * fire_decay * 6.0;
 
         // ── Layer 5: Echo / reverb tail ──
-        // Read from delay line, LP filter for muffled distant echo
         let buf_len = self.echo_buf.len();
-        // Multiple taps at different delays for diffuse echo
-        let tap1 = self.echo_buf[(self.echo_write + buf_len - (0.12 * sample_rate as f64) as usize) % buf_len];
-        let tap2 = self.echo_buf[(self.echo_write + buf_len - (0.23 * sample_rate as f64) as usize) % buf_len];
-        let tap3 = self.echo_buf[(self.echo_write + buf_len - (0.37 * sample_rate as f64) as usize) % buf_len];
-        let echo_raw = tap1 * 0.4 + tap2 * 0.3 + tap3 * 0.2;
-        // LP filter the echo for distance muffle (500 Hz)
-        let echo_alpha = (500.0 * dt * tau).min(0.5);
+        let tap1 = self.echo_buf[(self.echo_write + buf_len - (0.08 * sample_rate as f64) as usize) % buf_len];
+        let tap2 = self.echo_buf[(self.echo_write + buf_len - (0.19 * sample_rate as f64) as usize) % buf_len];
+        let tap3 = self.echo_buf[(self.echo_write + buf_len - (0.33 * sample_rate as f64) as usize) % buf_len];
+        let tap4 = self.echo_buf[(self.echo_write + buf_len - (0.47 * sample_rate as f64) as usize) % buf_len];
+        let echo_raw = tap1 * 0.5 + tap2 * 0.35 + tap3 * 0.25 + tap4 * 0.15;
+        let echo_alpha = (800.0 * dt * tau).min(0.5);
         self.echo_lp += echo_alpha * (echo_raw - self.echo_lp);
-        let echo = self.echo_lp * (-t * 0.6).exp();
+        let echo = self.echo_lp * (-t * 0.5).exp();
 
-        // ── Mix all layers ──
+        // ── Mix ──
         let dry = shock + blast + debris + fireball;
         let mix = dry + echo;
 
-        // Write dry signal into echo delay line (feedback echo)
-        self.echo_buf[self.echo_write] = dry * 0.5;
+        // Feed dry signal into echo buffer
+        self.echo_buf[self.echo_write] = dry * 0.6;
         self.echo_write = (self.echo_write + 1) % buf_len;
 
-        // Soft saturation to prevent harsh clipping
-        let saturated = Self::saturate(mix * 0.6);
+        // Drive hard into saturation for that compressed explosion feel
+        let saturated = Self::saturate(mix * 1.8);
 
         // DC blocker: y[n] = x[n] - x[n-1] + R * y[n-1], R = 0.997
         let dc_r = 0.997;
@@ -536,13 +532,10 @@ impl Voice for ImpactVoice {
 
     fn is_done(&self) -> bool { self.time > 4.0 }
     fn pan(&self) -> f32 { 0.0 }
-    fn volume(&self) -> f32 { 0.9 }
+    fn volume(&self) -> f32 { 1.0 }
     fn time(&self) -> f32 { self.time as f32 }
 
     fn next_stereo(&mut self, sample_rate: f32) -> Option<(f32, f32)> {
-        self.next_sample(sample_rate).map(|s| {
-            let v = s * self.volume();
-            (v, v)
-        })
+        self.next_sample(sample_rate).map(|s| (s, s))
     }
 }

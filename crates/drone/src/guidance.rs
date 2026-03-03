@@ -78,8 +78,8 @@ const TERMINAL_RANGE: f64 = 800.0;
 const TERMINAL_PITCH: f64 = -55.0_f64 * std::f64::consts::PI / 180.0;
 
 /// CEP (circular error probable) radius in meters — 50% of shots land within this radius.
-/// Real Shahed-136 GPS/INS CEP is estimated at 5-10m.
-const CEP_RADIUS: f64 = 8.0;
+/// Real Shahed-136 with commercial GPS/GLONASS CEP is estimated at 10-15m.
+const CEP_RADIUS: f64 = 12.0;
 
 /// Guidance state machine.
 pub struct Guidance {

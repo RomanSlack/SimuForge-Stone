@@ -241,6 +241,8 @@ struct App {
     terrain_regen_queue: Vec<(usize, f32, f32)>,
     building_mesh: Option<GpuMesh>,
     building_material: Option<MaterialBind>,
+    roof_mesh: Option<GpuMesh>,
+    roof_material: Option<MaterialBind>,
     rail_mesh: Option<GpuMesh>,
     rail_material: Option<MaterialBind>,
     flag_mesh: Option<GpuMesh>,
@@ -362,6 +364,8 @@ impl App {
             terrain_regen_queue: Vec::new(),
             building_mesh: None,
             building_material: None,
+            roof_mesh: None,
+            roof_material: None,
             rail_mesh: None,
             rail_material: None,
             flag_mesh: None,
@@ -565,10 +569,13 @@ impl App {
             sky.update(&ctx.queue, inv_vp, self.sky_exposure, self.horizon_dust);
         }
 
-        // Target building offset 15m beside the bullseye at (50000, 15, 1.5) in DH space
-        let building_dh = Vec3::new(50_000.0, 15.0, 1.5);
-        let building_render = swap.transform_point3(building_dh);
+        // Sandstone hut at target center, sitting on terrain
+        let hut_render_x = 50_000.0_f32;
+        let hut_render_z = 0.0_f32;
+        let hut_ground_y = terrain::terrain_height_visual(hut_render_x, hut_render_z);
+        let building_render = Vec3::new(hut_render_x, hut_ground_y, hut_render_z);
         let building_model = Mat4::from_translation(building_render);
+        let roof_model = building_model; // same origin, roof is offset in mesh
 
         // Target bullseye — vertices are in world space (terrain-conforming)
         let target_model = Mat4::IDENTITY;
@@ -603,9 +610,15 @@ impl App {
 
         // Upload non-tile materials
         if let Some(m) = &self.building_material {
-            let mut mat = MaterialUniform::metal(terrain::BUILDING_COLOR)
+            let mut mat = MaterialUniform::metal(terrain::HUT_COLOR)
                 .with_model(building_model.to_cols_array_2d());
-            mat.params = [0.8, 0.1, 0.0, 0.0];
+            mat.params = [0.9, 0.0, 0.0, 0.0]; // rough sandstone
+            ctx.queue.write_buffer(&m.buffer, 0, bytemuck::bytes_of(&mat));
+        }
+        if let Some(m) = &self.roof_material {
+            let mut mat = MaterialUniform::metal(terrain::HUT_ROOF_COLOR)
+                .with_model(roof_model.to_cols_array_2d());
+            mat.params = [0.85, 0.0, 0.0, 0.0];
             ctx.queue.write_buffer(&m.buffer, 0, bytemuck::bytes_of(&mat));
         }
         if let Some(m) = &self.rail_material {
@@ -699,6 +712,7 @@ impl App {
         let mut shadow_matrices: Vec<Mat4> = Vec::with_capacity(32);
         shadow_matrices.push(light_vp * Mat4::IDENTITY); // terrain
         shadow_matrices.push(light_vp * building_model);
+        shadow_matrices.push(light_vp * roof_model);
         shadow_matrices.push(light_vp * rail_model);
         shadow_matrices.push(light_vp * flag_model);
         for rm in &ref_models {
@@ -798,8 +812,19 @@ impl App {
             }
             si += 1;
 
-            // Building
+            // Hut body
             if let Some(mesh) = &self.building_mesh {
+                if si < shadow_matrices.len() {
+                    pass.set_bind_group(0, &shadow.bind_group, &[ShadowPipeline::dynamic_offset(si)]);
+                    pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..mesh.num_indices, 0, 0..1);
+                }
+            }
+            si += 1;
+
+            // Hut roof
+            if let Some(mesh) = &self.roof_mesh {
                 if si < shadow_matrices.len() {
                     pass.set_bind_group(0, &shadow.bind_group, &[ShadowPipeline::dynamic_offset(si)]);
                     pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
@@ -944,8 +969,9 @@ impl App {
                 }
             }
 
-            // Buildings
+            // Hut + buildings
             draw_mesh!(&self.building_mesh, &self.building_material);
+            draw_mesh!(&self.roof_mesh, &self.roof_material);
             draw_mesh!(&self.rail_mesh, &self.rail_material);
             draw_mesh!(&self.flag_mesh, &self.flag_material);
             for (mesh, mat) in self.ref_building_meshes.iter().zip(self.ref_building_materials.iter()) {
@@ -2301,13 +2327,18 @@ impl ApplicationHandler for App {
         self.terrain_material = Some(MaterialBind { buffer: buf, bind_group: bg });
         self.last_terrain_snap = (0, 0);
 
-        // Target building
-        let (bv, bi) = terrain::generate_target_building();
-        let bvb = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("Building VB"), contents: bytemuck::cast_slice(&bv), usage: wgpu::BufferUsages::VERTEX });
-        let bib = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("Building IB"), contents: bytemuck::cast_slice(&bi), usage: wgpu::BufferUsages::INDEX });
+        // Sandstone hut at target
+        let ((bv, bi), (rv, ri)) = terrain::generate_target_hut();
+        let bvb = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("Hut Body VB"), contents: bytemuck::cast_slice(&bv), usage: wgpu::BufferUsages::VERTEX });
+        let bib = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("Hut Body IB"), contents: bytemuck::cast_slice(&bi), usage: wgpu::BufferUsages::INDEX });
         self.building_mesh = Some(GpuMesh { vertex_buffer: bvb, index_buffer: bib, num_indices: bi.len() as u32 });
         let (buf, bg) = pbr.create_material_bind_group(&ctx.device);
         self.building_material = Some(MaterialBind { buffer: buf, bind_group: bg });
+        let rvb = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("Hut Roof VB"), contents: bytemuck::cast_slice(&rv), usage: wgpu::BufferUsages::VERTEX });
+        let rib = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("Hut Roof IB"), contents: bytemuck::cast_slice(&ri), usage: wgpu::BufferUsages::INDEX });
+        self.roof_mesh = Some(GpuMesh { vertex_buffer: rvb, index_buffer: rib, num_indices: ri.len() as u32 });
+        let (buf, bg) = pbr.create_material_bind_group(&ctx.device);
+        self.roof_material = Some(MaterialBind { buffer: buf, bind_group: bg });
 
         // Launch rail
         let (rv, ri) = terrain::generate_launch_rail();
@@ -2748,8 +2779,14 @@ impl ApplicationHandler for App {
                 }
 
                 // Update + upload explosion particles (wall-clock dt for smooth visuals)
+                // Convert DH wind (x,y,z) → render-space (x,z,-y)
+                let wind_render = Vec3::new(
+                    self.wind.x as f32,
+                    self.wind.z as f32,
+                    -self.wind.y as f32,
+                );
                 if let Some(ps) = &mut self.particle_system {
-                    ps.update(frame_dt as f32);
+                    ps.update(frame_dt as f32, wind_render);
                     // Extract camera right/up from view matrix for billboarding
                     let view_mat = self.camera.view_matrix();
                     let cam_right = Vec3::new(view_mat.x_axis.x, view_mat.y_axis.x, view_mat.z_axis.x);

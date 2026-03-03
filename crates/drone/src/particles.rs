@@ -231,16 +231,21 @@ impl ParticleSystem {
     }
 
     pub fn spawn_explosion(&mut self, pos: Vec3) {
-        let mut particles = Vec::with_capacity(2000);
+        let mut particles = Vec::with_capacity(1200);
 
-        // ── Fireball core: bright, explosive outward, pulled by gravity ──
+        // ── Fireball core: bright, violent outward, asymmetric ──
         for _ in 0..250 {
-            let dir = self.rand_hemisphere_up();
+            // Non-uniform: pick a random axis to bias toward for lopsided blast
+            let dir = self.rand_sphere();
+            let bias_strength = self.rand_range(0.0, 0.6);
+            let biased = (dir + Vec3::Y * self.rand_range(0.0, 0.8)
+                + Vec3::X * self.rand_range(-bias_strength, bias_strength)
+                + Vec3::Z * self.rand_range(-bias_strength, bias_strength))
+                .normalize();
             let speed = self.rand_range(20.0, 80.0);
-            let vel = dir * speed;
             particles.push(Particle {
                 position: pos + dir * self.rand_range(0.0, 1.5),
-                velocity: vel,
+                velocity: biased * speed,
                 size: self.rand_range(2.0, 8.0),
                 age: 0.0,
                 lifetime: self.rand_range(0.3, 1.2),
@@ -253,15 +258,15 @@ impl ParticleSystem {
             });
         }
 
-        // ── Secondary fire: slightly delayed, fills in the mushroom ──
-        for _ in 0..150 {
-            let dir = self.rand_hemisphere_up();
+        // ── Secondary fire: delayed, asymmetric clumps ──
+        for _ in 0..100 {
+            let dir = self.rand_sphere();
+            let biased = (dir + Vec3::Y * self.rand_range(0.2, 1.0)).normalize();
             let speed = self.rand_range(8.0, 30.0);
-            let vel = dir * speed;
             let delay = self.rand_range(0.0, 0.3);
             particles.push(Particle {
                 position: pos + dir * self.rand_range(0.0, 2.0),
-                velocity: vel,
+                velocity: biased * speed,
                 size: self.rand_range(3.0, 10.0),
                 age: -delay,
                 lifetime: self.rand_range(0.5, 1.5),
@@ -277,13 +282,11 @@ impl ParticleSystem {
         // ── Sparks: tiny, VERY fast, streaking outward like shrapnel ──
         for _ in 0..300 {
             let dir = self.rand_sphere();
-            // Bias slightly upward but sparks go everywhere
             let biased = (dir + Vec3::Y * 0.3).normalize();
             let speed = self.rand_range(60.0, 200.0);
-            let vel = biased * speed;
             particles.push(Particle {
                 position: pos + dir * self.rand_range(0.0, 0.5),
-                velocity: vel,
+                velocity: biased * speed,
                 size: self.rand_range(0.05, 0.2),
                 age: 0.0,
                 lifetime: self.rand_range(0.5, 2.5),
@@ -301,10 +304,9 @@ impl ParticleSystem {
             let dir = self.rand_sphere();
             let biased = (dir + Vec3::Y * 0.5).normalize();
             let speed = self.rand_range(40.0, 150.0);
-            let vel = biased * speed;
             particles.push(Particle {
                 position: pos + dir * self.rand_range(0.0, 1.0),
-                velocity: vel,
+                velocity: biased * speed,
                 size: self.rand_range(0.15, 0.6),
                 age: 0.0,
                 lifetime: self.rand_range(2.0, 5.0),
@@ -318,9 +320,9 @@ impl ParticleSystem {
         }
 
         // ── Shockwave ring: fast horizontal burst of dust ──
-        for _ in 0..150 {
+        for _ in 0..100 {
             let angle = self.rand_range(0.0, std::f32::consts::TAU);
-            let dir = Vec3::new(angle.cos(), 0.1, angle.sin());
+            let dir = Vec3::new(angle.cos(), self.rand_range(0.0, 0.15), angle.sin());
             let speed = self.rand_range(30.0, 80.0);
             particles.push(Particle {
                 position: pos + dir * self.rand_range(0.0, 2.0),
@@ -329,45 +331,60 @@ impl ParticleSystem {
                 age: 0.0,
                 lifetime: self.rand_range(0.5, 1.5),
                 kind: ParticleKind::Shockwave,
-                base_color: [0.6, 0.55, 0.45], // sandy dust
+                base_color: [0.6, 0.55, 0.45],
             });
         }
 
-        // ── Smoke: dark billowing clouds (alpha-blended) ──
-        for _ in 0..500 {
-            let dir = self.rand_hemisphere_up();
-            let speed = self.rand_range(5.0, 25.0);
-            let vel = dir * speed + Vec3::Y * self.rand_range(5.0, 15.0);
+        // ── Smoke: fewer, asymmetric clumps, shorter lived ──
+        // Pick 3-4 random "clump" directions so smoke isn't a perfect sphere
+        let num_clumps = 3 + (self.rand() * 2.0) as usize;
+        let mut clump_dirs = Vec::with_capacity(num_clumps);
+        for _ in 0..num_clumps {
+            clump_dirs.push((self.rand_sphere() + Vec3::Y * 0.5).normalize());
+        }
+        for _ in 0..150 {
+            // Pick a random clump to spawn near
+            let clump_idx = (self.rand() * clump_dirs.len() as f32) as usize % clump_dirs.len();
+            let clump_dir = clump_dirs[clump_idx];
+            // Scatter around the clump direction
+            let jitter = Vec3::new(
+                self.rand_range(-0.4, 0.4),
+                self.rand_range(-0.2, 0.4),
+                self.rand_range(-0.4, 0.4),
+            );
+            let dir = (clump_dir + jitter).normalize();
+            let speed = self.rand_range(5.0, 20.0);
+            let vel = dir * speed + Vec3::Y * self.rand_range(3.0, 10.0);
             let grey = self.rand_range(0.05, 0.2);
             particles.push(Particle {
-                position: pos + dir * self.rand_range(0.0, 3.0),
+                position: pos + dir * self.rand_range(0.0, 2.0),
                 velocity: vel,
-                size: self.rand_range(4.0, 12.0),
+                size: self.rand_range(3.0, 10.0),
                 age: 0.0,
-                lifetime: self.rand_range(3.0, 7.0),
+                lifetime: self.rand_range(1.5, 4.0),
                 kind: ParticleKind::Smoke,
                 base_color: [grey, grey * 0.9, grey * 0.8],
             });
         }
 
-        // ── Lingering smoke column: staggered spawn, rises for a long time ──
-        for _ in 0..300 {
-            let spread = self.rand_range(0.0, 4.0);
+        // ── Lingering smoke wisps: small staggered column, not a blob ──
+        for _ in 0..80 {
+            let spread = self.rand_range(0.0, 2.0);
             let offset = Vec3::new(
                 self.rand_range(-spread, spread),
-                self.rand_range(0.0, 2.0),
+                self.rand_range(0.0, 1.0),
                 self.rand_range(-spread, spread),
             );
-            let vel = Vec3::Y * self.rand_range(8.0, 20.0)
-                + Vec3::new(self.rand_range(-2.0, 2.0), 0.0, self.rand_range(-2.0, 2.0));
-            let grey = self.rand_range(0.03, 0.15);
-            let delay = self.rand_range(0.0, 3.0);
+            let vel = Vec3::Y * self.rand_range(6.0, 14.0)
+                + Vec3::new(self.rand_range(-1.5, 1.5), 0.0, self.rand_range(-1.5, 1.5));
+            let grey = self.rand_range(0.03, 0.12);
+            let delay = self.rand_range(0.0, 1.5);
             particles.push(Particle {
                 position: pos + offset,
                 velocity: vel,
-                size: self.rand_range(5.0, 15.0),
+                size: self.rand_range(3.0, 8.0),
                 age: -delay,
-                lifetime: self.rand_range(5.0, 12.0),
+                lifetime: self.rand_range(2.0, 5.0),
                 kind: ParticleKind::Smoke,
                 base_color: [grey, grey * 0.85, grey * 0.75],
             });
@@ -376,7 +393,9 @@ impl ParticleSystem {
         self.explosions.push(Explosion { particles });
     }
 
-    pub fn update(&mut self, dt: f32) {
+    /// Update all particles. `dt` is wall-clock seconds.
+    /// `wind` is in render-space (Y-up): convert DH wind (x,y,z) → render (x,z,-y).
+    pub fn update(&mut self, dt: f32, wind: Vec3) {
         const GRAVITY: f32 = 9.81;
 
         for explosion in &mut self.explosions {
@@ -384,16 +403,27 @@ impl ParticleSystem {
                 p.age += dt;
                 if p.age < 0.0 { continue; }
 
+                // Wind effect — stronger on light particles, weaker on heavy
+                let wind_factor = match p.kind {
+                    ParticleKind::Smoke => 1.0,     // smoke catches wind fully
+                    ParticleKind::Shockwave => 0.5,  // dust picks up some
+                    ParticleKind::Fireball => 0.3,   // hot gas resists a bit
+                    ParticleKind::Sparks => 0.1,     // too fast to care much
+                    ParticleKind::Debris => 0.05,    // heavy, barely affected
+                };
+                // Accelerate toward wind velocity (drag-like — approaches wind speed over time)
+                let wind_accel = (wind * wind_factor - p.velocity * wind_factor) * 0.5;
+                p.velocity += wind_accel * dt;
+
                 match p.kind {
                     ParticleKind::Fireball => {
                         p.velocity *= (1.0 - 2.0 * dt).max(0.0);
-                        p.velocity.y -= GRAVITY * 0.5 * dt; // half gravity — hot gas rises but still pulled down
+                        p.velocity.y -= GRAVITY * 0.5 * dt;
                         p.size += dt * 5.0;
                     }
                     ParticleKind::Sparks => {
-                        p.velocity.y -= GRAVITY * dt; // full gravity
-                        p.velocity *= (1.0 - 0.3 * dt).max(0.0); // light drag
-                        // Ground bounce
+                        p.velocity.y -= GRAVITY * dt;
+                        p.velocity *= (1.0 - 0.3 * dt).max(0.0);
                         if p.position.y < 0.0 {
                             p.position.y = 0.0;
                             p.velocity.y = p.velocity.y.abs() * 0.3;
@@ -401,7 +431,7 @@ impl ParticleSystem {
                         }
                     }
                     ParticleKind::Debris => {
-                        p.velocity.y -= GRAVITY * 1.5 * dt; // heavy — 1.5x gravity
+                        p.velocity.y -= GRAVITY * 1.5 * dt;
                         p.velocity *= (1.0 - 0.2 * dt).max(0.0);
                         if p.position.y < 0.0 {
                             p.position.y = 0.0;
@@ -409,9 +439,9 @@ impl ParticleSystem {
                         }
                     }
                     ParticleKind::Shockwave => {
-                        p.velocity *= (1.0 - 2.5 * dt).max(0.0); // fast drag
+                        p.velocity *= (1.0 - 2.5 * dt).max(0.0);
                         p.velocity.y -= GRAVITY * 0.3 * dt;
-                        p.size += dt * 8.0; // expand rapidly
+                        p.size += dt * 8.0;
                     }
                     ParticleKind::Smoke => {
                         p.velocity *= (1.0 - 1.0 * dt).max(0.0);
