@@ -23,9 +23,9 @@ pub const REF_BUILDING_COLOR: [f32; 4] = [0.55, 0.40, 0.30, 1.0];
 /// Tile size (meters).
 pub const TILE_SIZE: f32 = 500.0;
 /// Vertices per tile edge.
-const TILE_RES: u32 = 16;
-/// Half-extent of tile grid. 5 → 11x11 = 121 tiles (good balance).
-pub const TILE_RADIUS: i32 = 5;
+const TILE_RES: u32 = 24;
+/// Half-extent of tile grid. 10 → 21x21 = 441 tiles (2x render distance).
+pub const TILE_RADIUS: i32 = 10;
 /// Total ground tiles.
 pub const NUM_TILES: usize = ((TILE_RADIUS * 2 + 1) * (TILE_RADIUS * 2 + 1)) as usize;
 /// Vertices per tile.
@@ -66,8 +66,8 @@ pub fn terrain_height(wx: f32, wz: f32) -> f32 {
     let mut frequency = 1.0_f32;
     let mut amp_sum = 0.0_f32;
 
-    let base_scale = 0.0006; // ~1600m primary wavelength
-    for _ in 0..4 {
+    let base_scale = 0.0012; // ~830m primary wavelength
+    for _ in 0..5 {
         let nx = wx * base_scale * frequency;
         let nz = wz * base_scale * frequency;
         height += (value_noise(nx, nz) - 0.5) * 2.0 * amplitude;
@@ -79,80 +79,113 @@ pub fn terrain_height(wx: f32, wz: f32) -> f32 {
     let normalized = height / amp_sum;
     // Desert profile: mostly gentle rolling dunes
     let shaped = normalized.abs().powf(0.7) * normalized.signum();
-    let raw = shaped * 20.0; // ±20m — visible rolling dunes from altitude
+    let raw = shaped * 80.0; // ±80m — dramatic dunes visible from cruise altitude
 
     // Flatten near launch site (within ~1km of origin) so the rail sits on flat ground
     let dist_from_origin = (wx * wx + wz * wz).sqrt();
-    let flatten = (dist_from_origin / 1000.0).clamp(0.0, 1.0); // 0 at origin, 1 at 1km+
+    let flatten = (dist_from_origin / 200.0).clamp(0.0, 1.0); // 0 at origin, 1 at 200m+
     raw * flatten
 }
 
-/// Generate all visible tile geometry for a single upload.
+/// Side length of the tile grid.
+pub const TILE_SIDE: usize = (TILE_RADIUS * 2 + 1) as usize;
+
+/// Generate a single tile's geometry into pre-allocated buffers.
+/// `slot` is the linear tile index [0, NUM_TILES).
+/// `tile_cx`, `tile_cz` are the tile's world-space center coords.
+/// Writes vertices and indices at the correct offsets for that slot.
+pub fn generate_single_tile(
+    tile_cx: f32,
+    tile_cz: f32,
+    slot: usize,
+    verts: &mut [Vertex],
+    idxs: &mut [u32],
+) {
+    let half = TILE_SIZE / 2.0;
+    let step = TILE_SIZE / TILE_RES as f32;
+    let n = TILE_RES + 1;
+
+    let v_off = slot * VERTS_PER_TILE;
+    let i_off = slot * IDXS_PER_TILE;
+    let base_vertex = v_off as u32;
+
+    // Vertices
+    for iz in 0..n {
+        for ix in 0..n {
+            let local_x = -half + ix as f32 * step;
+            let local_z = -half + iz as f32 * step;
+            let world_x = tile_cx + local_x;
+            let world_z = tile_cz + local_z;
+            let y = terrain_height(world_x, world_z);
+            verts[v_off + (iz * n + ix) as usize] = Vertex {
+                position: [world_x, y, world_z],
+                normal: [0.0, 1.0, 0.0],
+            };
+        }
+    }
+
+    // Normals (finite difference)
+    let eps = step * 0.5;
+    for iz in 0..n {
+        for ix in 0..n {
+            let idx = v_off + (iz * n + ix) as usize;
+            let wx = verts[idx].position[0];
+            let wz = verts[idx].position[2];
+            let dx = terrain_height(wx + eps, wz) - terrain_height(wx - eps, wz);
+            let dz = terrain_height(wx, wz + eps) - terrain_height(wx, wz - eps);
+            let nx = -dx;
+            let ny = 2.0 * eps;
+            let nz = -dz;
+            let len = (nx * nx + ny * ny + nz * nz).sqrt();
+            verts[idx].normal = [nx / len, ny / len, nz / len];
+        }
+    }
+
+    // Indices
+    let mut ii = i_off;
+    for iz in 0..TILE_RES {
+        for ix in 0..TILE_RES {
+            let i00 = base_vertex + iz * n + ix;
+            let i01 = i00 + n;
+            idxs[ii] = i00;
+            idxs[ii + 1] = i01;
+            idxs[ii + 2] = i00 + 1;
+            idxs[ii + 3] = i00 + 1;
+            idxs[ii + 4] = i01;
+            idxs[ii + 5] = i01 + 1;
+            ii += 6;
+        }
+    }
+}
+
+/// Compute the tile slot index from local grid offsets.
+#[inline]
+pub fn tile_slot(tdx: i32, tdz: i32) -> usize {
+    ((tdx + TILE_RADIUS) as usize) * TILE_SIDE + (tdz + TILE_RADIUS) as usize
+}
+
+/// Compute the world-space tile center for a given snap position and local offset.
+#[inline]
+pub fn tile_world_center(snap_x: f32, snap_z: f32, tdx: i32, tdz: i32) -> (f32, f32) {
+    (snap_x + tdx as f32 * TILE_SIZE, snap_z + tdz as f32 * TILE_SIZE)
+}
+
+/// Generate all visible tile geometry for initial upload.
 /// Returns (all_vertices, all_indices) for ALL tiles combined.
-/// Each tile is a TILE_RES×TILE_RES grid displaced by terrain noise.
 pub fn generate_all_tiles(cam_x: f32, cam_z: f32) -> (Vec<Vertex>, Vec<u32>) {
     let snap_x = (cam_x / TILE_SIZE).round() * TILE_SIZE;
     let snap_z = (cam_z / TILE_SIZE).round() * TILE_SIZE;
 
     let total_verts = NUM_TILES * VERTS_PER_TILE;
     let total_idxs = NUM_TILES * IDXS_PER_TILE;
-    let mut verts = Vec::with_capacity(total_verts);
-    let mut idxs = Vec::with_capacity(total_idxs);
-
-    let half = TILE_SIZE / 2.0;
-    let step = TILE_SIZE / TILE_RES as f32;
-    let n = TILE_RES + 1;
+    let mut verts = vec![Vertex { position: [0.0; 3], normal: [0.0, 1.0, 0.0] }; total_verts];
+    let mut idxs = vec![0u32; total_idxs];
 
     for tdx in -TILE_RADIUS..=TILE_RADIUS {
         for tdz in -TILE_RADIUS..=TILE_RADIUS {
-            let tile_cx = snap_x + tdx as f32 * TILE_SIZE;
-            let tile_cz = snap_z + tdz as f32 * TILE_SIZE;
-            let base_vertex = verts.len() as u32;
-
-            // Vertices
-            for iz in 0..n {
-                for ix in 0..n {
-                    let local_x = -half + ix as f32 * step;
-                    let local_z = -half + iz as f32 * step;
-                    let world_x = tile_cx + local_x;
-                    let world_z = tile_cz + local_z;
-                    let y = terrain_height(world_x, world_z);
-
-                    verts.push(Vertex {
-                        position: [world_x, y, world_z],
-                        normal: [0.0, 1.0, 0.0], // computed below
-                    });
-                }
-            }
-
-            // Normals (finite difference)
-            let eps = step * 0.5;
-            let tile_base = base_vertex as usize;
-            for iz in 0..n {
-                for ix in 0..n {
-                    let idx = tile_base + (iz * n + ix) as usize;
-                    let wx = verts[idx].position[0];
-                    let wz = verts[idx].position[2];
-                    let dx = terrain_height(wx + eps, wz) - terrain_height(wx - eps, wz);
-                    let dz = terrain_height(wx, wz + eps) - terrain_height(wx, wz - eps);
-                    let nx = -dx;
-                    let ny = 2.0 * eps;
-                    let nz = -dz;
-                    let len = (nx * nx + ny * ny + nz * nz).sqrt();
-                    verts[idx].normal = [nx / len, ny / len, nz / len];
-                }
-            }
-
-            // Indices
-            for iz in 0..TILE_RES {
-                for ix in 0..TILE_RES {
-                    let i00 = base_vertex + iz * n + ix;
-                    let i10 = i00 + 1;
-                    let i01 = i00 + n;
-                    let i11 = i01 + 1;
-                    idxs.extend_from_slice(&[i00, i01, i10, i10, i01, i11]);
-                }
-            }
+            let slot = tile_slot(tdx, tdz);
+            let (cx, cz) = tile_world_center(snap_x, snap_z, tdx, tdz);
+            generate_single_tile(cx, cz, slot, &mut verts, &mut idxs);
         }
     }
 
@@ -164,24 +197,31 @@ pub fn generate_target_building() -> (Vec<Vertex>, Vec<u32>) {
     generate_box(1.0, 1.0, 1.5)
 }
 
-/// Generate the outer ring of the target bullseye (20m–100m radius annulus at y=0.01).
-pub fn generate_target_outer_ring() -> (Vec<Vertex>, Vec<u32>) {
-    let segments = 64_u32;
-    let inner_r = 20.0_f32;
-    let outer_r = 100.0_f32;
-    let y = 0.01_f32;
+/// Generate a terrain-conforming ring around the target center (world-space vertices).
+/// `cx`, `cz` are the ring center in render world space (Y-up).
+fn generate_target_ring(cx: f32, cz: f32, inner_r: f32, outer_r: f32) -> (Vec<Vertex>, Vec<u32>) {
+    let segments = 96_u32;
+    let lift = 0.05_f32; // slight lift above terrain to prevent z-fighting
     let mut verts = Vec::with_capacity((segments as usize + 1) * 2);
     let mut idxs = Vec::new();
 
     for i in 0..=segments {
         let theta = i as f32 / segments as f32 * std::f32::consts::TAU;
         let (s, c) = theta.sin_cos();
+
+        let ix = cx + c * inner_r;
+        let iz = cz + s * inner_r;
+        let iy = terrain_height(ix, iz) + lift;
         verts.push(Vertex {
-            position: [c * inner_r, y, s * inner_r],
+            position: [ix, iy, iz],
             normal: [0.0, 1.0, 0.0],
         });
+
+        let ox = cx + c * outer_r;
+        let oz = cz + s * outer_r;
+        let oy = terrain_height(ox, oz) + lift;
         verts.push(Vertex {
-            position: [c * outer_r, y, s * outer_r],
+            position: [ox, oy, oz],
             normal: [0.0, 1.0, 0.0],
         });
     }
@@ -197,31 +237,48 @@ pub fn generate_target_outer_ring() -> (Vec<Vertex>, Vec<u32>) {
     (verts, idxs)
 }
 
-/// Generate the inner disc of the target bullseye (0–20m radius fan at y=0.02).
-pub fn generate_target_inner_disc() -> (Vec<Vertex>, Vec<u32>) {
-    let segments = 64_u32;
-    let radius = 20.0_f32;
-    let y = 0.02_f32;
-    let mut verts = Vec::with_capacity(segments as usize + 2);
-    let mut idxs = Vec::new();
+/// Generate the outer ring of the target bullseye: thin ring at 40–44m radius, terrain-conforming.
+/// Vertices are in world space (model matrix = IDENTITY).
+pub fn generate_target_outer_ring() -> (Vec<Vertex>, Vec<u32>) {
+    // Target at DH (50000, 0, 0) → render (50000, 0, 0)
+    generate_target_ring(50_000.0, 0.0, 40.0, 44.0)
+}
 
-    // Center vertex
+/// Generate the inner ring + center disc of the target bullseye, terrain-conforming.
+/// Inner ring: 15–18m. Center disc: 0–5m. Combined in one mesh, world-space vertices.
+pub fn generate_target_inner_disc() -> (Vec<Vertex>, Vec<u32>) {
+    let cx = 50_000.0_f32;
+    let cz = 0.0_f32;
+
+    // Inner ring (15–18m)
+    let (mut verts, mut idxs) = generate_target_ring(cx, cz, 15.0, 18.0);
+
+    // Center disc (0–5m) as a triangle fan
+    let segments = 64_u32;
+    let radius = 5.0_f32;
+    let lift = 0.06_f32; // slightly above outer ring
+
+    let center_base = verts.len() as u32;
+    let cy = terrain_height(cx, cz) + lift;
     verts.push(Vertex {
-        position: [0.0, y, 0.0],
+        position: [cx, cy, cz],
         normal: [0.0, 1.0, 0.0],
     });
 
     for i in 0..=segments {
         let theta = i as f32 / segments as f32 * std::f32::consts::TAU;
         let (s, c) = theta.sin_cos();
+        let px = cx + c * radius;
+        let pz = cz + s * radius;
+        let py = terrain_height(px, pz) + lift;
         verts.push(Vertex {
-            position: [c * radius, y, s * radius],
+            position: [px, py, pz],
             normal: [0.0, 1.0, 0.0],
         });
     }
 
     for i in 0..segments {
-        idxs.extend_from_slice(&[0, i + 1, i + 2]);
+        idxs.extend_from_slice(&[center_base, center_base + i + 1, center_base + i + 2]);
     }
 
     (verts, idxs)
@@ -230,6 +287,47 @@ pub fn generate_target_inner_disc() -> (Vec<Vertex>, Vec<u32>) {
 /// Generate the launch rail.
 pub fn generate_launch_rail() -> (Vec<Vertex>, Vec<u32>) {
     generate_cylinder(0.05, 5.0, 8)
+}
+
+/// White flag color.
+pub const FLAG_COLOR: [f32; 4] = [0.95, 0.95, 0.92, 1.0];
+
+/// Rock color (sandy brown).
+pub const ROCK_COLOR: [f32; 4] = [0.50, 0.45, 0.38, 1.0];
+
+/// Generate a flagpole: thin vertical cylinder (6m tall, 0.03m radius) with a flag quad at the top.
+/// Geometry is in render Y-up space: pole along +Y, flag hangs from top.
+pub fn generate_flagpole() -> (Vec<Vertex>, Vec<u32>) {
+    // Pole: cylinder along Y axis
+    let (mut verts, mut idxs) = generate_cylinder(0.03, 6.0, 8);
+
+    // Shift pole up so base is at y=0 (generate_cylinder centers at origin)
+    for v in &mut verts {
+        v.position[1] += 3.0;
+    }
+
+    // Flag quad at top of pole (y ≈ 6.0), extending in +Z, hanging in -Y
+    let flag_w = 0.8_f32;
+    let flag_h = 0.5_f32;
+    let top_y = 6.0_f32;
+
+    // Front face (normal +X)
+    let b = verts.len() as u32;
+    verts.push(Vertex { position: [0.0, top_y, 0.0], normal: [1.0, 0.0, 0.0] });
+    verts.push(Vertex { position: [0.0, top_y, flag_w], normal: [1.0, 0.0, 0.0] });
+    verts.push(Vertex { position: [0.0, top_y - flag_h, flag_w], normal: [1.0, 0.0, 0.0] });
+    verts.push(Vertex { position: [0.0, top_y - flag_h, 0.0], normal: [1.0, 0.0, 0.0] });
+    idxs.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
+
+    // Back face (normal -X)
+    let b = verts.len() as u32;
+    verts.push(Vertex { position: [0.0, top_y, 0.0], normal: [-1.0, 0.0, 0.0] });
+    verts.push(Vertex { position: [0.0, top_y, flag_w], normal: [-1.0, 0.0, 0.0] });
+    verts.push(Vertex { position: [0.0, top_y - flag_h, flag_w], normal: [-1.0, 0.0, 0.0] });
+    verts.push(Vertex { position: [0.0, top_y - flag_h, 0.0], normal: [-1.0, 0.0, 0.0] });
+    idxs.extend_from_slice(&[b, b + 2, b + 1, b, b + 3, b + 2]);
+
+    (verts, idxs)
 }
 
 /// Reference buildings along the route.

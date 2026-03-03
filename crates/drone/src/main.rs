@@ -69,6 +69,7 @@ enum CameraMode {
     Orbit,
     Chase,
     Side,
+    Ground,
 }
 
 impl CameraMode {
@@ -76,7 +77,8 @@ impl CameraMode {
         match self {
             Self::Orbit => Self::Chase,
             Self::Chase => Self::Side,
-            Self::Side => Self::Orbit,
+            Self::Side => Self::Ground,
+            Self::Ground => Self::Orbit,
         }
     }
 
@@ -85,6 +87,7 @@ impl CameraMode {
             Self::Orbit => "Orbit",
             Self::Chase => "Chase",
             Self::Side => "Side",
+            Self::Ground => "Ground",
         }
     }
 }
@@ -144,10 +147,18 @@ struct App {
     terrain_num_indices: u32,
     terrain_material: Option<MaterialBind>,
     last_terrain_snap: (i32, i32), // cached snap position to avoid regen every frame
+    /// CPU-side terrain vertex cache for incremental updates.
+    terrain_verts: Vec<simuforge_core::Vertex>,
+    /// CPU-side terrain index cache for incremental updates.
+    terrain_idxs: Vec<u32>,
+    /// Queue of tile slots pending regeneration (slot_index, tile_cx, tile_cz).
+    terrain_regen_queue: Vec<(usize, f32, f32)>,
     building_mesh: Option<GpuMesh>,
     building_material: Option<MaterialBind>,
     rail_mesh: Option<GpuMesh>,
     rail_material: Option<MaterialBind>,
+    flag_mesh: Option<GpuMesh>,
+    flag_material: Option<MaterialBind>,
     ref_building_meshes: Vec<GpuMesh>,
     ref_building_materials: Vec<MaterialBind>,
     // GPU meshes — drone
@@ -160,6 +171,13 @@ struct App {
     target_outer_material: Option<MaterialBind>,
     target_inner_mesh: Option<GpuMesh>,
     target_inner_material: Option<MaterialBind>,
+    // Drone outline (ground mode visibility)
+    drone_outline_material: Option<MaterialBind>,
+    // Ground camera
+    ground_cam_pos: Vec3,
+    ground_cam_yaw: f32,
+    ground_cam_pitch: f32,
+    ground_cam_fov: f32,
     // Trail
     trail_pipeline: Option<LinePipeline>,
     trail_points: Vec<(Vec3, [f32; 4])>,
@@ -171,8 +189,13 @@ struct App {
     wind_voice: Option<Arc<Mutex<sound::WindVoice>>>,
     // Wind
     wind: nalgebra::Vector3<f64>,
-    // Radar
-    show_radar: bool,
+    wind_speed: f64,
+    wind_direction: f64,
+    // Audio controls
+    master_volume: f32,
+    engine_muted: bool,
+    // Minimap trail (DH x,y coords)
+    minimap_trail: Vec<[f64; 2]>,
     // Post-processing
     post_sampler: Option<wgpu::Sampler>,
     depth_sampler: Option<wgpu::Sampler>,
@@ -225,16 +248,26 @@ impl App {
             terrain_num_indices: 0,
             terrain_material: None,
             last_terrain_snap: (i32::MAX, i32::MAX),
+            terrain_verts: Vec::new(),
+            terrain_idxs: Vec::new(),
+            terrain_regen_queue: Vec::new(),
             building_mesh: None,
             building_material: None,
             rail_mesh: None,
             rail_material: None,
+            flag_mesh: None,
+            flag_material: None,
             ref_building_meshes: Vec::new(),
             ref_building_materials: Vec::new(),
             drone_mesh: None,
             drone_material: None,
+            drone_outline_material: None,
             prop_mesh: None,
             prop_material: None,
+            ground_cam_pos: Vec3::new(0.0, 0.0, 0.0),
+            ground_cam_yaw: 0.0,
+            ground_cam_pitch: 0.2,
+            ground_cam_fov: std::f32::consts::FRAC_PI_4, // 45° default
             target_outer_mesh: None,
             target_outer_material: None,
             target_inner_mesh: None,
@@ -247,7 +280,11 @@ impl App {
             engine_voice: None,
             wind_voice: None,
             wind: nalgebra::Vector3::new(8.0, 0.0, 0.0), // 8 m/s tailwind
-            show_radar: true,
+            wind_speed: 8.0,
+            wind_direction: 0.0,
+            master_volume: 0.5,
+            engine_muted: false,
+            minimap_trail: Vec::new(),
             post_sampler: None,
             depth_sampler: None,
             ssao_bind_group: None,
@@ -272,17 +309,28 @@ impl App {
         self.engine_voice = None;
         self.wind_voice = None;
         self.last_terrain_snap = (i32::MAX, i32::MAX);
+        self.terrain_regen_queue.clear();
+        self.minimap_trail.clear();
         // Reset camera to launch view
         self.camera.target = Vec3::new(0.0, 2.0, 0.0);
         self.camera.distance = 25.0;
         self.camera.yaw = -0.3;
         self.camera.pitch = 0.15;
         self.camera_mode = CameraMode::Orbit;
+        self.ground_cam_pos = Vec3::ZERO;
+        self.ground_cam_yaw = 0.0;
+        self.ground_cam_pitch = 0.2;
+        self.ground_cam_fov = std::f32::consts::FRAC_PI_4;
     }
 
     /// Update camera based on current mode and drone position.
     fn update_camera(&mut self) {
         let drone_render = to_render(&self.flight.position);
+
+        // Restore default FOV when not in ground mode
+        if self.camera_mode != CameraMode::Ground {
+            self.camera.fov = std::f32::consts::FRAC_PI_4;
+        }
 
         match self.camera_mode {
             CameraMode::Orbit => {
@@ -316,6 +364,24 @@ impl App {
                     self.camera.yaw = diff.z.atan2(diff.x);
                     self.camera.pitch = (diff.y / self.camera.distance).asin();
                 }
+            }
+            CameraMode::Ground => {
+                // Ground observer: first-person, always above terrain surface
+                let ground_y = terrain::terrain_height(self.ground_cam_pos.x, self.ground_cam_pos.z);
+                let eye_height = (ground_y + 1.7).max(1.7); // always at least 1.7m above sea level
+                let eye_pos = Vec3::new(self.ground_cam_pos.x, eye_height, self.ground_cam_pos.z);
+                // Look direction from yaw/pitch
+                let look_dir = Vec3::new(
+                    self.ground_cam_yaw.cos() * self.ground_cam_pitch.cos(),
+                    self.ground_cam_pitch.sin(),
+                    self.ground_cam_yaw.sin() * self.ground_cam_pitch.cos(),
+                );
+                self.camera.target = eye_pos + look_dir * 100.0;
+                self.camera.distance = 100.0;
+                self.camera.fov = self.ground_cam_fov;
+                let diff = eye_pos - self.camera.target;
+                self.camera.yaw = diff.z.atan2(diff.x);
+                self.camera.pitch = (diff.y / self.camera.distance).asin();
             }
         }
     }
@@ -376,7 +442,7 @@ impl App {
         if let Some(m) = &self.terrain_material {
             let mut mat = MaterialUniform::metal(terrain::SAND_COLOR)
                 .with_model(Mat4::IDENTITY.to_cols_array_2d());
-            mat.params = [0.95, 0.0, 0.0, 0.0]; // very rough desert sand
+            mat.params = [0.95, 0.0, 0.0, 1.0]; // very rough desert sand, params.w=1 = terrain flag
             ctx.queue.write_buffer(&m.buffer, 0, bytemuck::bytes_of(&mat));
         }
 
@@ -404,6 +470,11 @@ impl App {
         let rail_rot = Quat::from_rotation_z(10.0_f32.to_radians());
         let rail_model = Mat4::from_rotation_translation(rail_rot, rail_render);
 
+        // Flag at top of rail — DH: rail base (0,0,1) + 5m along 10° angle → top ≈ (4.92, 0, 1.87)
+        let flag_dh = Vec3::new(4.9, 0.0, 1.85);
+        let flag_render = swap.transform_point3(flag_dh);
+        let flag_model = Mat4::from_translation(flag_render);
+
         // Reference buildings
         let ref_buildings = terrain::reference_buildings();
         let ref_models: Vec<Mat4> = ref_buildings.iter().map(|(x, _, hy, _)| {
@@ -427,6 +498,12 @@ impl App {
                 .with_model(rail_model.to_cols_array_2d());
             ctx.queue.write_buffer(&m.buffer, 0, bytemuck::bytes_of(&mat));
         }
+        if let Some(m) = &self.flag_material {
+            let mut mat = MaterialUniform::metal(terrain::FLAG_COLOR)
+                .with_model(flag_model.to_cols_array_2d());
+            mat.params = [0.9, 0.0, 0.0, 0.0]; // rough cloth, non-metallic
+            ctx.queue.write_buffer(&m.buffer, 0, bytemuck::bytes_of(&mat));
+        }
         for (i, m) in self.ref_building_materials.iter().enumerate() {
             if i < ref_models.len() {
                 let mut mat = MaterialUniform::metal(terrain::REF_BUILDING_COLOR)
@@ -440,6 +517,16 @@ impl App {
                 .with_model(drone_model.to_cols_array_2d());
             mat.params = [0.6, 0.2, 0.0, 0.0];
             ctx.queue.write_buffer(&m.buffer, 0, bytemuck::bytes_of(&mat));
+        }
+        // Drone outline (scaled up, bright red) for ground mode visibility
+        if self.camera_mode == CameraMode::Ground {
+            if let Some(m) = &self.drone_outline_material {
+                let outline_model = drone_model * Mat4::from_scale(Vec3::splat(1.08));
+                let mut mat = MaterialUniform::metal([1.0, 0.1, 0.1, 1.0])
+                    .with_model(outline_model.to_cols_array_2d());
+                mat.params = [1.0, 0.0, 0.0, 0.0]; // full rough, no metallic
+                ctx.queue.write_buffer(&m.buffer, 0, bytemuck::bytes_of(&mat));
+            }
         }
         if let Some(m) = &self.prop_material {
             let mat = MaterialUniform::metal(drone::PROP_COLOR)
@@ -459,9 +546,10 @@ impl App {
             ctx.queue.write_buffer(&m.buffer, 0, bytemuck::bytes_of(&mat));
         }
 
-        // --- Shadow setup (centered on drone for nearby detail) ---
+        // --- Shadow setup (centered on drone, radius scales with camera distance) ---
         let drone_render = to_render(&self.flight.position);
-        let scene_radius = 60.0_f32;
+        let cam_dist = (self.camera.eye() - drone_render).length();
+        let scene_radius = cam_dist.clamp(60.0, 800.0);
         let light_pos = drone_render - light_dir * scene_radius * 2.0;
         let shadow_view = Mat4::look_at_rh(light_pos, drone_render, Vec3::Y);
         let shadow_proj = Mat4::orthographic_rh(
@@ -476,6 +564,7 @@ impl App {
         shadow_matrices.push(light_vp * Mat4::IDENTITY); // terrain is in world space
         shadow_matrices.push(light_vp * building_model);
         shadow_matrices.push(light_vp * rail_model);
+        shadow_matrices.push(light_vp * flag_model);
         for rm in &ref_models {
             if shadow_matrices.len() < 28 {
                 shadow_matrices.push(light_vp * *rm);
@@ -573,6 +662,17 @@ impl App {
 
             // Rail
             if let Some(mesh) = &self.rail_mesh {
+                if si < shadow_matrices.len() {
+                    pass.set_bind_group(0, &shadow.bind_group, &[ShadowPipeline::dynamic_offset(si)]);
+                    pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..mesh.num_indices, 0, 0..1);
+                }
+            }
+            si += 1;
+
+            // Flag
+            if let Some(mesh) = &self.flag_mesh {
                 if si < shadow_matrices.len() {
                     pass.set_bind_group(0, &shadow.bind_group, &[ShadowPipeline::dynamic_offset(si)]);
                     pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
@@ -686,6 +786,7 @@ impl App {
             // Buildings
             draw_mesh!(&self.building_mesh, &self.building_material);
             draw_mesh!(&self.rail_mesh, &self.rail_material);
+            draw_mesh!(&self.flag_mesh, &self.flag_material);
             for (mesh, mat) in self.ref_building_meshes.iter().zip(self.ref_building_materials.iter()) {
                 pass.set_bind_group(0, &mat.bind_group, &[]);
                 pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
@@ -697,6 +798,10 @@ impl App {
             draw_mesh!(&self.target_outer_mesh, &self.target_outer_material);
             draw_mesh!(&self.target_inner_mesh, &self.target_inner_material);
 
+            // Drone outline (ground mode: scaled-up red halo drawn first)
+            if self.camera_mode == CameraMode::Ground {
+                draw_mesh!(&self.drone_mesh, &self.drone_outline_material);
+            }
             // Drone
             draw_mesh!(&self.drone_mesh, &self.drone_material);
             draw_mesh!(&self.prop_mesh, &self.prop_material);
@@ -766,10 +871,17 @@ impl App {
         if let Some(trail) = &mut self.trail_pipeline {
             if self.trail_points.len() >= 2 {
                 let n = self.trail_points.len();
-                let mut verts = Vec::with_capacity(n * 2);
+                let mut verts = Vec::with_capacity(n * 2 + 2);
                 for i in 0..n - 1 {
                     verts.push(LineVertex { position: self.trail_points[i].0.into(), color: self.trail_points[i].1 });
                     verts.push(LineVertex { position: self.trail_points[i + 1].0.into(), color: self.trail_points[i + 1].1 });
+                }
+                // Bridge gap: connect last trail point to current drone position
+                let drone_pos = to_render(&self.flight.position);
+                let current_color = self.guidance.phase.trail_color();
+                if let Some(last) = self.trail_points.last() {
+                    verts.push(LineVertex { position: last.0.into(), color: last.1 });
+                    verts.push(LineVertex { position: drone_pos.into(), color: current_color });
                 }
                 trail.upload(&ctx.queue, &verts);
             } else {
@@ -802,11 +914,35 @@ impl App {
             .take_egui_input(self.window.as_ref().unwrap());
         self.egui_ctx.begin_pass(egui_input);
         let mut new_exposure = self.sky_exposure;
-        draw_hud(&self.egui_ctx, &self.flight, &self.guidance, self.time_scale, self.fps, self.camera_mode, &mut new_exposure, &self.wind);
-        if self.show_radar {
-            draw_radar(&self.egui_ctx, &self.flight, &self.guidance);
+        let mut new_wind_speed = self.wind_speed;
+        let mut new_wind_dir = self.wind_direction;
+        let mut new_master_vol = self.master_volume;
+        let mut new_engine_muted = self.engine_muted;
+        let mut cam_mode = self.camera_mode;
+        draw_mission_control(
+            &self.egui_ctx, &self.flight, &self.guidance,
+            self.time_scale, self.fps, &mut cam_mode,
+            &mut new_exposure, &self.wind,
+            &mut new_wind_speed, &mut new_wind_dir,
+            &mut new_master_vol, &mut new_engine_muted,
+        );
+        self.camera_mode = cam_mode;
+        let minimap_click = draw_minimap(
+            &self.egui_ctx, &self.flight, &self.guidance, &self.minimap_trail,
+            &self.wind, self.camera_mode, &self.ground_cam_pos, self.ground_cam_yaw,
+        );
+        if let Some([dh_x, dh_y]) = minimap_click {
+            // Convert DH coords to render coords and place ground camera
+            self.ground_cam_pos = Vec3::new(dh_x as f32, 0.0, -(dh_y as f32));
+            self.ground_cam_yaw = 0.0;
+            self.ground_cam_pitch = 0.2;
+            self.camera_mode = CameraMode::Ground;
         }
         self.sky_exposure = new_exposure;
+        self.wind_speed = new_wind_speed;
+        self.wind_direction = new_wind_dir;
+        self.master_volume = new_master_vol;
+        self.engine_muted = new_engine_muted;
         let egui_output = self.egui_ctx.end_pass();
         let egui_prims = self.egui_ctx.tessellate(egui_output.shapes, egui_output.pixels_per_point);
         let screen = egui_wgpu::ScreenDescriptor {
@@ -846,23 +982,30 @@ impl App {
     }
 }
 
-// ── HUD ──────────────────────────────────────────────────────────────────────
+// ── Mission Control ──────────────────────────────────────────────────────────
 
-fn draw_hud(
+fn draw_mission_control(
     ctx: &egui::Context,
     flight: &FlightState,
     guidance: &Guidance,
     time_scale: f64,
     fps: f64,
-    camera_mode: CameraMode,
+    camera_mode: &mut CameraMode,
     sky_exposure: &mut f32,
     wind: &nalgebra::Vector3<f64>,
+    wind_speed: &mut f64,
+    wind_direction: &mut f64,
+    master_volume: &mut f32,
+    engine_muted: &mut bool,
 ) {
-    egui::Area::new(egui::Id::new("telemetry"))
-        .fixed_pos(egui::pos2(10.0, 10.0))
+    egui::Window::new("Mission Control")
+        .default_pos(egui::pos2(10.0, 10.0))
+        .default_width(240.0)
+        .resizable(false)
         .show(ctx, |ui| {
             ui.visuals_mut().override_text_color = Some(egui::Color32::WHITE);
 
+            // ── Telemetry ──
             let phase_color = guidance.phase.color();
             let ec = egui::Color32::from_rgba_unmultiplied(
                 (phase_color[0] * 255.0) as u8, (phase_color[1] * 255.0) as u8,
@@ -879,19 +1022,48 @@ fn draw_hud(
             ui.label(egui::RichText::new(dist_label).size(16.0));
             let fuel_pct = flight.fuel_mass / flight::FUEL_INIT * 100.0;
             ui.label(egui::RichText::new(format!("Fuel: {:.1} kg ({:.0}%)", flight.fuel_mass, fuel_pct)).size(16.0));
-            let wind_speed = wind.norm();
-            let wind_dir = wind.y.atan2(wind.x).to_degrees().rem_euclid(360.0);
-            ui.label(egui::RichText::new(format!("Wind: {:.0} m/s @ {:.0}\u{00b0}", wind_speed, wind_dir)).size(16.0).color(egui::Color32::from_rgb(140, 200, 255)));
+            let w_speed = wind.norm();
+            let w_dir = wind.y.atan2(wind.x).to_degrees().rem_euclid(360.0);
+            ui.label(egui::RichText::new(format!("Wind: {:.0} m/s @ {:.0}\u{00b0}", w_speed, w_dir)).size(16.0).color(egui::Color32::from_rgb(140, 200, 255)));
             ui.label(egui::RichText::new(format!("T+{:.1}s", guidance.mission_time)).size(14.0).color(egui::Color32::LIGHT_GRAY));
-            ui.add_space(4.0);
+            ui.add_space(2.0);
             ui.label(egui::RichText::new(format!("Time: {:.0}x", time_scale)).size(14.0).color(egui::Color32::YELLOW));
             ui.label(egui::RichText::new(format!("Cam: {}", camera_mode.label())).size(14.0).color(egui::Color32::LIGHT_GRAY));
+            // Ground mode: Back to Drone button
+            if *camera_mode == CameraMode::Ground {
+                if ui.button(egui::RichText::new("Back to Drone").size(14.0).color(egui::Color32::YELLOW)).clicked() {
+                    *camera_mode = CameraMode::Chase;
+                }
+            }
             ui.label(egui::RichText::new(format!("{:.0} FPS", fps)).size(13.0).color(egui::Color32::LIGHT_GRAY));
             let lat = 33.5 + flight.position.y * 0.000009;
             let lon = 45.0 + flight.position.x * 0.000009;
             ui.label(egui::RichText::new(format!("GPS: {:.4}\u{00b0}N  {:.4}\u{00b0}E", lat, lon)).size(13.0).color(egui::Color32::from_rgb(100, 200, 100)));
+
+            // ── Settings ──
+            ui.separator();
+            ui.label(egui::RichText::new("Sky Exposure").size(13.0));
+            ui.add(egui::Slider::new(sky_exposure, 0.05..=3.0).logarithmic(true).text(""));
+
+            ui.label(egui::RichText::new("Wind Speed (m/s)").size(13.0));
+            let mut ws = *wind_speed as f32;
+            if ui.add(egui::Slider::new(&mut ws, 0.0..=25.0).text("")).changed() {
+                *wind_speed = ws as f64;
+            }
+
+            ui.label(egui::RichText::new("Wind Direction (\u{00b0})").size(13.0));
+            let mut wd = *wind_direction as f32;
+            if ui.add(egui::Slider::new(&mut wd, 0.0..=359.0).text("")).changed() {
+                *wind_direction = wd as f64;
+            }
+
+            ui.label(egui::RichText::new("Volume").size(13.0));
+            ui.add(egui::Slider::new(master_volume, 0.0..=1.0).text(""));
+
+            ui.checkbox(engine_muted, "Mute Engine");
         });
 
+    // Instructions at bottom (PreLaunch/Impact only)
     if guidance.phase == FlightPhase::PreLaunch || guidance.phase == FlightPhase::Impact {
         egui::Area::new(egui::Id::new("instructions"))
             .fixed_pos(egui::pos2(10.0, ctx.screen_rect().height() - 100.0))
@@ -901,97 +1073,277 @@ fn draw_hud(
                 } else {
                     ui.label(egui::RichText::new("IMPACT - Mission Complete").size(20.0).color(egui::Color32::RED).strong());
                 }
-                ui.label(egui::RichText::new("R: Reset  |  1-5: Time scale  |  C: Camera  |  P: Pause").size(14.0).color(egui::Color32::LIGHT_GRAY));
+                ui.label(egui::RichText::new("R: Reset | 1-5: Time | C: Camera | P: Pause | Click map: Ground cam | B: Back").size(14.0).color(egui::Color32::LIGHT_GRAY));
             });
     }
-
-    // Settings panel (top-right)
-    egui::Window::new("Settings")
-        .default_pos(egui::pos2(ctx.screen_rect().width() - 220.0, 10.0))
-        .default_width(200.0)
-        .resizable(false)
-        .show(ctx, |ui| {
-            ui.label("Sky Exposure");
-            ui.add(egui::Slider::new(sky_exposure, 0.05..=3.0).logarithmic(true).text(""));
-        });
 }
 
-// ── Radar ─────────────────────────────────────────────────────────────────────
+// ── GIS Minimap ──────────────────────────────────────────────────────────────
 
-fn draw_radar(ctx: &egui::Context, flight: &FlightState, guidance: &Guidance) {
-    egui::Window::new("Radar")
-        .default_pos(egui::pos2(ctx.screen_rect().width() - 220.0, 80.0))
-        .default_width(200.0)
+fn draw_minimap(
+    ctx: &egui::Context,
+    flight: &FlightState,
+    guidance: &Guidance,
+    minimap_trail: &[[f64; 2]],
+    wind: &nalgebra::Vector3<f64>,
+    camera_mode: CameraMode,
+    ground_cam_pos: &Vec3,
+    ground_cam_yaw: f32,
+) -> Option<[f64; 2]> {
+    let mut clicked_pos: Option<[f64; 2]> = None;
+    egui::Window::new("Map")
+        .default_pos(egui::pos2(ctx.screen_rect().width() - 320.0, 10.0))
+        .default_width(300.0)
         .resizable(false)
         .show(ctx, |ui| {
-            let size = egui::vec2(180.0, 180.0);
-            let (response, painter) = ui.allocate_painter(size, egui::Sense::hover());
+            let map_size = egui::vec2(280.0, 280.0);
+            let (response, painter) = ui.allocate_painter(map_size, egui::Sense::click());
             let rect = response.rect;
             let center = rect.center();
-            let radius = rect.width().min(rect.height()) * 0.45;
 
-            // Dark green background
-            painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(10, 30, 10));
+            // Map projection: center (25000, 0), half-range 28km
+            let map_cx = 25_000.0_f64;
+            let map_cy = 0.0_f64;
+            let half_range = 28_000.0_f64;
+            let map_half = rect.width().min(rect.height()) * 0.5;
 
-            // Range circles
-            let dist_to_target = guidance.distance_to_target(&flight.position);
-            let scale_km = if dist_to_target > 20_000.0 { 50.0 }
-                else if dist_to_target > 5_000.0 { 10.0 }
-                else { 2.0 };
-            let ring_color = egui::Color32::from_rgba_unmultiplied(40, 100, 40, 120);
-            for ring in 1..=3 {
-                let r = radius * ring as f32 / 3.0;
-                painter.circle_stroke(center, r, egui::Stroke::new(1.0, ring_color));
+            let to_screen = |dh_x: f64, dh_y: f64| -> egui::Pos2 {
+                let sx = ((dh_x - map_cx) / half_range) as f32 * map_half + center.x;
+                let sy = -((dh_y - map_cy) / half_range) as f32 * map_half + center.y;
+                egui::pos2(sx, sy)
+            };
+
+            // Sand background
+            painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(194, 178, 128));
+
+            // Grid lines every 10km
+            let grid_color = egui::Color32::from_rgba_unmultiplied(139, 119, 80, 80);
+            let grid_step = 10_000.0_f64;
+            let grid_min_x = ((map_cx - half_range) / grid_step).ceil() as i32;
+            let grid_max_x = ((map_cx + half_range) / grid_step).floor() as i32;
+            let grid_min_y = ((map_cy - half_range) / grid_step).ceil() as i32;
+            let grid_max_y = ((map_cy + half_range) / grid_step).floor() as i32;
+            for gx in grid_min_x..=grid_max_x {
+                let x = gx as f64 * grid_step;
+                let p0 = to_screen(x, map_cy - half_range);
+                let p1 = to_screen(x, map_cy + half_range);
+                painter.line_segment([p0, p1], egui::Stroke::new(1.0, grid_color));
+            }
+            for gy in grid_min_y..=grid_max_y {
+                let y = gy as f64 * grid_step;
+                let p0 = to_screen(map_cx - half_range, y);
+                let p1 = to_screen(map_cx + half_range, y);
+                painter.line_segment([p0, p1], egui::Stroke::new(1.0, grid_color));
             }
 
-            // Target at center (red dot)
-            painter.circle_filled(center, 4.0, egui::Color32::from_rgb(200, 40, 40));
+            // Flight trail (green polyline)
+            if minimap_trail.len() >= 2 {
+                let trail_color = egui::Color32::from_rgb(40, 180, 40);
+                for i in 0..minimap_trail.len() - 1 {
+                    let p0 = to_screen(minimap_trail[i][0], minimap_trail[i][1]);
+                    let p1 = to_screen(minimap_trail[i + 1][0], minimap_trail[i + 1][1]);
+                    painter.line_segment([p0, p1], egui::Stroke::new(1.5, trail_color));
+                }
+            }
 
-            // Drone position relative to target
-            let dx = flight.position.x - guidance::TARGET_POS.x;
-            let dy = flight.position.y - guidance::TARGET_POS.y;
-            let max_range = scale_km * 1000.0; // meters
-            let px = (dx / max_range) as f32 * radius;
-            let py = -(dy / max_range) as f32 * radius; // flip Y for screen coords
-            let drone_screen = egui::pos2(center.x + px, center.y + py);
+            // Launch marker (green dot + label)
+            let launch_pos = to_screen(0.0, 0.0);
+            painter.circle_filled(launch_pos, 4.0, egui::Color32::from_rgb(40, 200, 40));
+            painter.text(
+                egui::pos2(launch_pos.x + 8.0, launch_pos.y),
+                egui::Align2::LEFT_CENTER,
+                "LAUNCH",
+                egui::FontId::proportional(10.0),
+                egui::Color32::from_rgb(40, 200, 40),
+            );
 
-            // Clamp drone dot to circle
-            let d = ((drone_screen.x - center.x).powi(2) + (drone_screen.y - center.y).powi(2)).sqrt();
-            let drone_pos = if d > radius {
-                let scale = radius / d;
-                egui::pos2(
-                    center.x + (drone_screen.x - center.x) * scale,
-                    center.y + (drone_screen.y - center.y) * scale,
-                )
-            } else {
-                drone_screen
-            };
+            // Target marker (red X + label)
+            let tgt_pos = to_screen(guidance::TARGET_POS.x, guidance::TARGET_POS.y);
+            let x_size = 5.0_f32;
+            let x_color = egui::Color32::from_rgb(220, 40, 40);
+            painter.line_segment(
+                [egui::pos2(tgt_pos.x - x_size, tgt_pos.y - x_size), egui::pos2(tgt_pos.x + x_size, tgt_pos.y + x_size)],
+                egui::Stroke::new(2.0, x_color),
+            );
+            painter.line_segment(
+                [egui::pos2(tgt_pos.x + x_size, tgt_pos.y - x_size), egui::pos2(tgt_pos.x - x_size, tgt_pos.y + x_size)],
+                egui::Stroke::new(2.0, x_color),
+            );
+            painter.text(
+                egui::pos2(tgt_pos.x + 8.0, tgt_pos.y),
+                egui::Align2::LEFT_CENTER,
+                "TGT",
+                egui::FontId::proportional(10.0),
+                x_color,
+            );
 
-            painter.circle_filled(drone_pos, 3.0, egui::Color32::from_rgb(40, 200, 40));
+            // Waypoints (yellow dots + labels)
+            let wp_color = egui::Color32::from_rgb(220, 200, 40);
+            // Skip last waypoint (it's the target)
+            let num_wps = if guidance.waypoints.len() > 1 { guidance.waypoints.len() - 1 } else { 0 };
+            for (i, wp) in guidance.waypoints.iter().take(num_wps).enumerate() {
+                let wp_pos = to_screen(wp.x, wp.y);
+                painter.circle_filled(wp_pos, 3.0, wp_color);
+                painter.text(
+                    egui::pos2(wp_pos.x + 6.0, wp_pos.y),
+                    egui::Align2::LEFT_CENTER,
+                    format!("W{}", i + 1),
+                    egui::FontId::proportional(9.0),
+                    wp_color,
+                );
+            }
 
-            // Range text
+            // Drone icon (green filled triangle pointing in heading direction)
+            let drone_pos = to_screen(flight.position.x, flight.position.y);
+            let heading = flight.heading as f32;
+            // DH heading: 0 = +X (east on map = right), heading rotates CCW
+            // Screen: +X = right, +Y = down. Map: DH +X = right, DH +Y = up (flipped)
+            let tri_size = 7.0_f32;
+            let tri_color = egui::Color32::from_rgb(40, 220, 40);
+            // Forward is toward heading, which in screen coords: dx=cos(h), dy=-sin(h)
+            let fwd_x = heading.cos();
+            let fwd_y = -heading.sin();
+            let tip = egui::pos2(drone_pos.x + fwd_x * tri_size, drone_pos.y + fwd_y * tri_size);
+            let left = egui::pos2(
+                drone_pos.x + (-fwd_x * 0.5 + fwd_y * 0.5) * tri_size,
+                drone_pos.y + (-fwd_y * 0.5 - fwd_x * 0.5) * tri_size,
+            );
+            let right = egui::pos2(
+                drone_pos.x + (-fwd_x * 0.5 - fwd_y * 0.5) * tri_size,
+                drone_pos.y + (-fwd_y * 0.5 + fwd_x * 0.5) * tri_size,
+            );
+            painter.add(egui::Shape::convex_polygon(
+                vec![tip, left, right],
+                tri_color,
+                egui::Stroke::NONE,
+            ));
+
+            // Distance readout at bottom
+            let dist_to_target = guidance.distance_to_target(&flight.position);
             let range_text = if dist_to_target > 1000.0 {
-                format!("{:.1} km", dist_to_target / 1000.0)
+                format!("{:.1} km to target", dist_to_target / 1000.0)
             } else {
-                format!("{:.0} m", dist_to_target)
+                format!("{:.0} m to target", dist_to_target)
             };
             painter.text(
-                egui::pos2(center.x, rect.max.y - 8.0),
+                egui::pos2(center.x, rect.max.y - 6.0),
                 egui::Align2::CENTER_BOTTOM,
                 range_text,
                 egui::FontId::proportional(12.0),
-                egui::Color32::from_rgb(80, 180, 80),
+                egui::Color32::from_rgb(60, 60, 40),
             );
 
-            // Scale label
-            painter.text(
-                egui::pos2(rect.min.x + 4.0, rect.min.y + 4.0),
-                egui::Align2::LEFT_TOP,
-                format!("{:.0} km", scale_km),
-                egui::FontId::proportional(10.0),
-                egui::Color32::from_rgb(60, 140, 60),
+            // Scale bar at top-left (10km reference)
+            let bar_start = to_screen(map_cx - half_range + 2000.0, map_cy + half_range - 2000.0);
+            let bar_len_px = (10_000.0 / half_range) as f32 * map_half;
+            let bar_end = egui::pos2(bar_start.x + bar_len_px, bar_start.y);
+            let bar_color = egui::Color32::from_rgb(80, 70, 50);
+            painter.line_segment([bar_start, bar_end], egui::Stroke::new(2.0, bar_color));
+            // End ticks
+            painter.line_segment(
+                [egui::pos2(bar_start.x, bar_start.y - 3.0), egui::pos2(bar_start.x, bar_start.y + 3.0)],
+                egui::Stroke::new(1.5, bar_color),
             );
+            painter.line_segment(
+                [egui::pos2(bar_end.x, bar_end.y - 3.0), egui::pos2(bar_end.x, bar_end.y + 3.0)],
+                egui::Stroke::new(1.5, bar_color),
+            );
+            painter.text(
+                egui::pos2((bar_start.x + bar_end.x) * 0.5, bar_start.y - 6.0),
+                egui::Align2::CENTER_BOTTOM,
+                "10 km",
+                egui::FontId::proportional(10.0),
+                bar_color,
+            );
+
+            // ── Compass rose (bottom-left corner) ──
+            let compass_center = egui::pos2(rect.min.x + 30.0, rect.max.y - 30.0);
+            let compass_r = 18.0_f32;
+            painter.circle_stroke(compass_center, compass_r, egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(80, 70, 50, 120)));
+
+            // Cardinal direction ticks and labels
+            let directions = [
+                ("N", 0.0_f32, -1.0_f32, egui::Color32::from_rgb(220, 40, 40)),
+                ("E", 1.0, 0.0, egui::Color32::WHITE),
+                ("S", 0.0, 1.0, egui::Color32::WHITE),
+                ("W", -1.0, 0.0, egui::Color32::WHITE),
+            ];
+            for (label, dx, dy, color) in &directions {
+                let tick_inner = egui::pos2(compass_center.x + dx * (compass_r - 4.0), compass_center.y + dy * (compass_r - 4.0));
+                let tick_outer = egui::pos2(compass_center.x + dx * compass_r, compass_center.y + dy * compass_r);
+                painter.line_segment([tick_inner, tick_outer], egui::Stroke::new(1.5, *color));
+                let label_pos = egui::pos2(compass_center.x + dx * (compass_r + 8.0), compass_center.y + dy * (compass_r + 8.0));
+                painter.text(label_pos, egui::Align2::CENTER_CENTER, *label, egui::FontId::proportional(9.0), *color);
+            }
+
+            // ── Wind direction arrow ──
+            let wind_speed = wind.norm();
+            if wind_speed > 0.5 {
+                // Wind arrow shows direction wind blows TO (downwind)
+                let wind_screen_x = wind.x as f32;  // east = right
+                let wind_screen_y = -(wind.y as f32); // north = up on screen
+                let wind_len = (wind_screen_x * wind_screen_x + wind_screen_y * wind_screen_y).sqrt();
+                if wind_len > 0.01 {
+                    let wx = wind_screen_x / wind_len;
+                    let wy = wind_screen_y / wind_len;
+                    let arrow_len = (wind_speed as f32 / 25.0 * 14.0).min(14.0).max(4.0);
+                    let arrow_tip = egui::pos2(compass_center.x + wx * arrow_len, compass_center.y + wy * arrow_len);
+                    let wind_color = egui::Color32::from_rgb(140, 200, 255);
+                    painter.line_segment([compass_center, arrow_tip], egui::Stroke::new(2.0, wind_color));
+                    // Arrowhead
+                    let perp_x = -wy;
+                    let perp_y = wx;
+                    let head_size = 4.0_f32;
+                    let head_back = egui::pos2(arrow_tip.x - wx * head_size, arrow_tip.y - wy * head_size);
+                    let head_l = egui::pos2(head_back.x + perp_x * head_size * 0.5, head_back.y + perp_y * head_size * 0.5);
+                    let head_r = egui::pos2(head_back.x - perp_x * head_size * 0.5, head_back.y - perp_y * head_size * 0.5);
+                    painter.add(egui::Shape::convex_polygon(vec![arrow_tip, head_l, head_r], wind_color, egui::Stroke::NONE));
+                }
+            }
+
+            // ── Ground camera position + FOV wedge (only in Ground mode) ──
+            if camera_mode == CameraMode::Ground {
+                // Convert render-space ground_cam_pos back to DH for minimap
+                let dh_x = ground_cam_pos.x as f64;
+                let dh_y = -(ground_cam_pos.z as f64);
+                let cam_screen = to_screen(dh_x, dh_y);
+                painter.circle_filled(cam_screen, 4.0, egui::Color32::from_rgb(255, 200, 40));
+                painter.text(
+                    egui::pos2(cam_screen.x + 8.0, cam_screen.y),
+                    egui::Align2::LEFT_CENTER,
+                    "CAM",
+                    egui::FontId::proportional(9.0),
+                    egui::Color32::from_rgb(255, 200, 40),
+                );
+                // FOV wedge lines (±30° from look direction)
+                let wedge_len = 20.0_f32;
+                let fov_half = 30.0_f32.to_radians();
+                // ground_cam_yaw is in render space: need to convert to map angle
+                // In render space: yaw 0 = +X (east), but the z axis is -DH_y
+                // On map: east = +screen_x, north = -screen_y
+                let map_angle = ground_cam_yaw; // render yaw matches map x-axis convention
+                for sign in [-1.0_f32, 1.0] {
+                    let angle = map_angle + sign * fov_half;
+                    let dx = angle.cos();
+                    let dy = angle.sin(); // render z → screen y is flipped
+                    let end = egui::pos2(cam_screen.x + dx * wedge_len, cam_screen.y + dy * wedge_len);
+                    painter.line_segment(
+                        [cam_screen, end],
+                        egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 200, 40, 100)),
+                    );
+                }
+            }
+
+            // ── Click to place ground camera ──
+            if response.clicked() {
+                if let Some(click_pos) = response.interact_pointer_pos() {
+                    let dh_x = ((click_pos.x - center.x) / map_half) as f64 * half_range + map_cx;
+                    let dh_y = -((click_pos.y - center.y) / map_half) as f64 * half_range + map_cy;
+                    clicked_pos = Some([dh_x, dh_y]);
+                }
+            }
         });
+    clicked_pos
 }
 
 // ── ApplicationHandler ───────────────────────────────────────────────────────
@@ -1065,6 +1417,9 @@ impl ApplicationHandler for App {
         self.terrain_num_indices = ti.len() as u32;
         self.terrain_vb = Some(terrain_vb);
         self.terrain_ib = Some(terrain_ib);
+        self.terrain_verts = tv;
+        self.terrain_idxs = ti;
+        self.terrain_regen_queue.clear();
         let (buf, bg) = pbr.create_material_bind_group(&ctx.device);
         self.terrain_material = Some(MaterialBind { buffer: buf, bind_group: bg });
         self.last_terrain_snap = (0, 0);
@@ -1085,6 +1440,14 @@ impl ApplicationHandler for App {
         let (buf, bg) = pbr.create_material_bind_group(&ctx.device);
         self.rail_material = Some(MaterialBind { buffer: buf, bind_group: bg });
 
+        // Flag on launch rail
+        let (fv, fi) = terrain::generate_flag();
+        let fvb = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("Flag VB"), contents: bytemuck::cast_slice(&fv), usage: wgpu::BufferUsages::VERTEX });
+        let fib = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("Flag IB"), contents: bytemuck::cast_slice(&fi), usage: wgpu::BufferUsages::INDEX });
+        self.flag_mesh = Some(GpuMesh { vertex_buffer: fvb, index_buffer: fib, num_indices: fi.len() as u32 });
+        let (buf, bg) = pbr.create_material_bind_group(&ctx.device);
+        self.flag_material = Some(MaterialBind { buffer: buf, bind_group: bg });
+
         // Reference buildings
         self.ref_building_meshes.clear();
         self.ref_building_materials.clear();
@@ -1104,6 +1467,9 @@ impl ApplicationHandler for App {
         self.drone_mesh = Some(GpuMesh { vertex_buffer: dvb, index_buffer: dib, num_indices: di.len() as u32 });
         let (buf, bg) = pbr.create_material_bind_group(&ctx.device);
         self.drone_material = Some(MaterialBind { buffer: buf, bind_group: bg });
+        // Drone outline material (red halo for ground mode visibility)
+        let (buf, bg) = pbr.create_material_bind_group(&ctx.device);
+        self.drone_outline_material = Some(MaterialBind { buffer: buf, bind_group: bg });
 
         // Prop
         let (pv, pi) = drone::generate_prop_disc();
@@ -1206,6 +1572,11 @@ impl ApplicationHandler for App {
                     Key::Character(ref c) if c.as_str() == "r" => self.reset(),
                     Key::Character(ref c) if c.as_str() == "p" => self.paused = !self.paused,
                     Key::Character(ref c) if c.as_str() == "c" => self.camera_mode = self.camera_mode.next(),
+                    Key::Character(ref c) if c.as_str() == "b" => {
+                        if self.camera_mode == CameraMode::Ground {
+                            self.camera_mode = CameraMode::Chase;
+                        }
+                    }
                     Key::Character(ref c) if c.as_str() == "1" => self.time_scale = 1.0,
                     Key::Character(ref c) if c.as_str() == "2" => self.time_scale = 10.0,
                     Key::Character(ref c) if c.as_str() == "3" => self.time_scale = 50.0,
@@ -1226,7 +1597,14 @@ impl ApplicationHandler for App {
                 if let Some((lx, ly)) = self.last_mouse_pos {
                     let dx = (position.x - lx) as f32;
                     let dy = (position.y - ly) as f32;
-                    if self.mouse_pressed { self.camera.rotate(dx * 0.005, -dy * 0.005); }
+                    if self.mouse_pressed {
+                        if self.camera_mode == CameraMode::Ground {
+                            self.ground_cam_yaw += dx * 0.005;
+                            self.ground_cam_pitch = (self.ground_cam_pitch + dy * 0.005).clamp(-1.2, 1.2);
+                        } else {
+                            self.camera.rotate(dx * 0.005, -dy * 0.005);
+                        }
+                    }
                     if self.middle_pressed { self.camera.pan(-dx, dy); }
                 }
                 self.last_mouse_pos = Some((position.x, position.y));
@@ -1236,8 +1614,14 @@ impl ApplicationHandler for App {
                     winit::event::MouseScrollDelta::LineDelta(_, y) => y,
                     winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.01,
                 };
-                // Override default zoom limits for flight sim
-                self.camera.distance = (self.camera.distance * (1.0 - scroll * 0.1)).clamp(5.0, 500.0);
+                if self.camera_mode == CameraMode::Ground {
+                    // Scroll = FOV zoom (scroll up = zoom in = narrower FOV)
+                    self.ground_cam_fov = (self.ground_cam_fov * (1.0 - scroll * 0.08))
+                        .clamp(5.0_f32.to_radians(), 120.0_f32.to_radians());
+                } else {
+                    // Override default zoom limits for flight sim
+                    self.camera.distance = (self.camera.distance * (1.0 - scroll * 0.1)).clamp(5.0, 500.0);
+                }
             }
             WindowEvent::RedrawRequested => {
                 let now = Instant::now();
@@ -1250,6 +1634,17 @@ impl ApplicationHandler for App {
                 } else {
                     self.time_scale
                 };
+
+                // Reconstruct wind vector from sliders
+                let wd_rad = self.wind_direction.to_radians();
+                self.wind = nalgebra::Vector3::new(
+                    self.wind_speed * wd_rad.cos(),
+                    self.wind_speed * wd_rad.sin(),
+                    0.0,
+                );
+
+                // Master volume
+                self.audio_engine.set_volume(self.master_volume);
 
                 // Physics loop
                 if !self.paused && self.guidance.phase != FlightPhase::Impact
@@ -1277,6 +1672,8 @@ impl ApplicationHandler for App {
                             self.trail_distance_accum = 0.0;
                             self.trail_points.push((to_render(&self.flight.position), self.guidance.phase.trail_color()));
                             if self.trail_points.len() > 10_000 { self.trail_points.remove(0); }
+                            self.minimap_trail.push([self.flight.position.x, self.flight.position.y]);
+                            if self.minimap_trail.len() > 10_000 { self.minimap_trail.remove(0); }
                         }
                     }
 
@@ -1289,6 +1686,7 @@ impl ApplicationHandler for App {
                     if let Some(ev) = &self.engine_voice {
                         if let Ok(mut e) = ev.lock() {
                             e.update_params(airspeed, dist, pan.clamp(-1.0, 1.0));
+                            if self.engine_muted { e.volume = 0.0; }
                         }
                     }
                     if let Some(wv) = &self.wind_voice {
@@ -1301,19 +1699,50 @@ impl ApplicationHandler for App {
                 // Camera
                 self.update_camera();
 
-                // Regenerate terrain tiles if camera moved to new snap position
+                // Incremental terrain tile regeneration
                 let cam = self.camera.eye();
                 let snap_x = (cam.x / terrain::TILE_SIZE).round() as i32;
                 let snap_z = (cam.z / terrain::TILE_SIZE).round() as i32;
                 if (snap_x, snap_z) != self.last_terrain_snap {
+                    let snap_wx = snap_x as f32 * terrain::TILE_SIZE;
+                    let snap_wz = snap_z as f32 * terrain::TILE_SIZE;
+                    // Queue all tiles for regeneration
+                    self.terrain_regen_queue.clear();
+                    for tdx in -terrain::TILE_RADIUS..=terrain::TILE_RADIUS {
+                        for tdz in -terrain::TILE_RADIUS..=terrain::TILE_RADIUS {
+                            let slot = terrain::tile_slot(tdx, tdz);
+                            let (cx, cz) = terrain::tile_world_center(snap_wx, snap_wz, tdx, tdz);
+                            self.terrain_regen_queue.push((slot, cx, cz));
+                        }
+                    }
+                    // Sort: nearest tiles first so the visible area updates immediately
+                    self.terrain_regen_queue.sort_by(|a, b| {
+                        let da = (a.1 - cam.x) * (a.1 - cam.x) + (a.2 - cam.z) * (a.2 - cam.z);
+                        let db = (b.1 - cam.x) * (b.1 - cam.x) + (b.2 - cam.z) * (b.2 - cam.z);
+                        da.partial_cmp(&db).unwrap()
+                    });
                     self.last_terrain_snap = (snap_x, snap_z);
-                    let (tv, ti) = terrain::generate_all_tiles(cam.x, cam.z);
+                }
+
+                // Process a batch of queued tiles per frame (max 60 → spreads 441 tiles over ~8 frames)
+                if !self.terrain_regen_queue.is_empty() {
+                    let batch_size = 60.min(self.terrain_regen_queue.len());
+                    let batch: Vec<_> = self.terrain_regen_queue.drain(..batch_size).collect();
+                    let vert_stride = terrain::VERTS_PER_TILE * std::mem::size_of::<simuforge_core::Vertex>();
+                    let idx_stride = terrain::IDXS_PER_TILE * std::mem::size_of::<u32>();
+
+                    for (slot, cx, cz) in &batch {
+                        terrain::generate_single_tile(*cx, *cz, *slot, &mut self.terrain_verts, &mut self.terrain_idxs);
+                    }
+
+                    // Upload only the changed tile regions
                     if let (Some(ctx), Some(vb), Some(ib)) = (&self.render_ctx, &self.terrain_vb, &self.terrain_ib) {
-                        // Check if buffers are large enough; if not, we'd need to recreate.
-                        // Since NUM_TILES is constant, size is always the same.
-                        ctx.queue.write_buffer(vb, 0, bytemuck::cast_slice(&tv));
-                        ctx.queue.write_buffer(ib, 0, bytemuck::cast_slice(&ti));
-                        self.terrain_num_indices = ti.len() as u32;
+                        for (slot, _, _) in &batch {
+                            ctx.queue.write_buffer(vb, (slot * vert_stride) as u64,
+                                bytemuck::cast_slice(&self.terrain_verts[slot * terrain::VERTS_PER_TILE..(slot + 1) * terrain::VERTS_PER_TILE]));
+                            ctx.queue.write_buffer(ib, (slot * idx_stride) as u64,
+                                bytemuck::cast_slice(&self.terrain_idxs[slot * terrain::IDXS_PER_TILE..(slot + 1) * terrain::IDXS_PER_TILE]));
+                        }
                     }
                 }
 

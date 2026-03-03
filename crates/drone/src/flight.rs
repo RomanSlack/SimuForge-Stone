@@ -76,7 +76,7 @@ impl FlightState {
         Self {
             position: Vector3::new(0.0, 0.0, 1.0), // on launch rail, slightly above ground
             velocity: Vector3::zeros(),
-            heading: 0.0,  // facing +X
+            heading: 20.0_f64.to_radians(),  // launch at 20° from +X (heading NE)
             pitch: 10.0_f64.to_radians(), // launch rail angle
             bank: 0.0,
             fuel_mass: FUEL_INIT,
@@ -211,7 +211,7 @@ pub fn step(
     let bank_error = bank_cmd - state.bank;
     state.bank += (bank_error * bank_rate * dt * 10.0).clamp(-bank_rate * dt, bank_rate * dt);
 
-    let pitch_rate = 0.5;
+    let pitch_rate = 1.5; // 1.5 rad/s — responsive for terminal dive
     let pitch_error = pitch_cmd - state.pitch;
     state.pitch += (pitch_error * pitch_rate * dt * 10.0).clamp(-pitch_rate * dt, pitch_rate * dt);
 

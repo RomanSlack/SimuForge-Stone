@@ -10,7 +10,6 @@
 
 use std::sync::{Arc, Mutex};
 
-use simuforge_audio::spatial;
 use simuforge_audio::synth::Voice;
 
 // ── SharedVoice wrapper ─────────────────────────────────────────────────────
@@ -67,7 +66,7 @@ pub struct EngineVoice {
     phase3: f64,
     frequency: f64,
     target_freq: f64,
-    volume: f32,
+    pub volume: f32,
     pan_value: f32,
     time: f32,
     running: bool,
@@ -183,8 +182,8 @@ impl Voice for EngineVoice {
 
     fn next_stereo(&mut self, sample_rate: f32) -> Option<(f32, f32)> {
         self.next_sample(sample_rate).map(|s| {
-            let (l, r) = spatial::stereo_pan(self.pan());
-            (s * l * self.volume(), s * r * self.volume())
+            let v = s * self.volume();
+            (v, v)
         })
     }
 }
@@ -312,8 +311,8 @@ impl Voice for WindVoice {
 
     fn next_stereo(&mut self, sample_rate: f32) -> Option<(f32, f32)> {
         self.next_sample(sample_rate).map(|s| {
-            let (l, r) = spatial::stereo_pan(self.pan());
-            (s * l * self.volume(), s * r * self.volume())
+            let v = s * self.volume();
+            (v, v)
         })
     }
 }
@@ -373,8 +372,8 @@ impl Voice for BoosterVoice {
 
     fn next_stereo(&mut self, sample_rate: f32) -> Option<(f32, f32)> {
         self.next_sample(sample_rate).map(|s| {
-            let (l, r) = spatial::stereo_pan(self.pan());
-            (s * l * self.volume(), s * r * self.volume())
+            let v = s * self.volume();
+            (v, v)
         })
     }
 }

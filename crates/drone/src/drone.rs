@@ -24,7 +24,14 @@ pub fn generate_drone_mesh() -> (Vec<Vertex>, Vec<u32>) {
     let fuse_half = fuse_length / 2.0;
     let max_radius = 0.16_f32;
 
-    for ring in 0..=fuse_rings {
+    // Nose apex: single vertex at tip (index 0)
+    verts.push(Vertex {
+        position: [fuse_half, 0.0, 0.0],
+        normal: [1.0, 0.0, 0.0],
+    });
+
+    // Generate rings 1..=fuse_rings (skip ring 0 — replaced by apex)
+    for ring in 1..=fuse_rings {
         let t = ring as f32 / fuse_rings as f32;
         let x = fuse_half - t * fuse_length; // from nose (+1.75) to tail (-1.75)
 
@@ -37,14 +44,23 @@ pub fn generate_drone_mesh() -> (Vec<Vertex>, Vec<u32>) {
             let (sin_t, cos_t) = theta.sin_cos();
             let y = r * cos_t;
             let z = r * sin_t;
-            let nx = if ring == 0 || ring == fuse_rings {
-                if ring == 0 { 1.0 } else { -1.0 }
+            let (nx, ny, nz) = if ring <= 2 {
+                // Near-nose rings: blend from axial to radial
+                let blend = ring as f32 / 3.0;
+                (1.0 - blend, cos_t * blend, sin_t * blend)
+            } else if ring == fuse_rings {
+                // Tail ring: blend toward tail axial
+                let blend = 0.33;
+                (-(1.0 - blend), cos_t * blend, sin_t * blend)
+            } else if ring >= fuse_rings - 2 {
+                // Near-tail rings: blend toward tail axial
+                let blend = (fuse_rings - ring) as f32 / 3.0;
+                (-(1.0 - blend), cos_t * blend, sin_t * blend)
             } else {
-                0.0
+                // Mid-body: pure radial
+                (0.0, cos_t, sin_t)
             };
-            let ny = cos_t;
-            let nz = sin_t;
-            let n_len = (nx * nx + ny * ny + nz * nz).sqrt();
+            let n_len = (nx * nx + ny * ny + nz * nz).sqrt().max(0.001);
             verts.push(Vertex {
                 position: [x, y, z],
                 normal: [nx / n_len, ny / n_len, nz / n_len],
@@ -52,16 +68,38 @@ pub fn generate_drone_mesh() -> (Vec<Vertex>, Vec<u32>) {
         }
     }
 
-    // Fuselage indices
+    // Nose triangle fan: apex (0) → ring 1 vertices (indices 1..=fuse_segments+1)
+    let ring1_base = 1_u32; // first vertex of ring 1
+    for seg in 0..fuse_segments {
+        idxs.extend_from_slice(&[0, ring1_base + seg, ring1_base + seg + 1]);
+    }
+
+    // Fuselage quad strips between rings 1..fuse_rings
     let ring_size = fuse_segments + 1;
-    for ring in 0..fuse_rings {
+    for ring in 0..(fuse_rings - 1) {
+        // ring index in our vertex array: ring 1 starts at offset 1
+        let r0_base = 1 + ring * ring_size;
+        let r1_base = r0_base + ring_size;
         for seg in 0..fuse_segments {
-            let i0 = ring * ring_size + seg;
+            let i0 = r0_base + seg;
             let i1 = i0 + 1;
-            let i2 = i0 + ring_size;
+            let i2 = r1_base + seg;
             let i3 = i2 + 1;
             idxs.extend_from_slice(&[i0, i2, i1, i1, i2, i3]);
         }
+    }
+
+    // Tail apex: single vertex at tail tip
+    let tail_apex = verts.len() as u32;
+    verts.push(Vertex {
+        position: [-fuse_half, 0.0, 0.0],
+        normal: [-1.0, 0.0, 0.0],
+    });
+
+    // Tail triangle fan: last ring → tail apex (reversed winding)
+    let last_ring_base = 1 + (fuse_rings - 1) * ring_size;
+    for seg in 0..fuse_segments {
+        idxs.extend_from_slice(&[last_ring_base + seg + 1, last_ring_base + seg, tail_apex]);
     }
 
     // ── Delta Wing ───────────────────────────────────────────────────────
@@ -157,52 +195,114 @@ pub fn generate_drone_mesh() -> (Vec<Vertex>, Vec<u32>) {
     (verts, idxs)
 }
 
-/// Generate the propeller disc mesh (thin cylinder at rear of fuselage).
+/// Generate a tapered 2-blade pusher propeller with central hub.
 /// Returns (vertices, indices).
 pub fn generate_prop_disc() -> (Vec<Vertex>, Vec<u32>) {
-    // Two-blade prop: simplified as thin rectangles
     let mut verts = Vec::new();
     let mut idxs = Vec::new();
 
-    let blade_length = 0.75_f32; // half-span of prop
-    let blade_width = 0.06_f32;
-    let blade_thick = 0.01_f32;
+    let blade_half_span = 0.30_f32; // 0.6m total diameter
+    let chord_root = 0.08_f32;
+    let chord_tip = 0.03_f32;
+    let thick_root = 0.012_f32;
+    let thick_tip = 0.004_f32;
+    let span_segs = 6_u32;
 
-    // Blade 1 (along Y)
-    let b = verts.len() as u32;
-    for &z_sign in &[1.0_f32, -1.0] {
-        for &y in &[-blade_length, blade_length] {
-            verts.push(Vertex {
-                position: [0.0, y, z_sign * blade_thick],
-                normal: [0.0, 0.0, z_sign],
-            });
+    // Generate one blade along +Y, then mirror for -Y blade
+    for blade_sign in &[1.0_f32, -1.0] {
+        for i in 0..span_segs {
+            let t0 = i as f32 / span_segs as f32;
+            let t1 = (i + 1) as f32 / span_segs as f32;
+
+            let y0 = blade_sign * t0 * blade_half_span;
+            let y1 = blade_sign * t1 * blade_half_span;
+
+            let c0 = chord_root + (chord_tip - chord_root) * t0;
+            let c1 = chord_root + (chord_tip - chord_root) * t1;
+            let h0 = thick_root + (thick_tip - thick_root) * t0;
+            let h1 = thick_root + (thick_tip - thick_root) * t1;
+
+            let b = verts.len() as u32;
+
+            // Top face (4 verts: root-LE, root-TE, tip-LE, tip-TE)
+            let nz_top = 1.0_f32;
+            verts.push(Vertex { position: [c0 * 0.5, y0, h0], normal: [0.0, 0.0, nz_top] });
+            verts.push(Vertex { position: [-c0 * 0.5, y0, h0], normal: [0.0, 0.0, nz_top] });
+            verts.push(Vertex { position: [c1 * 0.5, y1, h1], normal: [0.0, 0.0, nz_top] });
+            verts.push(Vertex { position: [-c1 * 0.5, y1, h1], normal: [0.0, 0.0, nz_top] });
+
+            // Bottom face
+            let nz_bot = -1.0_f32;
+            verts.push(Vertex { position: [c0 * 0.5, y0, -h0], normal: [0.0, 0.0, nz_bot] });
+            verts.push(Vertex { position: [-c0 * 0.5, y0, -h0], normal: [0.0, 0.0, nz_bot] });
+            verts.push(Vertex { position: [c1 * 0.5, y1, -h1], normal: [0.0, 0.0, nz_bot] });
+            verts.push(Vertex { position: [-c1 * 0.5, y1, -h1], normal: [0.0, 0.0, nz_bot] });
+
+            // Top face triangles
+            idxs.extend_from_slice(&[b, b + 2, b + 1, b + 1, b + 2, b + 3]);
+            // Bottom face triangles (reversed winding)
+            idxs.extend_from_slice(&[b + 4, b + 5, b + 6, b + 5, b + 7, b + 6]);
         }
-        // Width faces
+    }
+
+    // ── Hub: cylinder along X axis ──
+    let hub_r = 0.035_f32;
+    let hub_len = 0.04_f32;
+    let hub_segs = 12_u32;
+
+    // Front cap
+    let cap_f_center = verts.len() as u32;
+    verts.push(Vertex { position: [hub_len, 0.0, 0.0], normal: [1.0, 0.0, 0.0] });
+    for seg in 0..=hub_segs {
+        let theta = seg as f32 / hub_segs as f32 * std::f32::consts::TAU;
+        let (s, c) = theta.sin_cos();
         verts.push(Vertex {
-            position: [blade_width, 0.0, z_sign * blade_thick],
+            position: [hub_len, hub_r * c, hub_r * s],
             normal: [1.0, 0.0, 0.0],
         });
+    }
+    for seg in 0..hub_segs {
+        idxs.extend_from_slice(&[cap_f_center, cap_f_center + 1 + seg, cap_f_center + 2 + seg]);
+    }
+
+    // Back cap
+    let cap_b_center = verts.len() as u32;
+    verts.push(Vertex { position: [-hub_len, 0.0, 0.0], normal: [-1.0, 0.0, 0.0] });
+    for seg in 0..=hub_segs {
+        let theta = seg as f32 / hub_segs as f32 * std::f32::consts::TAU;
+        let (s, c) = theta.sin_cos();
         verts.push(Vertex {
-            position: [-blade_width, 0.0, z_sign * blade_thick],
+            position: [-hub_len, hub_r * c, hub_r * s],
             normal: [-1.0, 0.0, 0.0],
         });
     }
-    // Simple quad for top face
-    idxs.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
-    // Bottom face
-    idxs.extend_from_slice(&[b + 4, b + 6, b + 5, b + 4, b + 7, b + 6]);
-
-    // Blade 2 (along Z) — perpendicular to blade 1
-    let b = verts.len() as u32;
-    for &y_sign in &[1.0_f32, -1.0] {
-        for &z in &[-blade_length, blade_length] {
-            verts.push(Vertex {
-                position: [0.0, y_sign * blade_thick, z],
-                normal: [0.0, y_sign, 0.0],
-            });
-        }
+    for seg in 0..hub_segs {
+        idxs.extend_from_slice(&[cap_b_center, cap_b_center + 2 + seg, cap_b_center + 1 + seg]);
     }
-    idxs.extend_from_slice(&[b, b + 1, b + 2, b, b + 2, b + 3]);
+
+    // Cylinder wall
+    let wall_base = verts.len() as u32;
+    for seg in 0..=hub_segs {
+        let theta = seg as f32 / hub_segs as f32 * std::f32::consts::TAU;
+        let (s, c) = theta.sin_cos();
+        // Front ring
+        verts.push(Vertex {
+            position: [hub_len, hub_r * c, hub_r * s],
+            normal: [0.0, c, s],
+        });
+        // Back ring
+        verts.push(Vertex {
+            position: [-hub_len, hub_r * c, hub_r * s],
+            normal: [0.0, c, s],
+        });
+    }
+    for seg in 0..hub_segs {
+        let i0 = wall_base + seg * 2;
+        let i1 = i0 + 1;
+        let i2 = i0 + 2;
+        let i3 = i0 + 3;
+        idxs.extend_from_slice(&[i0, i1, i2, i2, i1, i3]);
+    }
 
     (verts, idxs)
 }

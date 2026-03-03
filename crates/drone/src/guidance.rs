@@ -72,7 +72,7 @@ const CRUISE_ALT: f64 = 300.0;
 const BOOSTER_DURATION: f64 = 3.0;
 
 /// Distance to target at which terminal phase begins (m).
-const TERMINAL_RANGE: f64 = 1500.0;
+const TERMINAL_RANGE: f64 = 800.0;
 
 /// Terminal dive pitch angle (radians, negative = nose down). Steep nose-dive.
 const TERMINAL_PITCH: f64 = -55.0_f64 * std::f64::consts::PI / 180.0;
@@ -91,13 +91,14 @@ pub struct Guidance {
 
 impl Guidance {
     pub fn new() -> Self {
-        // Straight-line mission: a few intermediate waypoints for visual interest
+        // S-curve route with lateral avoidance maneuvers
         let waypoints = vec![
-            Vector3::new(5_000.0, 0.0, CRUISE_ALT),
-            Vector3::new(15_000.0, 500.0, CRUISE_ALT),
-            Vector3::new(30_000.0, -300.0, CRUISE_ALT),
-            Vector3::new(45_000.0, 100.0, CRUISE_ALT),
-            Vector3::new(TARGET_POS.x, TARGET_POS.y, TARGET_POS.z + 3.0), // aim at building center
+            Vector3::new(3_000.0, 1_500.0, CRUISE_ALT),     // W1: veer left after launch
+            Vector3::new(10_000.0, -1_000.0, CRUISE_ALT),   // W2: hard right avoidance
+            Vector3::new(20_000.0, 2_000.0, CRUISE_ALT),    // W3: left avoidance
+            Vector3::new(35_000.0, -800.0, CRUISE_ALT),     // W4: right correction
+            Vector3::new(45_000.0, 200.0, CRUISE_ALT),      // W5: line up for terminal
+            Vector3::new(TARGET_POS.x, TARGET_POS.y, TARGET_POS.z + 3.0),
         ];
         Self {
             phase: FlightPhase::PreLaunch,
@@ -211,18 +212,18 @@ impl Guidance {
 
                 let thrust = THRUST_CRUISE;
 
-                // Heading to target
+                // Heading to target — high gain + wider bank for terminal accuracy
                 let to_target = TARGET_POS - state.position;
                 let desired_heading = to_target.y.atan2(to_target.x);
                 let heading_error = angle_diff(desired_heading, state.heading);
-                let bank_cmd = (2.0 * heading_error).clamp(
-                    -15.0_f64.to_radians(),
-                    15.0_f64.to_radians(),
+                let bank_cmd = (4.0 * heading_error).clamp(
+                    -25.0_f64.to_radians(),
+                    25.0_f64.to_radians(),
                 );
 
-                // Progressive steep dive — faster onset with sqrt, reaching -55° at target
+                // Linear dive onset reaching -55° at target
                 let dive_fraction = (1.0 - dist_to_target / TERMINAL_RANGE).clamp(0.0, 1.0);
-                let pitch_cmd = TERMINAL_PITCH * dive_fraction.powf(0.5);
+                let pitch_cmd = TERMINAL_PITCH * dive_fraction;
 
                 (thrust, pitch_cmd, bank_cmd)
             }

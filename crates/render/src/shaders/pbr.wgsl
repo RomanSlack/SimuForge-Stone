@@ -142,15 +142,76 @@ fn carve_depth(obj_pos: vec3<f32>) -> f32 {
     return max(d, 0.0);
 }
 
+// Simple hash for procedural sand variation
+fn hash_terrain(p: vec2<f32>) -> f32 {
+    let k = vec2<f32>(127.1, 311.7);
+    let d = dot(p, k);
+    return fract(sin(d) * 43758.5453);
+}
+
+// Value noise for smooth terrain color variation
+fn terrain_noise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    let a = hash_terrain(i);
+    let b = hash_terrain(i + vec2(1.0, 0.0));
+    let c = hash_terrain(i + vec2(0.0, 1.0));
+    let d = hash_terrain(i + vec2(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Depth-based interior coloring: white shell → warm reddish core
     let depth = carve_depth(in.object_pos);
     let interior_color = vec3<f32>(0.85, 0.25, 0.22); // strong red interior
     let depth_blend = smoothstep(0.0, 0.015, depth); // transition over ~15mm
-    let albedo = mix(material.base_color.rgb, interior_color, depth_blend);
+    var albedo = mix(material.base_color.rgb, interior_color, depth_blend);
     let roughness = material.params.x;
     let metallic = material.params.y;
+
+    // Procedural sand color variation (terrain flag: params.w > 0.5)
+    if (material.params.w > 0.5) {
+        let wp = in.world_pos.xz;
+        // Multi-octave color variation at different scales
+        let n1 = terrain_noise(wp * 0.0015); // very large regions (~670m)
+        let n2 = terrain_noise(wp * 0.005);  // large patches (~200m)
+        let n3 = terrain_noise(wp * 0.02);   // medium detail (~50m)
+        let n4 = terrain_noise(wp * 0.08);   // fine ripples (~12m)
+        let n5 = terrain_noise(wp * 0.3);    // very fine grain (~3m)
+
+        // Wind streak pattern — elongated along dominant wind direction (roughly +X)
+        let streak = terrain_noise(vec2<f32>(wp.x * 0.004, wp.y * 0.02)) * 0.7
+                   + terrain_noise(vec2<f32>(wp.x * 0.015, wp.y * 0.06)) * 0.3;
+
+        let combined = n1 * 0.25 + n2 * 0.25 + n3 * 0.2 + n4 * 0.15 + n5 * 0.05 + streak * 0.1;
+
+        // Slope-based darkening: steeper = darker (wind-blown shadow side)
+        let slope = 1.0 - max(dot(normalize(in.world_normal), vec3(0.0, 1.0, 0.0)), 0.0);
+        let slope_darken = 1.0 - slope * 0.45;
+
+        // Height-based tinting: lower areas are darker/redder
+        let height_factor = smoothstep(-60.0, 60.0, in.world_pos.y); // render Y = DH Z (altitude)
+
+        // Expanded color palette
+        let light_sand = vec3<f32>(0.76, 0.68, 0.50);   // bright dune crests
+        let mid_sand = vec3<f32>(0.62, 0.55, 0.38);     // standard sand
+        let dark_sand = vec3<f32>(0.42, 0.35, 0.24);    // sheltered areas
+        let ochre = vec3<f32>(0.55, 0.38, 0.22);        // clay/gravel patches
+        let pale_dust = vec3<f32>(0.80, 0.75, 0.62);    // wind-blown dust deposits
+
+        // Mix by noise + height
+        var sand_base = mix(dark_sand, mid_sand, combined);
+        sand_base = mix(sand_base, light_sand, height_factor * 0.6 + n1 * 0.4);
+        sand_base = mix(sand_base, ochre, (1.0 - n2) * (1.0 - height_factor) * 0.4);
+        sand_base = mix(sand_base, pale_dust, streak * height_factor * 0.25);
+
+        // Fine grain variation adds sparkle/texture at close range
+        sand_base = sand_base * (0.92 + n5 * 0.16);
+
+        albedo = sand_base * slope_darken;
+    }
 
     let n = normalize(in.world_normal);
     let v = normalize(camera.eye_pos.xyz - in.world_pos);
@@ -222,6 +283,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let dist = length(in.world_pos.xz - camera.eye_pos.xz);
         let fade = 1.0 - smoothstep(1.0, 4.0, dist);
         color = mix(albedo * ambient_factor * light.ambient.w * light.ambient.rgb, color, fade);
+    }
+
+    // Distance fade for terrain: blend to hazy horizon color at tile edges
+    if (material.params.w > 0.5) {
+        let dist = length(in.world_pos.xyz - camera.eye_pos.xyz);
+        // Fade starts at 3km, fully hazed at 5km
+        let haze_factor = smoothstep(3000.0, 5000.0, dist);
+        let haze_color = vec3<f32>(0.72, 0.68, 0.58); // warm dusty horizon
+        color = mix(color, haze_color, haze_factor);
     }
 
     // Output linear HDR (no tone mapping — composite pass handles that)
