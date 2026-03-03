@@ -9,7 +9,7 @@ use crate::ball::{Ball, BALL_INERTIA, BALL_MASS, BALL_RADIUS};
 use crate::table;
 
 /// Coefficient of restitution for each surface.
-pub const COR_TABLE: f64 = 0.93;
+pub const COR_TABLE: f64 = 0.95;
 pub const COR_PADDLE: f64 = 0.95;
 pub const COR_NET: f64 = 0.30;
 pub const COR_FLOOR: f64 = 0.80;
@@ -110,7 +110,7 @@ pub fn resolve_collisions(
             // NEVER flip based on ball position — that causes a normal-flip
             // race condition where the ball tunnels through the paddle.
             let side = if paddle.player == 1 { 1.0 } else { -1.0 }; // toward opponent
-            let tilt = 0.34_f64; // sin(20°) ≈ 0.34, cos(20°) ≈ 0.94
+            let tilt = 0.37_f64; // sin(22°) ≈ 0.37, cos(22°) ≈ 0.93
             let normal = Vector3::new(side * (1.0 - tilt * tilt).sqrt(), 0.0, tilt);
 
             let v_rel = ball.velocity - paddle.velocity;

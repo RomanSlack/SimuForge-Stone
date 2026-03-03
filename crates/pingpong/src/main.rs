@@ -136,6 +136,9 @@ struct PlayerArm {
     ik_solver: simuforge_control::ik::IkSolver,
     /// Scratch arm for IK solving (avoids clone every call).
     ik_scratch: RobotArm,
+    /// Cached gravity compensation torques (recomputed every N steps).
+    cached_grav_comp: Vec<f64>,
+    grav_comp_counter: u32,
 }
 
 impl PlayerArm {
@@ -171,6 +174,8 @@ impl PlayerArm {
                 nullspace_gain: 0.3,
             },
             ik_scratch,
+            cached_grav_comp: vec![0.0; 5],
+            grav_comp_counter: 0,
         };
         player.arm.set_joint_angles(&targets);
         // Zero velocities
@@ -221,7 +226,16 @@ impl PlayerArm {
         let n = self.arm.num_joints();
         let gravity = Vector3::new(0.0, 0.0, -9.81);
 
-        let grav_comp = gravity_compensation_rnea(&self.arm, &gravity);
+        // Cache gravity compensation — recompute every 5 steps (it changes slowly).
+        // Saves ~80% of RNEA calls.
+        if self.grav_comp_counter % 5 == 0 {
+            let gc = gravity_compensation_rnea(&self.arm, &gravity);
+            for i in 0..n {
+                self.cached_grav_comp[i] = gc[i];
+            }
+        }
+        self.grav_comp_counter = self.grav_comp_counter.wrapping_add(1);
+        let grav_comp = &self.cached_grav_comp;
 
         let mut joint_torques = [0.0_f64; 8]; // MAX_JOINTS in aba is 8
         for i in 0..n {
@@ -1124,7 +1138,7 @@ impl App {
             pass.draw(0..3, 0..1);
         }
 
-        // Pass 5: SSS (subsurface — minimal effect on metal, still needed for pipeline)
+        // Pass 5: SSS
         if let (Some(sss), Some(sss_bg)) = (&self.sss_pipeline, &self.sss_bind_group) {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("SSS Pass"),
@@ -1341,7 +1355,8 @@ impl ApplicationHandler for App {
                 .create_window(
                     Window::default_attributes()
                         .with_title("SimuForge — Ping Pong")
-                        .with_inner_size(winit::dpi::LogicalSize::new(1440, 810)),
+                        .with_inner_size(winit::dpi::LogicalSize::new(1920, 1080))
+                        .with_maximized(true),
                 )
                 .expect("Failed to create window"),
         );
@@ -1883,7 +1898,7 @@ impl ApplicationHandler for App {
                 // Physics accumulator with interleaved AI updates
                 if !self.paused {
                     self.accumulator += frame_dt;
-                    let max_steps = 80; // cap to ~80ms of physics per frame
+                    let max_steps = 20; // at 60fps, ~17 steps needed per frame
                     let mut steps = 0;
                     let ai_update_interval = 10; // AI + IK every 10 physics steps = 100Hz
                     while self.accumulator >= PHYSICS_DT && steps < max_steps {
@@ -2220,6 +2235,6 @@ mod tests {
         eprintln!("\nServe: vx=3.0, vz=1.5, z0=0.30");
         let hits = simulate_rally(3.0, 1.5, 0.30, 20.0);
         eprintln!("Rally hits: {}\n", hits);
-        assert!(hits >= 5, "Should rally at least 5 times");
+        assert!(hits >= 5, "Should rally at least 5 times (got {})", hits);
     }
 }

@@ -131,14 +131,14 @@ impl AiController {
 
                         let target_z = pt.z + PADDLE_Z_OFFSET;
 
-                        if arrival_time < 0.12 {
+                        if arrival_time < 0.15 {
                             // DRIVE: rush to intercept. Arm still moving = paddle velocity.
                             self.target_position = Vector3::new(pt.x, pt.y, target_z);
                         } else {
                             // WINDUP: wait 12cm behind intercept (toward base).
                             // Clamp to stay within arm workspace.
                             let base_x = self.side_sign * arm_config::ARM_X_OFFSET;
-                            let behind_x = pt.x + self.side_sign * 0.20;
+                            let behind_x = pt.x + self.side_sign * 0.12;
                             let clamped_x = behind_x.clamp(
                                 base_x - 0.50, base_x + 0.50,
                             );
@@ -183,9 +183,11 @@ impl AiController {
 
 fn predict_intercept(ball: &Ball, side_sign: f64) -> Option<(Vector3<f64>, f64)> {
     let base_x = side_sign * arm_config::ARM_X_OFFSET;
-    let max_reach = 0.55;
-    let zone_lo = (base_x - side_sign * max_reach).min(base_x - side_sign * 0.10);
-    let zone_hi = (base_x - side_sign * max_reach).max(base_x - side_sign * 0.10);
+    // Hit zone in the comfortable MIDDLE of the arm's workspace.
+    // Leaves room behind the intercept for the windup drive.
+    let hit_reach = 0.40; // 40cm forward, not the max 55cm
+    let zone_lo = (base_x - side_sign * hit_reach).min(base_x - side_sign * 0.08);
+    let zone_hi = (base_x - side_sign * hit_reach).max(base_x - side_sign * 0.08);
 
     let sim_dt = 0.004;
     let max_steps = 750;
@@ -238,19 +240,13 @@ fn predict_intercept(ball: &Ball, side_sign: f64) -> Option<(Vector3<f64>, f64)>
         if !bounced { continue; }
 
         let h = pos.z - table_z;
-        let min_h = 0.16; // just above net height (15.25cm) + tiny margin
-        if pos.x > zone_lo && pos.x < zone_hi && h > min_h && h < 0.55 {
+        if pos.x > zone_lo && pos.x < zone_hi && h > 0.02 && h < 0.55 {
             let clamped = Vector3::new(
-                pos.x.clamp(base_x - max_reach, base_x + max_reach),
+                pos.x.clamp(base_x - hit_reach, base_x + hit_reach),
                 pos.y.clamp(-0.8, 0.8),
-                pos.z.clamp(table_z + min_h, table_z + 0.50),
+                pos.z.clamp(table_z + 0.02, table_z + 0.50),
             );
-
-            // Take the FIRST intercept above the net. Prefer rising ball
-            // (just after bounce) for cleanest contact.
-            if vel.z > -0.5 {
-                return Some((clamped, t));
-            }
+            return Some((clamped, t));
         }
     }
 
