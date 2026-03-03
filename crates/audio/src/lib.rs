@@ -126,6 +126,13 @@ impl AudioEngine {
         }
     }
 
+    /// Remove all voices from the mixer (e.g. on mission reset).
+    pub fn clear_voices(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.voices.clear();
+        }
+    }
+
     /// Whether the audio engine is active.
     pub fn is_enabled(&self) -> bool {
         self.enabled

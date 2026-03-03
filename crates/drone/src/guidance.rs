@@ -18,7 +18,7 @@ pub enum FlightPhase {
     Climb,
     /// Cruising toward target via waypoints.
     Cruise,
-    /// Terminal dive toward target (< 1000m).
+    /// Terminal dive toward target (< 1500m).
     Terminal,
     /// Impact — simulation complete.
     Impact,
@@ -74,8 +74,8 @@ const BOOSTER_DURATION: f64 = 3.0;
 /// Distance to target at which terminal phase begins (m).
 const TERMINAL_RANGE: f64 = 1500.0;
 
-/// Terminal dive pitch angle (radians, negative = nose down).
-const TERMINAL_PITCH: f64 = -30.0_f64 * std::f64::consts::PI / 180.0;
+/// Terminal dive pitch angle (radians, negative = nose down). Steep nose-dive.
+const TERMINAL_PITCH: f64 = -55.0_f64 * std::f64::consts::PI / 180.0;
 
 /// Guidance state machine.
 pub struct Guidance {
@@ -203,7 +203,12 @@ impl Guidance {
             }
 
             FlightPhase::Terminal => {
-                // Dive toward target
+                // Impact: nose-dive into ground
+                if state.position.z <= 0.5 {
+                    self.phase = FlightPhase::Impact;
+                    return (0.0, state.pitch, 0.0);
+                }
+
                 let thrust = THRUST_CRUISE;
 
                 // Heading to target
@@ -215,14 +220,9 @@ impl Guidance {
                     15.0_f64.to_radians(),
                 );
 
-                // Progressive dive — steeper as we get closer
+                // Progressive steep dive — faster onset with sqrt, reaching -55° at target
                 let dive_fraction = (1.0 - dist_to_target / TERMINAL_RANGE).clamp(0.0, 1.0);
-                let pitch_cmd = TERMINAL_PITCH * dive_fraction;
-
-                // Impact detection
-                if state.position.z <= 1.5 && dist_to_target < 50.0 {
-                    self.phase = FlightPhase::Impact;
-                }
+                let pitch_cmd = TERMINAL_PITCH * dive_fraction.powf(0.5);
 
                 (thrust, pitch_cmd, bank_cmd)
             }

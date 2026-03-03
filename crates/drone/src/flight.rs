@@ -3,6 +3,9 @@
 //! Physics runs at 200 Hz. The model computes lift, drag, thrust, and gravity,
 //! then integrates position and velocity. Orientation (heading, pitch, bank)
 //! is updated by the guidance system's commands.
+//!
+//! All aerodynamic forces are computed from **air-relative velocity** (velocity − wind),
+//! which is the physically correct formulation.
 
 use nalgebra::Vector3;
 
@@ -28,6 +31,8 @@ pub const CD0: f64 = 0.030;
 pub const OSWALD_E: f64 = 0.65;
 /// Wing aspect ratio.
 pub const ASPECT_RATIO: f64 = 2.27;
+/// Wingspan (m) — for ground effect calculation.
+pub const WINGSPAN: f64 = 2.5;
 
 /// Maximum lift coefficient (vortex-augmented delta stall).
 pub const CL_MAX: f64 = 1.05;
@@ -43,6 +48,9 @@ pub const FUEL_RATE_CRUISE: f64 = 0.0023;
 const RHO_0: f64 = 1.225;
 /// Scale height for barometric formula (m).
 const SCALE_HEIGHT: f64 = 8500.0;
+
+/// Ground friction coefficient (concrete/sand).
+const MU_GROUND: f64 = 0.4;
 
 /// Drone flight state.
 pub struct FlightState {
@@ -84,6 +92,11 @@ impl FlightState {
     /// Airspeed (magnitude of velocity, m/s).
     pub fn airspeed(&self) -> f64 {
         self.velocity.norm()
+    }
+
+    /// True airspeed relative to the wind (m/s).
+    pub fn true_airspeed(&self, wind: &Vector3<f64>) -> f64 {
+        (self.velocity - wind).norm()
     }
 
     /// Airspeed in km/h.
@@ -131,16 +144,15 @@ fn air_density(altitude: f64) -> f64 {
     RHO_0 * (-altitude / SCALE_HEIGHT).exp()
 }
 
-/// Compute angle of attack from velocity and drone pitch.
+/// Compute angle of attack from airspeed vector and drone pitch.
 /// Returns alpha in radians.
-fn angle_of_attack(state: &FlightState) -> f64 {
-    let speed = state.airspeed();
+fn angle_of_attack(state: &FlightState, airspeed_vec: &Vector3<f64>) -> f64 {
+    let speed = airspeed_vec.norm();
     if speed < 1.0 {
         return 0.0;
     }
-    let vel_hat = state.velocity / speed;
+    let vel_hat = airspeed_vec / speed;
     let fwd = state.forward_dir();
-    // Alpha = angle between velocity vector and forward direction in pitch plane
     let dot = vel_hat.dot(&fwd).clamp(-1.0, 1.0);
     let cross = fwd.cross(&vel_hat);
     let right = state.right_dir();
@@ -149,10 +161,7 @@ fn angle_of_attack(state: &FlightState) -> f64 {
 }
 
 /// Lift coefficient as a function of angle of attack.
-/// Simple linear model with stall: Cl = 2π * α, clamped to ±CL_MAX.
 fn lift_coefficient(alpha: f64) -> f64 {
-    // For a delta wing, lift slope is lower than 2π due to low AR.
-    // Effective lift slope ≈ π * AR / (1 + sqrt(1 + (AR/2)²))
     let lift_slope = std::f64::consts::PI * ASPECT_RATIO
         / (1.0 + (1.0 + (ASPECT_RATIO / 2.0).powi(2)).sqrt());
     (lift_slope * alpha).clamp(-CL_MAX, CL_MAX)
@@ -163,71 +172,84 @@ fn drag_coefficient(cl: f64) -> f64 {
     CD0 + cl * cl / (std::f64::consts::PI * ASPECT_RATIO * OSWALD_E)
 }
 
+/// McCormick ground effect factor: reduces induced drag near the ground.
+/// Returns a multiplier < 1.0 when altitude < wingspan.
+fn ground_effect_factor(altitude: f64) -> f64 {
+    if altitude >= WINGSPAN {
+        1.0
+    } else {
+        let h_ratio = (altitude / WINGSPAN).clamp(0.0, 1.0);
+        // 50% drag reduction at ground level, linearly increasing to 0% at wingspan height
+        1.0 - (1.0 - h_ratio) * 0.5
+    }
+}
+
 /// Advance the flight state by one physics timestep.
 ///
 /// `thrust_n`: total thrust force (N) along forward direction.
 /// `pitch_cmd`: commanded pitch angle (radians), smoothly tracked.
 /// `bank_cmd`: commanded bank angle (radians), smoothly tracked.
-/// `heading_rate`: heading rate from bank-to-turn (rad/s).
+/// `wind`: wind velocity vector in world frame (m/s).
 pub fn step(
     state: &mut FlightState,
     thrust_n: f64,
     pitch_cmd: f64,
     bank_cmd: f64,
+    wind: &Vector3<f64>,
 ) {
     let dt = PHYSICS_DT;
     let mass = state.total_mass();
-    let speed = state.airspeed();
     let alt = state.altitude();
     let rho = air_density(alt);
 
+    // --- Air-relative velocity (all aero forces use this) ---
+    let airspeed_vec = state.velocity - wind;
+    let airspeed = airspeed_vec.norm();
+
     // --- Orientation update (smooth tracking of commanded angles) ---
-    // Bank rate: ~60 deg/s max
-    let bank_rate = 1.0_f64; // rad/s responsiveness
+    let bank_rate = 1.0_f64;
     let bank_error = bank_cmd - state.bank;
     state.bank += (bank_error * bank_rate * dt * 10.0).clamp(-bank_rate * dt, bank_rate * dt);
 
-    // Pitch rate: ~30 deg/s max
     let pitch_rate = 0.5;
     let pitch_error = pitch_cmd - state.pitch;
     state.pitch += (pitch_error * pitch_rate * dt * 10.0).clamp(-pitch_rate * dt, pitch_rate * dt);
 
     // Bank-to-turn: heading rate proportional to bank angle and airspeed
-    // Turn rate = g * tan(bank) / V for coordinated turn
-    if speed > 5.0 {
+    if airspeed > 5.0 {
         let g = 9.81;
-        let turn_rate = g * state.bank.tan().clamp(-2.0, 2.0) / speed;
+        let turn_rate = g * state.bank.tan().clamp(-2.0, 2.0) / airspeed;
         state.heading += turn_rate * dt;
     }
 
-    // --- Aerodynamic forces ---
-    let alpha = angle_of_attack(state);
+    // --- Aerodynamic forces (computed from air-relative velocity) ---
+    let alpha = angle_of_attack(state, &airspeed_vec);
     let cl = lift_coefficient(alpha);
-    let cd = drag_coefficient(cl);
+    let cd_base = drag_coefficient(cl);
 
-    let q = 0.5 * rho * speed * speed; // dynamic pressure
+    // Apply ground effect to induced drag portion only
+    let cd_induced = cd_base - CD0;
+    let cd = CD0 + cd_induced * ground_effect_factor(alt);
 
-    // Drag: opposes velocity
-    let drag_mag = q * cd * S_WING;
-    let drag = if speed > 0.1 {
-        -state.velocity.normalize() * drag_mag
+    let q = 0.5 * rho * airspeed * airspeed; // dynamic pressure
+
+    // Drag: opposes air-relative velocity
+    let drag = if airspeed > 0.1 {
+        -(airspeed_vec / airspeed) * q * cd * S_WING
     } else {
         Vector3::zeros()
     };
 
-    // Lift: perpendicular to velocity, in the pitch-up direction
-    let lift_mag = q * cl * S_WING;
-    let lift = if speed > 1.0 {
-        let vel_hat = state.velocity / speed;
-        let up = state.body_up();
-        // Lift acts perpendicular to velocity in the plane of velocity and body up
+    // Lift: perpendicular to air-relative velocity
+    let lift = if airspeed > 1.0 {
+        let vel_hat = airspeed_vec / airspeed;
         let lift_dir = vel_hat.cross(&state.right_dir());
         let lift_dir = if lift_dir.norm() > 0.01 {
             lift_dir.normalize()
         } else {
-            up
+            state.body_up()
         };
-        lift_dir * lift_mag
+        lift_dir * q * cl * S_WING
     } else {
         Vector3::zeros()
     };
@@ -238,8 +260,26 @@ pub fn step(
     // Gravity
     let gravity = Vector3::new(0.0, 0.0, -9.81) * mass;
 
+    // --- Ground friction (for sliding phase) ---
+    let ground_speed = state.velocity.norm();
+    let friction = if state.position.z < 0.5 && ground_speed > 0.1 {
+        let horiz_vel = Vector3::new(state.velocity.x, state.velocity.y, 0.0);
+        let horiz_speed = horiz_vel.norm();
+        if horiz_speed > 0.1 {
+            let friction_mag = MU_GROUND * mass * 9.81;
+            // Clamp so friction doesn't reverse velocity in one timestep
+            let max_decel = horiz_speed * mass / dt;
+            let f = friction_mag.min(max_decel);
+            -(horiz_vel / horiz_speed) * f
+        } else {
+            Vector3::zeros()
+        }
+    } else {
+        Vector3::zeros()
+    };
+
     // --- Integration ---
-    let total_force = thrust + lift + drag + gravity;
+    let total_force = thrust + lift + drag + gravity + friction;
     let accel = total_force / mass;
     state.velocity += accel * dt;
     state.position += state.velocity * dt;
@@ -254,14 +294,12 @@ pub fn step(
 
     // --- Fuel burn ---
     if thrust_n > 0.0 {
-        // Scale fuel rate with thrust ratio
         let thrust_ratio = thrust_n / THRUST_CRUISE;
         let fuel_burn = FUEL_RATE_CRUISE * thrust_ratio.min(3.0) * dt;
         state.fuel_mass = (state.fuel_mass - fuel_burn).max(0.0);
     }
 
     // --- Prop animation ---
-    // RPM proportional to thrust
     let rpm = if thrust_n > 0.0 { 5500.0 + (thrust_n / THRUST_CRUISE) * 2000.0 } else { 0.0 };
     state.prop_angle += rpm * 2.0 * std::f64::consts::PI / 60.0 * dt;
 }

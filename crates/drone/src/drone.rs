@@ -5,8 +5,8 @@
 
 use simuforge_core::Vertex;
 
-/// Olive drab color for the drone body.
-pub const DRONE_COLOR: [f32; 4] = [0.33, 0.37, 0.31, 1.0];
+/// Deep red color for the drone body.
+pub const DRONE_COLOR: [f32; 4] = [0.55, 0.05, 0.05, 1.0];
 /// Dark prop color.
 pub const PROP_COLOR: [f32; 4] = [0.15, 0.12, 0.10, 1.0];
 

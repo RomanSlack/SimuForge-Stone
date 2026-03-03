@@ -40,7 +40,7 @@ impl RenderContext {
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("SimuForge Device"),
-                    required_features: wgpu::Features::empty(),
+                    required_features: wgpu::Features::FLOAT32_FILTERABLE,
                     required_limits: wgpu::Limits::default(),
                     ..Default::default()
                 },
