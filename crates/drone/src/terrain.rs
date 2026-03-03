@@ -343,3 +343,88 @@ pub fn reference_buildings() -> Vec<(f64, f32, f32, f32)> {
 pub fn generate_ref_building(hx: f32, hy: f32, hz: f32) -> (Vec<Vertex>, Vec<u32>) {
     generate_box(hx, hy, hz)
 }
+
+/// Deterministic hash for rock placement (returns 0..1).
+fn rock_hash(seed: u32, i: u32) -> f32 {
+    let mut h = seed.wrapping_add(i).wrapping_mul(2654435761);
+    h = (h ^ (h >> 16)).wrapping_mul(2246822519);
+    h = h ^ (h >> 13);
+    (h as f32) / (u32::MAX as f32)
+}
+
+/// Generate ~50 low-poly rocks as a single combined mesh (world-space vertices).
+/// Rocks cluster near launch (0–2km) and target (48–50km), sparse mid-route.
+pub fn generate_rocks() -> (Vec<Vertex>, Vec<u32>) {
+    let mut verts = Vec::new();
+    let mut idxs = Vec::new();
+
+    let num_rocks = 50_u32;
+
+    for i in 0..num_rocks {
+        // Determine X position: cluster near launch and target
+        let t = rock_hash(100, i);
+        let wx = if t < 0.45 {
+            // Near launch: 50–2000m
+            50.0 + rock_hash(200, i) * 1950.0
+        } else if t < 0.90 {
+            // Near target: 48000–50000m
+            48_000.0 + rock_hash(201, i) * 2000.0
+        } else {
+            // Sparse mid-route
+            2000.0 + rock_hash(202, i) * 46_000.0
+        };
+
+        // Z (render) position: ±200m from flight path
+        let wz = (rock_hash(300, i) - 0.5) * 400.0;
+
+        let base_y = terrain_height(wx, wz);
+
+        // Rock size: 0.5–3m
+        let size = 0.5 + rock_hash(400, i) * 2.5;
+
+        // Generate irregular pyramid: 5 base vertices + 1 apex
+        let base = verts.len() as u32;
+        let n_base = 5_u32;
+        let apex_y = base_y + size * (0.5 + rock_hash(500, i) * 0.5);
+
+        // Base ring (on ground)
+        for j in 0..n_base {
+            let angle = j as f32 / n_base as f32 * std::f32::consts::TAU;
+            let jitter_r = size * 0.4 * (0.6 + rock_hash(600 + j, i) * 0.8);
+            let jitter_y = rock_hash(700 + j, i) * size * 0.15;
+            let (s, c) = angle.sin_cos();
+            let px = wx + c * jitter_r;
+            let pz = wz + s * jitter_r;
+            let py = base_y + jitter_y;
+            // Approximate outward normal
+            let ny = 0.3_f32;
+            let len = (c * c + ny * ny + s * s).sqrt();
+            verts.push(Vertex {
+                position: [px, py, pz],
+                normal: [c / len, ny / len, s / len],
+            });
+        }
+
+        // Apex
+        let apex_idx = verts.len() as u32;
+        let ax = wx + (rock_hash(800, i) - 0.5) * size * 0.3;
+        let az = wz + (rock_hash(801, i) - 0.5) * size * 0.3;
+        verts.push(Vertex {
+            position: [ax, apex_y, az],
+            normal: [0.0, 1.0, 0.0],
+        });
+
+        // Side faces: triangles from each base edge to apex
+        for j in 0..n_base {
+            let j_next = (j + 1) % n_base;
+            idxs.extend_from_slice(&[base + j, base + j_next, apex_idx]);
+        }
+
+        // Base face (fan from vertex 0)
+        for j in 1..n_base - 1 {
+            idxs.extend_from_slice(&[base, base + j + 1, base + j]); // wound opposite
+        }
+    }
+
+    (verts, idxs)
+}

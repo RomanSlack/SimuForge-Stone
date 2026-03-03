@@ -1,0 +1,11 @@
+In ground mode toggle like bounding box AI tracking thing
+
+Fleet of drones all try to approach from different angles
+
+Make rocks larger
+
+Night mode with heat vision or something for ground view.
+
+Recheck realistic physics for drone
+
+Actual nice launch animation from custom 3D truck

@@ -6,13 +6,14 @@
 use simuforge_render::context::RenderContext;
 use wgpu::util::DeviceExt;
 
-/// GPU sky uniforms: inv_vp + exposure.
+/// GPU sky uniforms: inv_vp + exposure + horizon_dust.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SkyUniforms {
     pub inv_view_proj: [[f32; 4]; 4],
     pub exposure: f32,
-    pub _pad: [f32; 3],
+    pub horizon_dust: f32,
+    pub _pad: [f32; 2],
 }
 
 pub struct SkyboxPipeline {
@@ -84,7 +85,8 @@ impl SkyboxPipeline {
         let uniforms = SkyUniforms {
             inv_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
             exposure: 0.4,
-            _pad: [0.0; 3],
+            horizon_dust: 0.5,
+            _pad: [0.0; 2],
         };
         let uniform_buffer = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Sky Uniforms"),
@@ -175,12 +177,13 @@ impl SkyboxPipeline {
         Self { pipeline, bind_group, uniform_buffer }
     }
 
-    /// Upload inverse VP and exposure to GPU. Call once per frame before render.
-    pub fn update(&self, queue: &wgpu::Queue, inv_view_proj: glam::Mat4, exposure: f32) {
+    /// Upload inverse VP, exposure, and horizon dust to GPU. Call once per frame before render.
+    pub fn update(&self, queue: &wgpu::Queue, inv_view_proj: glam::Mat4, exposure: f32, horizon_dust: f32) {
         let uniforms = SkyUniforms {
             inv_view_proj: inv_view_proj.to_cols_array_2d(),
             exposure,
-            _pad: [0.0; 3],
+            horizon_dust,
+            _pad: [0.0; 2],
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
     }

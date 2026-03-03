@@ -4,9 +4,9 @@
 struct SkyUniforms {
     inv_view_proj: mat4x4<f32>,
     exposure: f32,
+    horizon_dust: f32,
     _pad0: f32,
     _pad1: f32,
-    _pad2: f32,
 };
 
 @group(0) @binding(0) var<uniform> sky: SkyUniforms;
@@ -55,7 +55,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let color = textureSample(env_texture, env_sampler, uv);
 
     // Apply exposure
-    let exposed = color.rgb * sky.exposure;
+    var exposed = color.rgb * sky.exposure;
+
+    // Horizon dust: blend toward dusty haze color near horizon
+    let dust_color = vec3<f32>(0.72, 0.68, 0.58);
+    let elev = direction.y; // Y-up: positive = above horizon
+    // smoothstep band: full dust below -0.02, fades to zero at +0.12
+    let dust_band = 1.0 - smoothstep(-0.02, 0.12, elev);
+    let dust_blend = dust_band * sky.horizon_dust;
+    exposed = mix(exposed, dust_color * sky.exposure, dust_blend);
 
     // Reinhard tonemapping
     let tonemapped = exposed / (exposed + vec3<f32>(1.0));

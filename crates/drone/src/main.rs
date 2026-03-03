@@ -171,6 +171,11 @@ struct App {
     target_outer_material: Option<MaterialBind>,
     target_inner_mesh: Option<GpuMesh>,
     target_inner_material: Option<MaterialBind>,
+    // Rocks
+    rock_mesh: Option<GpuMesh>,
+    rock_material: Option<MaterialBind>,
+    // Horizon dust
+    horizon_dust: f32,
     // Drone outline (ground mode visibility)
     drone_outline_material: Option<MaterialBind>,
     // Ground camera
@@ -272,6 +277,9 @@ impl App {
             target_outer_material: None,
             target_inner_mesh: None,
             target_inner_material: None,
+            rock_mesh: None,
+            rock_material: None,
+            horizon_dust: 0.5,
             trail_pipeline: None,
             trail_points: Vec::new(),
             trail_distance_accum: 0.0,
@@ -311,6 +319,7 @@ impl App {
         self.last_terrain_snap = (i32::MAX, i32::MAX);
         self.terrain_regen_queue.clear();
         self.minimap_trail.clear();
+        self.horizon_dust = 0.5;
         // Reset camera to launch view
         self.camera.target = Vec3::new(0.0, 2.0, 0.0);
         self.camera.distance = 25.0;
@@ -452,7 +461,7 @@ impl App {
             let proj = self.camera.projection_matrix(ctx.aspect());
             let vp = proj * view;
             let inv_vp = vp.inverse();
-            sky.update(&ctx.queue, inv_vp, self.sky_exposure);
+            sky.update(&ctx.queue, inv_vp, self.sky_exposure, self.horizon_dust);
         }
 
         // Target building offset 15m beside the bullseye at (50000, 15, 1.5) in DH space
@@ -460,18 +469,16 @@ impl App {
         let building_render = swap.transform_point3(building_dh);
         let building_model = Mat4::from_translation(building_render);
 
-        // Target bullseye at (50000, 0, 0) in DH space
-        let target_dh = Vec3::new(50_000.0, 0.0, 0.0);
-        let target_render = swap.transform_point3(target_dh);
-        let target_model = Mat4::from_translation(target_render);
+        // Target bullseye — vertices are in world space (terrain-conforming)
+        let target_model = Mat4::IDENTITY;
 
         // Launch rail
         let rail_render = swap.transform_point3(Vec3::new(2.5, 0.0, 1.0));
         let rail_rot = Quat::from_rotation_z(10.0_f32.to_radians());
         let rail_model = Mat4::from_rotation_translation(rail_rot, rail_render);
 
-        // Flag at top of rail — DH: rail base (0,0,1) + 5m along 10° angle → top ≈ (4.92, 0, 1.87)
-        let flag_dh = Vec3::new(4.9, 0.0, 1.85);
+        // Flagpole: stands vertical beside the rail, DH (0.0, 2.0, 3.0) → base at 3m height
+        let flag_dh = Vec3::new(0.0, 2.0, 3.0);
         let flag_render = swap.transform_point3(flag_dh);
         let flag_model = Mat4::from_translation(flag_render);
 
@@ -545,6 +552,13 @@ impl App {
             mat.params = [0.95, 0.0, 0.0, 0.0];
             ctx.queue.write_buffer(&m.buffer, 0, bytemuck::bytes_of(&mat));
         }
+        // Rocks (world-space vertices, identity model)
+        if let Some(m) = &self.rock_material {
+            let mut mat = MaterialUniform::metal(terrain::ROCK_COLOR)
+                .with_model(Mat4::IDENTITY.to_cols_array_2d());
+            mat.params = [0.95, 0.0, 0.0, 0.0]; // very rough, non-metallic
+            ctx.queue.write_buffer(&m.buffer, 0, bytemuck::bytes_of(&mat));
+        }
 
         // --- Shadow setup (centered on drone, radius scales with camera distance) ---
         let drone_render = to_render(&self.flight.position);
@@ -572,6 +586,7 @@ impl App {
         }
         shadow_matrices.push(light_vp * target_model); // outer ring
         shadow_matrices.push(light_vp * target_model); // inner disc
+        shadow_matrices.push(light_vp * Mat4::IDENTITY); // rocks (world space)
         shadow_matrices.push(light_vp * drone_model);
         shadow_matrices.push(light_vp * prop_model);
 
@@ -715,6 +730,17 @@ impl App {
             }
             si += 1;
 
+            // Rocks
+            if let Some(mesh) = &self.rock_mesh {
+                if si < shadow_matrices.len() {
+                    pass.set_bind_group(0, &shadow.bind_group, &[ShadowPipeline::dynamic_offset(si)]);
+                    pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.draw_indexed(0..mesh.num_indices, 0, 0..1);
+                }
+            }
+            si += 1;
+
             // Drone
             if let Some(mesh) = &self.drone_mesh {
                 if si < shadow_matrices.len() {
@@ -797,6 +823,9 @@ impl App {
             // Target bullseye
             draw_mesh!(&self.target_outer_mesh, &self.target_outer_material);
             draw_mesh!(&self.target_inner_mesh, &self.target_inner_material);
+
+            // Rocks
+            draw_mesh!(&self.rock_mesh, &self.rock_material);
 
             // Drone outline (ground mode: scaled-up red halo drawn first)
             if self.camera_mode == CameraMode::Ground {
@@ -914,6 +943,7 @@ impl App {
             .take_egui_input(self.window.as_ref().unwrap());
         self.egui_ctx.begin_pass(egui_input);
         let mut new_exposure = self.sky_exposure;
+        let mut new_horizon_dust = self.horizon_dust;
         let mut new_wind_speed = self.wind_speed;
         let mut new_wind_dir = self.wind_direction;
         let mut new_master_vol = self.master_volume;
@@ -922,7 +952,7 @@ impl App {
         draw_mission_control(
             &self.egui_ctx, &self.flight, &self.guidance,
             self.time_scale, self.fps, &mut cam_mode,
-            &mut new_exposure, &self.wind,
+            &mut new_exposure, &mut new_horizon_dust, &self.wind,
             &mut new_wind_speed, &mut new_wind_dir,
             &mut new_master_vol, &mut new_engine_muted,
         );
@@ -939,6 +969,7 @@ impl App {
             self.camera_mode = CameraMode::Ground;
         }
         self.sky_exposure = new_exposure;
+        self.horizon_dust = new_horizon_dust;
         self.wind_speed = new_wind_speed;
         self.wind_direction = new_wind_dir;
         self.master_volume = new_master_vol;
@@ -992,6 +1023,7 @@ fn draw_mission_control(
     fps: f64,
     camera_mode: &mut CameraMode,
     sky_exposure: &mut f32,
+    horizon_dust: &mut f32,
     wind: &nalgebra::Vector3<f64>,
     wind_speed: &mut f64,
     wind_direction: &mut f64,
@@ -1044,6 +1076,9 @@ fn draw_mission_control(
             ui.separator();
             ui.label(egui::RichText::new("Sky Exposure").size(13.0));
             ui.add(egui::Slider::new(sky_exposure, 0.05..=3.0).logarithmic(true).text(""));
+
+            ui.label(egui::RichText::new("Horizon Dust").size(13.0));
+            ui.add(egui::Slider::new(horizon_dust, 0.0..=1.0).text(""));
 
             ui.label(egui::RichText::new("Wind Speed (m/s)").size(13.0));
             let mut ws = *wind_speed as f32;
@@ -1178,7 +1213,7 @@ fn draw_minimap(
             );
 
             // Waypoints (yellow dots + labels)
-            let wp_color = egui::Color32::from_rgb(220, 200, 40);
+            let wp_color = egui::Color32::from_rgb(60, 140, 255);
             // Skip last waypoint (it's the target)
             let num_wps = if guidance.waypoints.len() > 1 { guidance.waypoints.len() - 1 } else { 0 };
             for (i, wp) in guidance.waypoints.iter().take(num_wps).enumerate() {
@@ -1440,8 +1475,8 @@ impl ApplicationHandler for App {
         let (buf, bg) = pbr.create_material_bind_group(&ctx.device);
         self.rail_material = Some(MaterialBind { buffer: buf, bind_group: bg });
 
-        // Flag on launch rail
-        let (fv, fi) = terrain::generate_flag();
+        // Flagpole beside launch rail
+        let (fv, fi) = terrain::generate_flagpole();
         let fvb = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("Flag VB"), contents: bytemuck::cast_slice(&fv), usage: wgpu::BufferUsages::VERTEX });
         let fib = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("Flag IB"), contents: bytemuck::cast_slice(&fi), usage: wgpu::BufferUsages::INDEX });
         self.flag_mesh = Some(GpuMesh { vertex_buffer: fvb, index_buffer: fib, num_indices: fi.len() as u32 });
@@ -1494,6 +1529,14 @@ impl ApplicationHandler for App {
         self.target_inner_mesh = Some(GpuMesh { vertex_buffer: tivb, index_buffer: tiib, num_indices: tii.len() as u32 });
         let (buf, bg) = pbr.create_material_bind_group(&ctx.device);
         self.target_inner_material = Some(MaterialBind { buffer: buf, bind_group: bg });
+
+        // Rocks (single combined mesh, world-space vertices)
+        let (rov, roi) = terrain::generate_rocks();
+        let rovb = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("Rock VB"), contents: bytemuck::cast_slice(&rov), usage: wgpu::BufferUsages::VERTEX });
+        let roib = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("Rock IB"), contents: bytemuck::cast_slice(&roi), usage: wgpu::BufferUsages::INDEX });
+        self.rock_mesh = Some(GpuMesh { vertex_buffer: rovb, index_buffer: roib, num_indices: roi.len() as u32 });
+        let (buf, bg) = pbr.create_material_bind_group(&ctx.device);
+        self.rock_material = Some(MaterialBind { buffer: buf, bind_group: bg });
 
         // Trail pipeline
         self.trail_pipeline = Some(LinePipeline::new(&ctx, &pbr.camera_buffer));
