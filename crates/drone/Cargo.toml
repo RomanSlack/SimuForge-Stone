@@ -1,0 +1,18 @@
+[package]
+name = "simuforge-drone"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+simuforge-core = { path = "../core" }
+simuforge-render = { path = "../render" }
+simuforge-audio = { path = "../audio" }
+nalgebra = { workspace = true }
+glam = { workspace = true }
+bytemuck = { workspace = true }
+winit = { workspace = true }
+wgpu = { workspace = true }
+pollster = "0.4"
+egui = { workspace = true }
+egui-wgpu = { workspace = true }
+egui-winit = { workspace = true }

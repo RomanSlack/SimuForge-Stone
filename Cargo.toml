@@ -12,6 +12,7 @@ members = [
     "crates/carver",
     "crates/audio",
     "crates/pingpong",
+    "crates/drone",
 ]
 
 [workspace.dependencies]
