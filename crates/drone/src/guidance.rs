@@ -77,6 +77,10 @@ const TERMINAL_RANGE: f64 = 800.0;
 /// Terminal dive pitch angle (radians, negative = nose down). Steep nose-dive.
 const TERMINAL_PITCH: f64 = -55.0_f64 * std::f64::consts::PI / 180.0;
 
+/// CEP (circular error probable) radius in meters — 50% of shots land within this radius.
+/// Real Shahed-136 GPS/INS CEP is estimated at 5-10m.
+const CEP_RADIUS: f64 = 8.0;
+
 /// Guidance state machine.
 pub struct Guidance {
     /// Current flight phase.
@@ -87,6 +91,8 @@ pub struct Guidance {
     pub waypoints: Vec<Vector3<f64>>,
     /// Current waypoint index.
     pub waypoint_idx: usize,
+    /// Per-drone aim point (TARGET_POS + random CEP scatter).
+    pub aim_point: Vector3<f64>,
 }
 
 impl Guidance {
@@ -100,11 +106,14 @@ impl Guidance {
             Vector3::new(45_000.0, 200.0, CRUISE_ALT),      // W5: line up for terminal
             Vector3::new(TARGET_POS.x, TARGET_POS.y, TARGET_POS.z + 3.0),
         ];
+        let (dx, dy) = random_cep_offset(0);
+        let aim_point = Vector3::new(TARGET_POS.x + dx, TARGET_POS.y + dy, TARGET_POS.z);
         Self {
             phase: FlightPhase::PreLaunch,
             mission_time: 0.0,
             waypoints,
             waypoint_idx: 0,
+            aim_point,
         }
     }
 
@@ -130,11 +139,18 @@ impl Guidance {
         }
         waypoints.push(Vector3::new(TARGET_POS.x, TARGET_POS.y, TARGET_POS.z + 3.0));
 
+        // Unique seed from launch position for reproducible scatter
+        let seed = (launch_pos.x as u64).wrapping_mul(2654435761)
+            ^ (launch_pos.y as u64).wrapping_mul(2246822519);
+        let (dx, dy) = random_cep_offset(seed);
+        let aim_point = Vector3::new(TARGET_POS.x + dx, TARGET_POS.y + dy, TARGET_POS.z);
+
         Self {
             phase: FlightPhase::PreLaunch,
             mission_time: 0.0,
             waypoints,
             waypoint_idx: 0,
+            aim_point,
         }
     }
 
@@ -243,8 +259,8 @@ impl Guidance {
 
                 let thrust = THRUST_CRUISE;
 
-                // Heading to target — high gain + wider bank for terminal accuracy
-                let to_target = TARGET_POS - state.position;
+                // Heading to aim point — high gain + wider bank for terminal accuracy
+                let to_target = self.aim_point - state.position;
                 let desired_heading = to_target.y.atan2(to_target.x);
                 let heading_error = angle_diff(desired_heading, state.heading);
                 let bank_cmd = (4.0 * heading_error).clamp(
@@ -267,6 +283,33 @@ impl Guidance {
     pub fn should_auto_slow(&self) -> bool {
         matches!(self.phase, FlightPhase::Launch | FlightPhase::Terminal)
     }
+}
+
+/// Generate a random aim point offset using Box-Muller transform on a hash seed.
+/// Returns (dx, dy) in meters following a Rayleigh distribution with the given CEP.
+fn random_cep_offset(seed: u64) -> (f64, f64) {
+    // Two independent hash values in [0, 1)
+    let h1 = {
+        let mut s = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = (s ^ (s >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        s = (s ^ (s >> 27)).wrapping_mul(0x94d049bb133111eb);
+        s = s ^ (s >> 31);
+        (s as f64) / (u64::MAX as f64)
+    };
+    let h2 = {
+        let mut s = seed.wrapping_add(7).wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        s = (s ^ (s >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        s = (s ^ (s >> 27)).wrapping_mul(0x94d049bb133111eb);
+        s = s ^ (s >> 31);
+        (s as f64) / (u64::MAX as f64)
+    };
+    // Box-Muller: two uniform → two normal
+    let u1 = h1.max(1e-10); // avoid log(0)
+    let r = (-2.0 * u1.ln()).sqrt();
+    let theta = 2.0 * std::f64::consts::PI * h2;
+    // CEP → sigma: for 2D Gaussian, CEP = sigma * 1.1774
+    let sigma = CEP_RADIUS / 1.1774;
+    (r * theta.cos() * sigma, r * theta.sin() * sigma)
 }
 
 /// Normalize angle difference to [-π, π].

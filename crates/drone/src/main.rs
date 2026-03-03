@@ -30,6 +30,7 @@ use simuforge_audio::AudioEngine;
 mod drone;
 mod flight;
 mod guidance;
+mod particles;
 mod skybox;
 mod sound;
 mod terrain;
@@ -162,6 +163,8 @@ struct FleetPlanState {
     map_center: [f64; 2],
     /// Half-range in meters (zoom level).
     map_half_range: f64,
+    /// Brush size: how many drones to place per click (1, 5, or 10).
+    brush_count: usize,
 }
 
 /// Compute the drone model matrix from flight state.
@@ -264,6 +267,8 @@ struct App {
     ground_cam_fov: f32,
     // Trail
     trail_pipeline: Option<LinePipeline>,
+    // Particle system for explosions
+    particle_system: Option<particles::ParticleSystem>,
     // Audio — persistent voices wrapped in SharedVoice for per-frame updates
     audio_engine: AudioEngine,
     audio_started: bool,
@@ -334,7 +339,7 @@ impl App {
                 launch_pos: [0.0, 0.0],
             }],
             primary_drone: 0,
-            fleet_plan: FleetPlanState { active: false, launch_positions: Vec::new(), map_center: [25_000.0, 0.0], map_half_range: 28_000.0 },
+            fleet_plan: FleetPlanState { active: false, launch_positions: Vec::new(), map_center: [25_000.0, 0.0], map_half_range: 28_000.0, brush_count: 1 },
             last_frame: Instant::now(),
             accumulator: 0.0,
             frame_count: 0,
@@ -377,6 +382,7 @@ impl App {
             rock_material: None,
             horizon_dust: 0.5,
             trail_pipeline: None,
+            particle_system: None,
             audio_engine: AudioEngine::new(),
             audio_started: false,
             engine_voice: None,
@@ -402,25 +408,32 @@ impl App {
         }
     }
 
-    /// Reset everything for a new mission.
+    /// Reset everything for a new mission. Preserves fleet positions.
     fn reset(&mut self) {
-        // Keep materials from existing drones, just reset state
-        for d in &mut self.drones {
-            d.flight = FlightState::new();
-            d.guidance = Guidance::new();
+        // Reset each drone back to its original launch position
+        for (i, d) in self.drones.iter_mut().enumerate() {
+            let launch = nalgebra::Vector3::new(d.launch_pos[0], d.launch_pos[1], 1.0);
+            let heading = (guidance::TARGET_POS.x - d.launch_pos[0])
+                .atan2(guidance::TARGET_POS.y - d.launch_pos[1]);
+            d.flight = if d.launch_pos == [0.0, 0.0] && i == 0 {
+                FlightState::new() // default drone uses original spawn
+            } else {
+                FlightState::new_at(launch, heading)
+            };
+            d.guidance = if d.launch_pos == [0.0, 0.0] && i == 0 {
+                Guidance::new()
+            } else {
+                Guidance::new_from(launch)
+            };
             d.trail_points.clear();
             d.trail_distance_accum = 0.0;
             d.minimap_trail.clear();
         }
-        // Trim to single default drone
-        self.drones.truncate(1);
-        if let Some(d) = self.drones.first_mut() {
-            d.drone_tint = drone::DRONE_COLOR;
-            d.trail_color = fleet_trail_color(0);
-            d.launch_pos = [0.0, 0.0];
-        }
         self.primary_drone = 0;
-        self.fleet_plan = FleetPlanState { active: false, launch_positions: Vec::new(), map_center: [25_000.0, 0.0], map_half_range: 28_000.0 };
+        // Keep fleet_plan positions so user can re-launch the same fleet
+        if let Some(ps) = &mut self.particle_system {
+            ps.clear();
+        }
         self.sim_time = 0.0;
         self.accumulator = 0.0;
         self.time_scale = 1.0;
@@ -1062,6 +1075,50 @@ impl App {
                 pass.set_bind_group(0, &trail.bind_group, &[]);
                 pass.set_vertex_buffer(0, trail.vertex_buffer.slice(..));
                 pass.draw(0..trail.num_vertices, 0..1);
+            }
+        }
+
+        // Pass 6c: Explosion particles — fire (additive) then smoke (alpha)
+        if let Some(ps) = &self.particle_system {
+            if ps.fire_num_vertices > 0 {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Particle Fire Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &ctx.depth_texture,
+                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                        stencil_ops: None,
+                    }),
+                    ..Default::default()
+                });
+                pass.set_pipeline(&ps.fire_pipeline);
+                pass.set_bind_group(0, &ps.fire_bind_group, &[]);
+                pass.set_vertex_buffer(0, ps.fire_vertex_buffer.slice(..));
+                pass.draw(0..ps.fire_num_vertices, 0..1);
+            }
+            if ps.smoke_num_vertices > 0 {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Particle Smoke Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &ctx.depth_texture,
+                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store }),
+                        stencil_ops: None,
+                    }),
+                    ..Default::default()
+                });
+                pass.set_pipeline(&ps.smoke_pipeline);
+                pass.set_bind_group(0, &ps.smoke_bind_group, &[]);
+                pass.set_vertex_buffer(0, ps.smoke_vertex_buffer.slice(..));
+                pass.draw(0..ps.smoke_num_vertices, 0..1);
             }
         }
 
@@ -1733,11 +1790,21 @@ fn draw_fleet_planner(ctx: &egui::Context, plan: &mut FleetPlanState, launch_all
         .default_width(600.0)
         .resizable(false)
         .show(ctx, |ui| {
-            let range_km = plan.map_half_range / 1000.0;
-            ui.label(egui::RichText::new(format!(
-                "Click to place drones ({}/{}) | Scroll to zoom, right-drag to pan | View: {:.1} km",
-                plan.launch_positions.len(), MAX_FLEET_SIZE, range_km * 2.0
-            )).size(13.0).color(egui::Color32::WHITE));
+            // Brush size selector
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Brush:").size(13.0).color(egui::Color32::WHITE));
+                for &count in &[1_usize, 5, 10, 25] {
+                    let label = format!("{}x", count);
+                    let selected = plan.brush_count == count;
+                    let btn = ui.add(egui::Button::new(
+                        egui::RichText::new(&label).size(13.0)
+                            .color(if selected { egui::Color32::BLACK } else { egui::Color32::WHITE })
+                    ).fill(if selected { egui::Color32::from_rgb(100, 200, 255) } else { egui::Color32::from_rgb(50, 50, 65) }));
+                    if btn.clicked() { plan.brush_count = count; }
+                }
+                ui.label(egui::RichText::new(format!("  {}/{}", plan.launch_positions.len(), MAX_FLEET_SIZE)).size(13.0).color(egui::Color32::LIGHT_GRAY));
+            });
+            ui.label(egui::RichText::new("Click to place | Scroll to zoom | Right-drag to pan").size(11.0).color(egui::Color32::GRAY));
 
             let map_size = egui::vec2(560.0, 560.0);
             let (response, painter) = ui.allocate_painter(
@@ -1863,12 +1930,35 @@ fn draw_fleet_planner(ctx: &egui::Context, plan: &mut FleetPlanState, launch_all
                 plan.map_center[1] += (drag.y as f64 / map_half as f64) * half_range;
             }
 
-            // Left-click to place drone
+            // Left-click to place drones (brush formation)
             if response.clicked_by(egui::PointerButton::Primary) && plan.launch_positions.len() < MAX_FLEET_SIZE {
                 if let Some(click_pos) = response.interact_pointer_pos() {
                     let dh_x = ((click_pos.x - center.x) / map_half) as f64 * half_range + map_cx;
                     let dh_y = -((click_pos.y - center.y) / map_half) as f64 * half_range + map_cy;
-                    plan.launch_positions.push([dh_x, dh_y]);
+                    let count = plan.brush_count.min(MAX_FLEET_SIZE - plan.launch_positions.len());
+                    if count == 1 {
+                        plan.launch_positions.push([dh_x, dh_y]);
+                    } else {
+                        // Place in a spread formation: staggered grid centered on click
+                        // Spacing proportional to view range for consistent visual density
+                        let spacing = (half_range * 0.015).clamp(20.0, 500.0);
+                        let cols = (count as f64).sqrt().ceil() as usize;
+                        let rows = (count + cols - 1) / cols;
+                        let ox = -(cols as f64 - 1.0) * spacing * 0.5;
+                        let oy = -(rows as f64 - 1.0) * spacing * 0.5;
+                        let mut placed = 0;
+                        for r in 0..rows {
+                            for c in 0..cols {
+                                if placed >= count { break; }
+                                // Stagger odd rows by half spacing
+                                let stagger = if r % 2 == 1 { spacing * 0.5 } else { 0.0 };
+                                let px = dh_x + ox + c as f64 * spacing + stagger;
+                                let py = dh_y + oy + r as f64 * spacing;
+                                plan.launch_positions.push([px, py]);
+                                placed += 1;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -2296,6 +2386,9 @@ impl ApplicationHandler for App {
         // Trail pipeline
         self.trail_pipeline = Some(LinePipeline::new(&ctx, &pbr.camera_buffer));
 
+        // Particle system for explosions
+        self.particle_system = Some(particles::ParticleSystem::new(&ctx, &pbr.camera_buffer));
+
         self.post_sampler = Some(post_sampler);
         self.depth_sampler = Some(depth_sampler);
         self.ssao_bind_group = Some(ssao_bg);
@@ -2559,9 +2652,13 @@ impl ApplicationHandler for App {
                                 if d.minimap_trail.len() > 10_000 { d.minimap_trail.remove(0); }
                             }
                         }
-                        // Play impact sound for new impacts
-                        for _di in &new_impacts {
+                        // Play impact sound + spawn explosion for new impacts
+                        for &di in &new_impacts {
                             self.audio_engine.play(Box::new(sound::ImpactVoice::new()));
+                            if let Some(ps) = &mut self.particle_system {
+                                let impact_pos = to_render(&self.drones[di].flight.position);
+                                ps.spawn_explosion(impact_pos);
+                            }
                         }
                         if all_done { break; }
                         self.accumulator -= PHYSICS_DT;
@@ -2647,6 +2744,18 @@ impl ApplicationHandler for App {
                             ctx.queue.write_buffer(ib, (slot * idx_stride) as u64,
                                 bytemuck::cast_slice(&self.terrain_idxs[slot * terrain::IDXS_PER_TILE..(slot + 1) * terrain::IDXS_PER_TILE]));
                         }
+                    }
+                }
+
+                // Update + upload explosion particles (wall-clock dt for smooth visuals)
+                if let Some(ps) = &mut self.particle_system {
+                    ps.update(frame_dt as f32);
+                    // Extract camera right/up from view matrix for billboarding
+                    let view_mat = self.camera.view_matrix();
+                    let cam_right = Vec3::new(view_mat.x_axis.x, view_mat.y_axis.x, view_mat.z_axis.x);
+                    let cam_up = Vec3::new(view_mat.x_axis.y, view_mat.y_axis.y, view_mat.z_axis.y);
+                    if let Some(ctx) = &self.render_ctx {
+                        ps.upload(&ctx.queue, cam_right, cam_up);
                     }
                 }
 
