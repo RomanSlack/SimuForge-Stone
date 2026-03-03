@@ -1,11 +1,11 @@
-In ground mode toggle like bounding box AI tracking thing
+In ground mode toggle like bounding box AI tracking thing like yolo or something or fake
 
-Fleet of drones all try to approach from different angles
+Fleet of drones all try to approach from different angles, deafult one but can spawn more and such and mark on map their starting localtions, like you can enter this plan mode where the mini map is full screen and you just click where the drones should launch from and such and how many by clicking
 
 Make rocks larger
 
 Night mode with heat vision or something for ground view.
 
-Recheck realistic physics for drone
+Recheck realistic physics for drone to ensure accurate
 
 Actual nice launch animation from custom 3D truck

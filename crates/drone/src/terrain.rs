@@ -87,6 +87,33 @@ pub fn terrain_height(wx: f32, wz: f32) -> f32 {
     raw * flatten
 }
 
+/// Terrain grid step size (meters between vertices).
+pub const GRID_STEP: f32 = TILE_SIZE / TILE_RES as f32;
+
+/// Terrain height matching the visual mesh (bilinear interpolation on vertex grid).
+///
+/// The rendered terrain uses vertices spaced `GRID_STEP` apart, with heights from
+/// `terrain_height()` at each vertex and linear interpolation between them. This
+/// function replicates that interpolation so collision checks match the visual mesh.
+pub fn terrain_height_visual(wx: f32, wz: f32) -> f32 {
+    let step = GRID_STEP;
+    let gx = (wx / step).floor();
+    let gz = (wz / step).floor();
+    let x0 = gx * step;
+    let z0 = gz * step;
+    let x1 = x0 + step;
+    let z1 = z0 + step;
+    let h00 = terrain_height(x0, z0);
+    let h10 = terrain_height(x1, z0);
+    let h01 = terrain_height(x0, z1);
+    let h11 = terrain_height(x1, z1);
+    let fx = (wx - x0) / step;
+    let fz = (wz - z0) / step;
+    let h0 = h00 + (h10 - h00) * fx;
+    let h1 = h01 + (h11 - h01) * fx;
+    h0 + (h1 - h0) * fz
+}
+
 /// Side length of the tile grid.
 pub const TILE_SIDE: usize = (TILE_RADIUS * 2 + 1) as usize;
 
@@ -197,41 +224,52 @@ pub fn generate_target_building() -> (Vec<Vertex>, Vec<u32>) {
     generate_box(1.0, 1.0, 1.5)
 }
 
-/// Generate a terrain-conforming ring around the target center (world-space vertices).
+/// Generate a terrain-conforming extruded ring around the target center (world-space vertices).
 /// `cx`, `cz` are the ring center in render world space (Y-up).
+/// The ring has vertical thickness (`height`) to avoid z-fighting with terrain.
 fn generate_target_ring(cx: f32, cz: f32, inner_r: f32, outer_r: f32) -> (Vec<Vertex>, Vec<u32>) {
     let segments = 96_u32;
-    let lift = 0.05_f32; // slight lift above terrain to prevent z-fighting
-    let mut verts = Vec::with_capacity((segments as usize + 1) * 2);
+    let height = 1.5_f32; // vertical thickness of the ring
+    let n = segments + 1;
+
+    // 4 rows of vertices per segment: inner-bottom, inner-top, outer-top, outer-bottom
+    let mut verts = Vec::with_capacity(n as usize * 4);
     let mut idxs = Vec::new();
 
-    for i in 0..=segments {
+    for i in 0..n {
         let theta = i as f32 / segments as f32 * std::f32::consts::TAU;
         let (s, c) = theta.sin_cos();
 
         let ix = cx + c * inner_r;
         let iz = cz + s * inner_r;
-        let iy = terrain_height(ix, iz) + lift;
-        verts.push(Vertex {
-            position: [ix, iy, iz],
-            normal: [0.0, 1.0, 0.0],
-        });
+        let iy_base = terrain_height_visual(ix, iz) - 0.3;
 
         let ox = cx + c * outer_r;
         let oz = cz + s * outer_r;
-        let oy = terrain_height(ox, oz) + lift;
-        verts.push(Vertex {
-            position: [ox, oy, oz],
-            normal: [0.0, 1.0, 0.0],
-        });
+        let oy_base = terrain_height_visual(ox, oz) - 0.3;
+
+        // Row 0: inner bottom
+        verts.push(Vertex { position: [ix, iy_base, iz], normal: [-c, 0.0, -s] });
+        // Row 1: inner top
+        verts.push(Vertex { position: [ix, iy_base + height, iz], normal: [-c, 0.0, -s] });
+        // Row 2: outer top
+        verts.push(Vertex { position: [ox, oy_base + height, oz], normal: [c, 0.0, s] });
+        // Row 3: outer bottom
+        verts.push(Vertex { position: [ox, oy_base, oz], normal: [c, 0.0, s] });
     }
 
     for i in 0..segments {
-        let i0 = i * 2;
-        let i1 = i0 + 1;
-        let i2 = i0 + 2;
-        let i3 = i0 + 3;
-        idxs.extend_from_slice(&[i0, i2, i1, i1, i2, i3]);
+        let b = i * 4;
+        let nb = b + 4; // next segment
+
+        // Top face (row 1 inner → row 2 outer)
+        idxs.extend_from_slice(&[b + 1, nb + 1, b + 2, b + 2, nb + 1, nb + 2]);
+        // Inner wall (row 0 → row 1)
+        idxs.extend_from_slice(&[b, b + 1, nb, nb, b + 1, nb + 1]);
+        // Outer wall (row 2 → row 3)
+        idxs.extend_from_slice(&[b + 2, nb + 2, b + 3, b + 3, nb + 2, nb + 3]);
+        // Bottom face (row 0 inner → row 3 outer)
+        idxs.extend_from_slice(&[b, nb, b + 3, b + 3, nb, nb + 3]);
     }
 
     (verts, idxs)
@@ -253,32 +291,53 @@ pub fn generate_target_inner_disc() -> (Vec<Vertex>, Vec<u32>) {
     // Inner ring (15–18m)
     let (mut verts, mut idxs) = generate_target_ring(cx, cz, 15.0, 18.0);
 
-    // Center disc (0–5m) as a triangle fan
-    let segments = 64_u32;
+    // Center disc (0–5m) as extruded cylinder
+    let disc_segments = 64_u32;
     let radius = 5.0_f32;
-    let lift = 0.06_f32; // slightly above outer ring
+    let disc_height = 1.8_f32; // slightly taller than outer rings
 
+    // Top face: triangle fan from center
     let center_base = verts.len() as u32;
-    let cy = terrain_height(cx, cz) + lift;
+    let cy_base = terrain_height_visual(cx, cz) - 0.3;
+    let cy_top = cy_base + disc_height;
     verts.push(Vertex {
-        position: [cx, cy, cz],
+        position: [cx, cy_top, cz],
         normal: [0.0, 1.0, 0.0],
     });
 
-    for i in 0..=segments {
-        let theta = i as f32 / segments as f32 * std::f32::consts::TAU;
+    for i in 0..=disc_segments {
+        let theta = i as f32 / disc_segments as f32 * std::f32::consts::TAU;
         let (s, c) = theta.sin_cos();
         let px = cx + c * radius;
         let pz = cz + s * radius;
-        let py = terrain_height(px, pz) + lift;
+        let py_top = terrain_height_visual(px, pz) - 0.3 + disc_height;
         verts.push(Vertex {
-            position: [px, py, pz],
+            position: [px, py_top, pz],
             normal: [0.0, 1.0, 0.0],
         });
     }
 
-    for i in 0..segments {
+    for i in 0..disc_segments {
         idxs.extend_from_slice(&[center_base, center_base + i + 1, center_base + i + 2]);
+    }
+
+    // Side wall of the disc
+    let wall_base = verts.len() as u32;
+    for i in 0..=disc_segments {
+        let theta = i as f32 / disc_segments as f32 * std::f32::consts::TAU;
+        let (s, c) = theta.sin_cos();
+        let px = cx + c * radius;
+        let pz = cz + s * radius;
+        let py_base = terrain_height_visual(px, pz) - 0.3;
+        // Bottom vertex
+        verts.push(Vertex { position: [px, py_base, pz], normal: [c, 0.0, s] });
+        // Top vertex
+        verts.push(Vertex { position: [px, py_base + disc_height, pz], normal: [c, 0.0, s] });
+    }
+
+    for i in 0..disc_segments {
+        let b = wall_base + i * 2;
+        idxs.extend_from_slice(&[b, b + 2, b + 1, b + 1, b + 2, b + 3]);
     }
 
     (verts, idxs)
@@ -379,8 +438,8 @@ pub fn generate_rocks() -> (Vec<Vertex>, Vec<u32>) {
 
         let base_y = terrain_height(wx, wz);
 
-        // Rock size: 0.5–3m
-        let size = 0.5 + rock_hash(400, i) * 2.5;
+        // Rock size: 1.5–6.5m
+        let size = 1.5 + rock_hash(400, i) * 5.0;
 
         // Generate irregular pyramid: 5 base vertices + 1 apex
         let base = verts.len() as u32;

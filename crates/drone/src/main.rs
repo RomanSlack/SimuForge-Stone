@@ -105,6 +105,88 @@ struct MaterialBind {
     bind_group: wgpu::BindGroup,
 }
 
+/// Maximum fleet size.
+const MAX_FLEET_SIZE: usize = 100;
+
+/// Generate a drone body tint from index using golden-angle hue distribution.
+fn fleet_tint(i: usize) -> [f32; 4] {
+    let hue = (i as f32 * 137.508) % 360.0; // golden angle
+    let s = 0.7_f32;
+    let v = 0.8_f32;
+    let (r, g, b) = hsv_to_rgb(hue, s, v);
+    [r, g, b, 1.0]
+}
+
+/// Generate a trail color (brighter version of tint).
+fn fleet_trail_color(i: usize) -> [f32; 4] {
+    let hue = (i as f32 * 137.508) % 360.0;
+    let s = 0.5_f32;
+    let v = 1.0_f32;
+    let (r, g, b) = hsv_to_rgb(hue, s, v);
+    [r, g, b, 1.0]
+}
+
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
+    let c = v * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = v - c;
+    let (r, g, b) = if h < 60.0 { (c, x, 0.0) }
+        else if h < 120.0 { (x, c, 0.0) }
+        else if h < 180.0 { (0.0, c, x) }
+        else if h < 240.0 { (0.0, x, c) }
+        else if h < 300.0 { (x, 0.0, c) }
+        else { (c, 0.0, x) };
+    (r + m, g + m, b + m)
+}
+
+/// Per-drone instance state.
+struct DroneInstance {
+    flight: FlightState,
+    guidance: Guidance,
+    drone_material: Option<MaterialBind>,
+    prop_material: Option<MaterialBind>,
+    drone_outline_material: Option<MaterialBind>,
+    trail_points: Vec<(Vec3, [f32; 4])>,
+    trail_distance_accum: f64,
+    minimap_trail: Vec<[f64; 2]>,
+    trail_color: [f32; 4],
+    drone_tint: [f32; 4],
+    launch_pos: [f64; 2],
+}
+
+/// Fleet planning state.
+struct FleetPlanState {
+    active: bool,
+    launch_positions: Vec<[f64; 2]>,
+    /// Map center in DH coords for pan/zoom.
+    map_center: [f64; 2],
+    /// Half-range in meters (zoom level).
+    map_half_range: f64,
+}
+
+/// Compute the drone model matrix from flight state.
+fn drone_model_matrix_for(flight: &FlightState) -> Mat4 {
+    let pos = to_render(&flight.position);
+    let heading = flight.heading as f32;
+    let pitch = flight.pitch as f32;
+    let bank = flight.bank as f32;
+    let swap = coord_swap_matrix();
+    let rot_heading = Mat4::from_rotation_z(heading);
+    let rot_pitch = Mat4::from_rotation_y(-pitch);
+    let rot_bank = Mat4::from_rotation_x(bank);
+    let dh_rotation = rot_heading * rot_pitch * rot_bank;
+    let render_rotation = swap * dh_rotation;
+    let rot_quat = Quat::from_mat4(&render_rotation);
+    Mat4::from_scale_rotation_translation(Vec3::ONE, rot_quat, pos)
+}
+
+/// Compute the prop model matrix from flight state and drone model matrix.
+fn prop_model_matrix_for(flight: &FlightState, drone_mat: &Mat4) -> Mat4 {
+    let prop_offset = Mat4::from_translation(Vec3::new(-1.75, 0.0, 0.0));
+    let prop_spin = Mat4::from_rotation_x(flight.prop_angle as f32);
+    *drone_mat * prop_offset * prop_spin
+}
+
 /// Application state.
 struct App {
     window: Option<Arc<Window>>,
@@ -123,9 +205,10 @@ struct App {
     camera: OrbitCamera,
     camera_mode: CameraMode,
     chase_cam_pos: Vec3,
-    // Flight state
-    flight: FlightState,
-    guidance: Guidance,
+    // Fleet
+    drones: Vec<DroneInstance>,
+    primary_drone: usize,
+    fleet_plan: FleetPlanState,
     // Timing
     last_frame: Instant,
     accumulator: f64,
@@ -161,11 +244,9 @@ struct App {
     flag_material: Option<MaterialBind>,
     ref_building_meshes: Vec<GpuMesh>,
     ref_building_materials: Vec<MaterialBind>,
-    // GPU meshes — drone
+    // GPU meshes — drone (shared geometry, per-drone materials in DroneInstance)
     drone_mesh: Option<GpuMesh>,
-    drone_material: Option<MaterialBind>,
     prop_mesh: Option<GpuMesh>,
-    prop_material: Option<MaterialBind>,
     // Target bullseye
     target_outer_mesh: Option<GpuMesh>,
     target_outer_material: Option<MaterialBind>,
@@ -176,8 +257,6 @@ struct App {
     rock_material: Option<MaterialBind>,
     // Horizon dust
     horizon_dust: f32,
-    // Drone outline (ground mode visibility)
-    drone_outline_material: Option<MaterialBind>,
     // Ground camera
     ground_cam_pos: Vec3,
     ground_cam_yaw: f32,
@@ -185,8 +264,6 @@ struct App {
     ground_cam_fov: f32,
     // Trail
     trail_pipeline: Option<LinePipeline>,
-    trail_points: Vec<(Vec3, [f32; 4])>,
-    trail_distance_accum: f64,
     // Audio — persistent voices wrapped in SharedVoice for per-frame updates
     audio_engine: AudioEngine,
     audio_started: bool,
@@ -199,8 +276,17 @@ struct App {
     // Audio controls
     master_volume: f32,
     engine_muted: bool,
-    // Minimap trail (DH x,y coords)
-    minimap_trail: Vec<[f64; 2]>,
+    // Thermal IR + YOLO
+    thermal_mode: bool,
+    yolo_tracking: bool,
+    pending_fleet_launch: bool,
+    // Fullscreen map
+    fullscreen_map: bool,
+    map_center: [f64; 2],
+    map_half_range: f64,
+    // Display toggles
+    show_trails: bool,
+    show_drone_outlines: bool,
     // Post-processing
     post_sampler: Option<wgpu::Sampler>,
     depth_sampler: Option<wgpu::Sampler>,
@@ -234,8 +320,21 @@ impl App {
             camera,
             camera_mode: CameraMode::Orbit,
             chase_cam_pos: Vec3::new(-20.0, 10.0, 0.0),
-            flight: FlightState::new(),
-            guidance: Guidance::new(),
+            drones: vec![DroneInstance {
+                flight: FlightState::new(),
+                guidance: Guidance::new(),
+                drone_material: None,
+                prop_material: None,
+                drone_outline_material: None,
+                trail_points: Vec::new(),
+                trail_distance_accum: 0.0,
+                minimap_trail: Vec::new(),
+                trail_color: fleet_trail_color(0),
+                drone_tint: drone::DRONE_COLOR,
+                launch_pos: [0.0, 0.0],
+            }],
+            primary_drone: 0,
+            fleet_plan: FleetPlanState { active: false, launch_positions: Vec::new(), map_center: [25_000.0, 0.0], map_half_range: 28_000.0 },
             last_frame: Instant::now(),
             accumulator: 0.0,
             frame_count: 0,
@@ -265,10 +364,7 @@ impl App {
             ref_building_meshes: Vec::new(),
             ref_building_materials: Vec::new(),
             drone_mesh: None,
-            drone_material: None,
-            drone_outline_material: None,
             prop_mesh: None,
-            prop_material: None,
             ground_cam_pos: Vec3::new(0.0, 0.0, 0.0),
             ground_cam_yaw: 0.0,
             ground_cam_pitch: 0.2,
@@ -281,8 +377,6 @@ impl App {
             rock_material: None,
             horizon_dust: 0.5,
             trail_pipeline: None,
-            trail_points: Vec::new(),
-            trail_distance_accum: 0.0,
             audio_engine: AudioEngine::new(),
             audio_started: false,
             engine_voice: None,
@@ -292,7 +386,14 @@ impl App {
             wind_direction: 0.0,
             master_volume: 0.5,
             engine_muted: false,
-            minimap_trail: Vec::new(),
+            thermal_mode: false,
+            yolo_tracking: false,
+            pending_fleet_launch: false,
+            fullscreen_map: false,
+            map_center: [25_000.0, 0.0],
+            map_half_range: 28_000.0,
+            show_trails: true,
+            show_drone_outlines: true,
             post_sampler: None,
             depth_sampler: None,
             ssao_bind_group: None,
@@ -303,24 +404,34 @@ impl App {
 
     /// Reset everything for a new mission.
     fn reset(&mut self) {
-        self.flight = FlightState::new();
-        self.guidance = Guidance::new();
+        // Keep materials from existing drones, just reset state
+        for d in &mut self.drones {
+            d.flight = FlightState::new();
+            d.guidance = Guidance::new();
+            d.trail_points.clear();
+            d.trail_distance_accum = 0.0;
+            d.minimap_trail.clear();
+        }
+        // Trim to single default drone
+        self.drones.truncate(1);
+        if let Some(d) = self.drones.first_mut() {
+            d.drone_tint = drone::DRONE_COLOR;
+            d.trail_color = fleet_trail_color(0);
+            d.launch_pos = [0.0, 0.0];
+        }
+        self.primary_drone = 0;
+        self.fleet_plan = FleetPlanState { active: false, launch_positions: Vec::new(), map_center: [25_000.0, 0.0], map_half_range: 28_000.0 };
         self.sim_time = 0.0;
         self.accumulator = 0.0;
-        self.trail_points.clear();
-        self.trail_distance_accum = 0.0;
         self.time_scale = 1.0;
         self.paused = false;
-        // Clear audio voices and drop refs so they can be recreated on next launch
         self.audio_engine.clear_voices();
         self.audio_started = false;
         self.engine_voice = None;
         self.wind_voice = None;
         self.last_terrain_snap = (i32::MAX, i32::MAX);
         self.terrain_regen_queue.clear();
-        self.minimap_trail.clear();
         self.horizon_dust = 0.5;
-        // Reset camera to launch view
         self.camera.target = Vec3::new(0.0, 2.0, 0.0);
         self.camera.distance = 25.0;
         self.camera.yaw = -0.3;
@@ -334,7 +445,8 @@ impl App {
 
     /// Update camera based on current mode and drone position.
     fn update_camera(&mut self) {
-        let drone_render = to_render(&self.flight.position);
+        let pi = self.primary_drone.min(self.drones.len().saturating_sub(1));
+        let drone_render = to_render(&self.drones[pi].flight.position);
 
         // Restore default FOV when not in ground mode
         if self.camera_mode != CameraMode::Ground {
@@ -346,7 +458,7 @@ impl App {
                 self.camera.target = drone_render;
             }
             CameraMode::Chase => {
-                let fwd = self.flight.forward_dir();
+                let fwd = self.drones[pi].flight.forward_dir();
                 let fwd_render = Vec3::new(fwd.x as f32, fwd.z as f32, -fwd.y as f32);
                 let ideal_pos = drone_render - fwd_render * 30.0 + Vec3::Y * 10.0;
                 let lerp = 0.03_f32;
@@ -360,7 +472,7 @@ impl App {
                 }
             }
             CameraMode::Side => {
-                let fwd = self.flight.forward_dir();
+                let fwd = self.drones[pi].flight.forward_dir();
                 let fwd_render = Vec3::new(fwd.x as f32, fwd.z as f32, -fwd.y as f32);
                 let side = Vec3::new(-fwd_render.z, 0.0, fwd_render.x).normalize_or_zero();
                 let ideal_pos = drone_render + side * 50.0 + Vec3::Y * 15.0;
@@ -393,30 +505,6 @@ impl App {
                 self.camera.pitch = (diff.y / self.camera.distance).asin();
             }
         }
-    }
-
-    /// Compute the drone model matrix.
-    fn drone_model_matrix(&self) -> Mat4 {
-        let pos = to_render(&self.flight.position);
-        let heading = self.flight.heading as f32;
-        let pitch = self.flight.pitch as f32;
-        let bank = self.flight.bank as f32;
-        let swap = coord_swap_matrix();
-        let rot_heading = Mat4::from_rotation_z(heading);
-        let rot_pitch = Mat4::from_rotation_y(-pitch);
-        let rot_bank = Mat4::from_rotation_x(bank);
-        let dh_rotation = rot_heading * rot_pitch * rot_bank;
-        let render_rotation = swap * dh_rotation;
-        let rot_quat = Quat::from_mat4(&render_rotation);
-        Mat4::from_scale_rotation_translation(Vec3::ONE, rot_quat, pos)
-    }
-
-    /// Compute the prop model matrix.
-    fn prop_model_matrix(&self) -> Mat4 {
-        let drone_mat = self.drone_model_matrix();
-        let prop_offset = Mat4::from_translation(Vec3::new(-1.75, 0.0, 0.0));
-        let prop_spin = Mat4::from_rotation_x(self.flight.prop_angle as f32);
-        drone_mat * prop_offset * prop_spin
     }
 
     fn render(&mut self) {
@@ -477,8 +565,8 @@ impl App {
         let rail_rot = Quat::from_rotation_z(10.0_f32.to_radians());
         let rail_model = Mat4::from_rotation_translation(rail_rot, rail_render);
 
-        // Flagpole: stands vertical beside the rail, DH (0.0, 2.0, 3.0) → base at 3m height
-        let flag_dh = Vec3::new(0.0, 2.0, 3.0);
+        // Flagpole: stands vertical beside the rail, base sunk below ground
+        let flag_dh = Vec3::new(0.0, 2.0, -0.8);
         let flag_render = swap.transform_point3(flag_dh);
         let flag_model = Mat4::from_translation(flag_render);
 
@@ -489,9 +577,16 @@ impl App {
             Mat4::from_translation(swap.transform_point3(dh))
         }).collect();
 
-        // Drone
-        let drone_model = self.drone_model_matrix();
-        let prop_model = self.prop_model_matrix();
+        // Compute per-drone model matrices
+        let pi = self.primary_drone.min(self.drones.len().saturating_sub(1));
+        let mut drone_models: Vec<Mat4> = Vec::with_capacity(self.drones.len());
+        let mut prop_models: Vec<Mat4> = Vec::with_capacity(self.drones.len());
+        for d in &self.drones {
+            let dm = drone_model_matrix_for(&d.flight);
+            let pm = prop_model_matrix_for(&d.flight, &dm);
+            drone_models.push(dm);
+            prop_models.push(pm);
+        }
 
         // Upload non-tile materials
         if let Some(m) = &self.building_material {
@@ -519,26 +614,31 @@ impl App {
                 ctx.queue.write_buffer(&m.buffer, 0, bytemuck::bytes_of(&mat));
             }
         }
-        if let Some(m) = &self.drone_material {
-            let mut mat = MaterialUniform::metal(drone::DRONE_COLOR)
-                .with_model(drone_model.to_cols_array_2d());
-            mat.params = [0.6, 0.2, 0.0, 0.0];
-            ctx.queue.write_buffer(&m.buffer, 0, bytemuck::bytes_of(&mat));
-        }
-        // Drone outline (scaled up, bright red) for ground mode visibility
-        if self.camera_mode == CameraMode::Ground {
-            if let Some(m) = &self.drone_outline_material {
-                let outline_model = drone_model * Mat4::from_scale(Vec3::splat(1.08));
-                let mut mat = MaterialUniform::metal([1.0, 0.1, 0.1, 1.0])
-                    .with_model(outline_model.to_cols_array_2d());
-                mat.params = [1.0, 0.0, 0.0, 0.0]; // full rough, no metallic
+        // Upload per-drone materials
+        let thermal_emission = if self.thermal_mode { 1.0_f32 } else { 0.0 };
+        let prop_thermal = if self.thermal_mode { 1.5_f32 } else { 0.0 };
+        for (i, d) in self.drones.iter().enumerate() {
+            if let Some(m) = &d.drone_material {
+                let mut mat = MaterialUniform::metal(d.drone_tint)
+                    .with_model(drone_models[i].to_cols_array_2d());
+                mat.params = [0.6, 0.2, thermal_emission, 0.0];
                 ctx.queue.write_buffer(&m.buffer, 0, bytemuck::bytes_of(&mat));
             }
-        }
-        if let Some(m) = &self.prop_material {
-            let mat = MaterialUniform::metal(drone::PROP_COLOR)
-                .with_model(prop_model.to_cols_array_2d());
-            ctx.queue.write_buffer(&m.buffer, 0, bytemuck::bytes_of(&mat));
+            if self.camera_mode == CameraMode::Ground {
+                if let Some(m) = &d.drone_outline_material {
+                    let outline_model = drone_models[i] * Mat4::from_scale(Vec3::splat(1.08));
+                    let mut mat = MaterialUniform::metal([1.0, 0.1, 0.1, 1.0])
+                        .with_model(outline_model.to_cols_array_2d());
+                    mat.params = [1.0, 0.0, 0.0, 0.0];
+                    ctx.queue.write_buffer(&m.buffer, 0, bytemuck::bytes_of(&mat));
+                }
+            }
+            if let Some(m) = &d.prop_material {
+                let mut mat = MaterialUniform::metal(drone::PROP_COLOR)
+                    .with_model(prop_models[i].to_cols_array_2d());
+                mat.params = [0.6, 0.2, prop_thermal, 0.0];
+                ctx.queue.write_buffer(&m.buffer, 0, bytemuck::bytes_of(&mat));
+            }
         }
         if let Some(m) = &self.target_outer_material {
             let mut mat = MaterialUniform::metal(terrain::TARGET_RED)
@@ -560,12 +660,21 @@ impl App {
             ctx.queue.write_buffer(&m.buffer, 0, bytemuck::bytes_of(&mat));
         }
 
-        // --- Shadow setup (centered on drone, radius scales with camera distance) ---
-        let drone_render = to_render(&self.flight.position);
-        let cam_dist = (self.camera.eye() - drone_render).length();
+        // Composite params (thermal mode)
+        if let Some(composite) = &self.composite_pipeline {
+            let cp = CompositeParams {
+                thermal_mode: if self.thermal_mode { 1.0 } else { 0.0 },
+                ..CompositeParams::default()
+            };
+            composite.update_params(&ctx.queue, &cp);
+        }
+
+        // --- Shadow setup (centered on primary drone, radius scales with camera distance) ---
+        let primary_render = to_render(&self.drones[pi].flight.position);
+        let cam_dist = (self.camera.eye() - primary_render).length();
         let scene_radius = cam_dist.clamp(60.0, 800.0);
-        let light_pos = drone_render - light_dir * scene_radius * 2.0;
-        let shadow_view = Mat4::look_at_rh(light_pos, drone_render, Vec3::Y);
+        let light_pos = primary_render - light_dir * scene_radius * 2.0;
+        let shadow_view = Mat4::look_at_rh(light_pos, primary_render, Vec3::Y);
         let shadow_proj = Mat4::orthographic_rh(
             -scene_radius, scene_radius, -scene_radius, scene_radius,
             0.1, scene_radius * 4.0,
@@ -573,9 +682,9 @@ impl App {
         let light_vp = shadow_proj * shadow_view;
         pbr.update_shadow_light_vp(&ctx.queue, &light_vp);
 
-        // Shadow matrices: terrain (identity), buildings, drone
-        let mut shadow_matrices: Vec<Mat4> = Vec::with_capacity(16);
-        shadow_matrices.push(light_vp * Mat4::IDENTITY); // terrain is in world space
+        // Shadow matrices: terrain (identity), buildings, all drones
+        let mut shadow_matrices: Vec<Mat4> = Vec::with_capacity(32);
+        shadow_matrices.push(light_vp * Mat4::IDENTITY); // terrain
         shadow_matrices.push(light_vp * building_model);
         shadow_matrices.push(light_vp * rail_model);
         shadow_matrices.push(light_vp * flag_model);
@@ -586,9 +695,21 @@ impl App {
         }
         shadow_matrices.push(light_vp * target_model); // outer ring
         shadow_matrices.push(light_vp * target_model); // inner disc
-        shadow_matrices.push(light_vp * Mat4::IDENTITY); // rocks (world space)
-        shadow_matrices.push(light_vp * drone_model);
-        shadow_matrices.push(light_vp * prop_model);
+        shadow_matrices.push(light_vp * Mat4::IDENTITY); // rocks
+        // Shadow only nearest drones (limited by MAX_SHADOW_OBJECTS=32)
+        let max_shadow_drones = ((32 - shadow_matrices.len()) / 2).min(self.drones.len());
+        // Sort drone indices by distance to camera for shadow priority
+        let mut drone_shadow_order: Vec<usize> = (0..self.drones.len()).collect();
+        drone_shadow_order.sort_by(|&a, &b| {
+            let da = (to_render(&self.drones[a].flight.position) - primary_render).length();
+            let db = (to_render(&self.drones[b].flight.position) - primary_render).length();
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let shadow_drone_set: Vec<usize> = drone_shadow_order.into_iter().take(max_shadow_drones).collect();
+        for &i in &shadow_drone_set {
+            shadow_matrices.push(light_vp * drone_models[i]);
+            shadow_matrices.push(light_vp * prop_models[i]);
+        }
 
         if let Some(shadow) = &self.shadow_pipeline {
             shadow.upload_matrices(&ctx.queue, &shadow_matrices);
@@ -741,25 +862,26 @@ impl App {
             }
             si += 1;
 
-            // Drone
-            if let Some(mesh) = &self.drone_mesh {
-                if si < shadow_matrices.len() {
-                    pass.set_bind_group(0, &shadow.bind_group, &[ShadowPipeline::dynamic_offset(si)]);
-                    pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                    pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..mesh.num_indices, 0, 0..1);
+            // Shadowed drones + props (only nearest few)
+            for _di in 0..shadow_drone_set.len() {
+                if let Some(mesh) = &self.drone_mesh {
+                    if si < shadow_matrices.len() {
+                        pass.set_bind_group(0, &shadow.bind_group, &[ShadowPipeline::dynamic_offset(si)]);
+                        pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                        pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..mesh.num_indices, 0, 0..1);
+                    }
                 }
-            }
-            si += 1;
-
-            // Prop
-            if let Some(mesh) = &self.prop_mesh {
-                if si < shadow_matrices.len() {
-                    pass.set_bind_group(0, &shadow.bind_group, &[ShadowPipeline::dynamic_offset(si)]);
-                    pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                    pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..mesh.num_indices, 0, 0..1);
+                si += 1;
+                if let Some(mesh) = &self.prop_mesh {
+                    if si < shadow_matrices.len() {
+                        pass.set_bind_group(0, &shadow.bind_group, &[ShadowPipeline::dynamic_offset(si)]);
+                        pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                        pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..mesh.num_indices, 0, 0..1);
+                    }
                 }
+                si += 1;
             }
         }
 
@@ -827,13 +949,14 @@ impl App {
             // Rocks
             draw_mesh!(&self.rock_mesh, &self.rock_material);
 
-            // Drone outline (ground mode: scaled-up red halo drawn first)
-            if self.camera_mode == CameraMode::Ground {
-                draw_mesh!(&self.drone_mesh, &self.drone_outline_material);
+            // All drones
+            for d in &self.drones {
+                if self.camera_mode == CameraMode::Ground && self.show_drone_outlines {
+                    draw_mesh!(&self.drone_mesh, &d.drone_outline_material);
+                }
+                draw_mesh!(&self.drone_mesh, &d.drone_material);
+                draw_mesh!(&self.prop_mesh, &d.prop_material);
             }
-            // Drone
-            draw_mesh!(&self.drone_mesh, &self.drone_material);
-            draw_mesh!(&self.prop_mesh, &self.prop_material);
         }
 
         // Pass 4: SSAO
@@ -896,22 +1019,26 @@ impl App {
             pass.draw(0..3, 0..1);
         }
 
-        // Pass 6b: Trail lines
+        // Pass 6b: Trail lines (combined from all drones)
         if let Some(trail) = &mut self.trail_pipeline {
-            if self.trail_points.len() >= 2 {
-                let n = self.trail_points.len();
-                let mut verts = Vec::with_capacity(n * 2 + 2);
-                for i in 0..n - 1 {
-                    verts.push(LineVertex { position: self.trail_points[i].0.into(), color: self.trail_points[i].1 });
-                    verts.push(LineVertex { position: self.trail_points[i + 1].0.into(), color: self.trail_points[i + 1].1 });
+            let mut verts: Vec<LineVertex> = Vec::new();
+            if self.show_trails {
+                for d in &self.drones {
+                    let n = d.trail_points.len();
+                    if n >= 2 {
+                        for i in 0..n - 1 {
+                            verts.push(LineVertex { position: d.trail_points[i].0.into(), color: d.trail_points[i].1 });
+                            verts.push(LineVertex { position: d.trail_points[i + 1].0.into(), color: d.trail_points[i + 1].1 });
+                        }
+                        let drone_pos = to_render(&d.flight.position);
+                        if let Some(last) = d.trail_points.last() {
+                            verts.push(LineVertex { position: last.0.into(), color: last.1 });
+                            verts.push(LineVertex { position: drone_pos.into(), color: d.trail_color });
+                        }
+                    }
                 }
-                // Bridge gap: connect last trail point to current drone position
-                let drone_pos = to_render(&self.flight.position);
-                let current_color = self.guidance.phase.trail_color();
-                if let Some(last) = self.trail_points.last() {
-                    verts.push(LineVertex { position: last.0.into(), color: last.1 });
-                    verts.push(LineVertex { position: drone_pos.into(), color: current_color });
-                }
+            }
+            if !verts.is_empty() {
                 trail.upload(&ctx.queue, &verts);
             } else {
                 trail.num_vertices = 0;
@@ -949,31 +1076,85 @@ impl App {
         let mut new_master_vol = self.master_volume;
         let mut new_engine_muted = self.engine_muted;
         let mut cam_mode = self.camera_mode;
+        let mut thermal = self.thermal_mode;
+        let mut yolo = self.yolo_tracking;
+        let mut trails = self.show_trails;
+        let mut outlines = self.show_drone_outlines;
+        let primary_flight = &self.drones[pi].flight;
+        let primary_guidance = &self.drones[pi].guidance;
         draw_mission_control(
-            &self.egui_ctx, &self.flight, &self.guidance,
+            &self.egui_ctx, primary_flight, primary_guidance,
             self.time_scale, self.fps, &mut cam_mode,
             &mut new_exposure, &mut new_horizon_dust, &self.wind,
             &mut new_wind_speed, &mut new_wind_dir,
             &mut new_master_vol, &mut new_engine_muted,
+            &mut thermal, &mut yolo, &mut trails, &mut outlines,
+            self.drones.len(), pi,
         );
         self.camera_mode = cam_mode;
+        self.thermal_mode = thermal;
+        self.yolo_tracking = yolo;
+        self.show_trails = trails;
+        self.show_drone_outlines = outlines;
         let minimap_click = draw_minimap(
-            &self.egui_ctx, &self.flight, &self.guidance, &self.minimap_trail,
+            &self.egui_ctx, &self.drones,
             &self.wind, self.camera_mode, &self.ground_cam_pos, self.ground_cam_yaw,
+            pi,
         );
         if let Some([dh_x, dh_y]) = minimap_click {
-            // Convert DH coords to render coords and place ground camera
             self.ground_cam_pos = Vec3::new(dh_x as f32, 0.0, -(dh_y as f32));
             self.ground_cam_yaw = 0.0;
             self.ground_cam_pitch = 0.2;
             self.camera_mode = CameraMode::Ground;
         }
+
+        // Fullscreen map overlay (M key)
+        if self.fullscreen_map {
+            let fs_click = draw_fullscreen_map(
+                &self.egui_ctx, &self.drones,
+                &self.wind, self.camera_mode, &self.ground_cam_pos, self.ground_cam_yaw,
+                pi, &mut self.map_center, &mut self.map_half_range,
+                self.show_trails,
+            );
+            if let Some([dh_x, dh_y]) = fs_click {
+                self.ground_cam_pos = Vec3::new(dh_x as f32, 0.0, -(dh_y as f32));
+                self.ground_cam_yaw = 0.0;
+                self.ground_cam_pitch = 0.2;
+                self.camera_mode = CameraMode::Ground;
+            }
+        }
+
         self.sky_exposure = new_exposure;
         self.horizon_dust = new_horizon_dust;
         self.wind_speed = new_wind_speed;
         self.wind_direction = new_wind_dir;
         self.master_volume = new_master_vol;
         self.engine_muted = new_engine_muted;
+
+        // Fleet planner window
+        let mut fleet_launch_clicked = false;
+        if self.drones[pi].guidance.phase == FlightPhase::PreLaunch {
+            draw_fleet_planner(&self.egui_ctx, &mut self.fleet_plan, &mut fleet_launch_clicked);
+        }
+        if fleet_launch_clicked {
+            self.pending_fleet_launch = true;
+        }
+
+        // YOLO bounding box overlay (Ground mode only)
+        if self.yolo_tracking && self.camera_mode == CameraMode::Ground {
+            let view_mat = self.camera.view_matrix();
+            let proj_mat = self.camera.projection_matrix(ctx.aspect());
+            let vp = proj_mat * view_mat;
+            let screen_w = ctx.config.width as f32;
+            let screen_h = ctx.config.height as f32;
+            draw_yolo_overlay(&self.egui_ctx, &self.drones, &vp, screen_w, screen_h, self.camera.fov, pi);
+        }
+
+        // Thermal HUD overlay
+        if self.thermal_mode && self.camera_mode == CameraMode::Ground {
+            draw_thermal_hud(&self.egui_ctx, ctx.config.width as f32, ctx.config.height as f32);
+        }
+
         let egui_output = self.egui_ctx.end_pass();
         let egui_prims = self.egui_ctx.tessellate(egui_output.shapes, egui_output.pixels_per_point);
         let screen = egui_wgpu::ScreenDescriptor {
@@ -1015,6 +1196,7 @@ impl App {
 
 // ── Mission Control ──────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn draw_mission_control(
     ctx: &egui::Context,
     flight: &FlightState,
@@ -1029,6 +1211,12 @@ fn draw_mission_control(
     wind_direction: &mut f64,
     master_volume: &mut f32,
     engine_muted: &mut bool,
+    thermal_mode: &mut bool,
+    yolo_tracking: &mut bool,
+    show_trails: &mut bool,
+    show_drone_outlines: &mut bool,
+    fleet_size: usize,
+    primary_idx: usize,
 ) {
     egui::Window::new("Mission Control")
         .default_pos(egui::pos2(10.0, 10.0))
@@ -1096,6 +1284,24 @@ fn draw_mission_control(
             ui.add(egui::Slider::new(master_volume, 0.0..=1.0).text(""));
 
             ui.checkbox(engine_muted, "Mute Engine");
+
+            ui.separator();
+            ui.checkbox(show_trails, "Contrails");
+            ui.checkbox(show_drone_outlines, "Drone Outlines");
+
+            // Fleet info
+            if fleet_size > 1 {
+                ui.separator();
+                ui.label(egui::RichText::new(format!("Fleet: {}/{} | Primary: #{}", fleet_size, MAX_FLEET_SIZE, primary_idx + 1)).size(13.0).color(egui::Color32::from_rgb(200, 200, 100)));
+                ui.label(egui::RichText::new("Tab: cycle drone").size(11.0).color(egui::Color32::LIGHT_GRAY));
+            }
+
+            // Ground mode sensors
+            if *camera_mode == CameraMode::Ground {
+                ui.separator();
+                ui.checkbox(thermal_mode, "Thermal IR");
+                ui.checkbox(yolo_tracking, "YOLO Tracking");
+            }
         });
 
     // Instructions at bottom (PreLaunch/Impact only)
@@ -1108,7 +1314,7 @@ fn draw_mission_control(
                 } else {
                     ui.label(egui::RichText::new("IMPACT - Mission Complete").size(20.0).color(egui::Color32::RED).strong());
                 }
-                ui.label(egui::RichText::new("R: Reset | 1-5: Time | C: Camera | P: Pause | Click map: Ground cam | B: Back").size(14.0).color(egui::Color32::LIGHT_GRAY));
+                ui.label(egui::RichText::new("R: Reset | 1-5: Time | C: Camera | P: Pause | Tab: Cycle | M: Map | Click map: Ground cam").size(14.0).color(egui::Color32::LIGHT_GRAY));
             });
     }
 }
@@ -1117,14 +1323,15 @@ fn draw_mission_control(
 
 fn draw_minimap(
     ctx: &egui::Context,
-    flight: &FlightState,
-    guidance: &Guidance,
-    minimap_trail: &[[f64; 2]],
+    drones: &[DroneInstance],
     wind: &nalgebra::Vector3<f64>,
     camera_mode: CameraMode,
     ground_cam_pos: &Vec3,
     ground_cam_yaw: f32,
+    primary_idx: usize,
 ) -> Option<[f64; 2]> {
+    let flight = &drones[primary_idx].flight;
+    let guidance = &drones[primary_idx].guidance;
     let mut clicked_pos: Option<[f64; 2]> = None;
     egui::Window::new("Map")
         .default_pos(egui::pos2(ctx.screen_rect().width() - 320.0, 10.0))
@@ -1171,13 +1378,19 @@ fn draw_minimap(
                 painter.line_segment([p0, p1], egui::Stroke::new(1.0, grid_color));
             }
 
-            // Flight trail (green polyline)
-            if minimap_trail.len() >= 2 {
-                let trail_color = egui::Color32::from_rgb(40, 180, 40);
-                for i in 0..minimap_trail.len() - 1 {
-                    let p0 = to_screen(minimap_trail[i][0], minimap_trail[i][1]);
-                    let p1 = to_screen(minimap_trail[i + 1][0], minimap_trail[i + 1][1]);
-                    painter.line_segment([p0, p1], egui::Stroke::new(1.5, trail_color));
+            // Flight trails (per-drone color)
+            for d in drones {
+                let tc = d.trail_color;
+                let trail_color = egui::Color32::from_rgb(
+                    (tc[0] * 255.0) as u8, (tc[1] * 255.0) as u8, (tc[2] * 255.0) as u8,
+                );
+                let mt = &d.minimap_trail;
+                if mt.len() >= 2 {
+                    for i in 0..mt.len() - 1 {
+                        let p0 = to_screen(mt[i][0], mt[i][1]);
+                        let p1 = to_screen(mt[i + 1][0], mt[i + 1][1]);
+                        painter.line_segment([p0, p1], egui::Stroke::new(1.5, trail_color));
+                    }
                 }
             }
 
@@ -1228,30 +1441,41 @@ fn draw_minimap(
                 );
             }
 
-            // Drone icon (green filled triangle pointing in heading direction)
-            let drone_pos = to_screen(flight.position.x, flight.position.y);
-            let heading = flight.heading as f32;
-            // DH heading: 0 = +X (east on map = right), heading rotates CCW
-            // Screen: +X = right, +Y = down. Map: DH +X = right, DH +Y = up (flipped)
-            let tri_size = 7.0_f32;
-            let tri_color = egui::Color32::from_rgb(40, 220, 40);
-            // Forward is toward heading, which in screen coords: dx=cos(h), dy=-sin(h)
-            let fwd_x = heading.cos();
-            let fwd_y = -heading.sin();
-            let tip = egui::pos2(drone_pos.x + fwd_x * tri_size, drone_pos.y + fwd_y * tri_size);
-            let left = egui::pos2(
-                drone_pos.x + (-fwd_x * 0.5 + fwd_y * 0.5) * tri_size,
-                drone_pos.y + (-fwd_y * 0.5 - fwd_x * 0.5) * tri_size,
-            );
-            let right = egui::pos2(
-                drone_pos.x + (-fwd_x * 0.5 - fwd_y * 0.5) * tri_size,
-                drone_pos.y + (-fwd_y * 0.5 + fwd_x * 0.5) * tri_size,
-            );
-            painter.add(egui::Shape::convex_polygon(
-                vec![tip, left, right],
-                tri_color,
-                egui::Stroke::NONE,
-            ));
+            // Drone icons (all drones, primary is larger)
+            for (di, d) in drones.iter().enumerate() {
+                let dp = to_screen(d.flight.position.x, d.flight.position.y);
+                let h = d.flight.heading as f32;
+                let is_primary = di == primary_idx;
+                let tri_size = if is_primary { 8.0_f32 } else { 5.0_f32 };
+                let tc = d.trail_color;
+                let tri_color = egui::Color32::from_rgb(
+                    (tc[0] * 255.0) as u8, (tc[1] * 255.0) as u8, (tc[2] * 255.0) as u8,
+                );
+                let fwd_x = h.cos();
+                let fwd_y = -h.sin();
+                let tip = egui::pos2(dp.x + fwd_x * tri_size, dp.y + fwd_y * tri_size);
+                let left = egui::pos2(
+                    dp.x + (-fwd_x * 0.5 + fwd_y * 0.5) * tri_size,
+                    dp.y + (-fwd_y * 0.5 - fwd_x * 0.5) * tri_size,
+                );
+                let right = egui::pos2(
+                    dp.x + (-fwd_x * 0.5 - fwd_y * 0.5) * tri_size,
+                    dp.y + (-fwd_y * 0.5 + fwd_x * 0.5) * tri_size,
+                );
+                painter.add(egui::Shape::convex_polygon(
+                    vec![tip, left, right],
+                    tri_color,
+                    egui::Stroke::NONE,
+                ));
+                // Number label
+                painter.text(
+                    egui::pos2(dp.x + 10.0, dp.y),
+                    egui::Align2::LEFT_CENTER,
+                    format!("#{}", di + 1),
+                    egui::FontId::proportional(if is_primary { 11.0 } else { 9.0 }),
+                    tri_color,
+                );
+            }
 
             // Distance readout at bottom
             let dist_to_target = guidance.distance_to_target(&flight.position);
@@ -1381,6 +1605,534 @@ fn draw_minimap(
     clicked_pos
 }
 
+// ── YOLO Bounding Box Overlay ────────────────────────────────────────────────
+
+fn draw_yolo_overlay(
+    ctx: &egui::Context,
+    drones: &[DroneInstance],
+    view_proj: &Mat4,
+    screen_w: f32,
+    screen_h: f32,
+    fov: f32,
+    primary_idx: usize,
+) {
+    egui::Area::new(egui::Id::new("yolo_overlay"))
+        .fixed_pos(egui::pos2(0.0, 0.0))
+        .interactable(false)
+        .show(ctx, |ui| {
+            let painter = ui.painter();
+            for (di, d) in drones.iter().enumerate() {
+                let world_pos = to_render(&d.flight.position);
+                let clip = *view_proj * Vec4::new(world_pos.x, world_pos.y, world_pos.z, 1.0);
+                if clip.w <= 0.0 { continue; }
+                let ndc_x = clip.x / clip.w;
+                let ndc_y = clip.y / clip.w;
+                if ndc_x < -1.0 || ndc_x > 1.0 || ndc_y < -1.0 || ndc_y > 1.0 { continue; }
+                let sx = (ndc_x + 1.0) * 0.5 * screen_w;
+                let sy = (1.0 - ndc_y) * 0.5 * screen_h; // flip Y
+                let distance = clip.w;
+                let box_px = (3.5 / distance) * (screen_h / (2.0 * (fov / 2.0).tan()));
+                let box_px = box_px.clamp(20.0, 400.0);
+                let half = box_px * 0.5;
+                let r = egui::Rect::from_center_size(
+                    egui::pos2(sx, sy),
+                    egui::vec2(box_px, box_px),
+                );
+                let color = egui::Color32::from_rgb(0, 255, 0);
+                painter.rect_stroke(r, 0.0, egui::Stroke::new(2.0, color), egui::StrokeKind::Outside);
+                let label = if di == primary_idx { format!("UAV-{} 87%", di + 1) } else { format!("UAV-{} 84%", di + 1) };
+                painter.text(
+                    egui::pos2(sx - half, sy - half - 16.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    label,
+                    egui::FontId::monospace(13.0),
+                    color,
+                );
+            }
+        });
+}
+
+// ── Thermal IR HUD ──────────────────────────────────────────────────────────
+
+fn draw_thermal_hud(ctx: &egui::Context, screen_w: f32, screen_h: f32) {
+    // FLIR watermark top-left
+    egui::Area::new(egui::Id::new("flir_label"))
+        .fixed_pos(egui::pos2(10.0, screen_h - 40.0))
+        .interactable(false)
+        .show(ctx, |ui| {
+            ui.label(egui::RichText::new("FLIR").size(20.0).color(egui::Color32::from_rgba_unmultiplied(200, 200, 200, 180)).strong());
+        });
+
+    // Vertical color scale bar (right side)
+    egui::Area::new(egui::Id::new("thermal_scale"))
+        .fixed_pos(egui::pos2(screen_w - 40.0, screen_h * 0.3))
+        .interactable(false)
+        .show(ctx, |ui| {
+            let bar_h = screen_h * 0.4;
+            let bar_w = 15.0_f32;
+            let (response, painter) = ui.allocate_painter(egui::vec2(bar_w + 30.0, bar_h + 20.0), egui::Sense::hover());
+            let rect = response.rect;
+            let steps = 32;
+            let step_h = bar_h / steps as f32;
+            for i in 0..steps {
+                let t = 1.0 - i as f32 / steps as f32;
+                let (r, g, b) = thermal_ramp_cpu(t);
+                let color = egui::Color32::from_rgb(r, g, b);
+                let y = rect.min.y + i as f32 * step_h;
+                painter.rect_filled(
+                    egui::Rect::from_min_size(egui::pos2(rect.min.x, y), egui::vec2(bar_w, step_h + 1.0)),
+                    0.0,
+                    color,
+                );
+            }
+            // Labels
+            painter.text(egui::pos2(rect.min.x + bar_w + 3.0, rect.min.y), egui::Align2::LEFT_TOP, "HOT", egui::FontId::proportional(10.0), egui::Color32::WHITE);
+            painter.text(egui::pos2(rect.min.x + bar_w + 3.0, rect.min.y + bar_h), egui::Align2::LEFT_BOTTOM, "COLD", egui::FontId::proportional(10.0), egui::Color32::WHITE);
+        });
+}
+
+/// CPU-side thermal ramp matching the WGSL shader.
+fn thermal_ramp_cpu(t: f32) -> (u8, u8, u8) {
+    let tc = t.clamp(0.0, 1.0);
+    let (r, g, b) = if tc < 0.2 {
+        let f = tc / 0.2;
+        (0.0, 0.0, 0.8 * f)
+    } else if tc < 0.4 {
+        let f = (tc - 0.2) / 0.2;
+        (0.6 * f, 0.0, 0.8)
+    } else if tc < 0.6 {
+        let f = (tc - 0.4) / 0.2;
+        (0.6 + 0.4 * f, 0.0 * (1.0 - f), 0.8 * (1.0 - f))
+    } else if tc < 0.8 {
+        let f = (tc - 0.6) / 0.2;
+        (1.0, f, 0.0)
+    } else {
+        let f = (tc - 0.8) / 0.2;
+        (1.0, 1.0, f)
+    };
+    ((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
+}
+
+// ── Fleet Planner ───────────────────────────────────────────────────────────
+
+fn draw_fleet_planner(ctx: &egui::Context, plan: &mut FleetPlanState, launch_all: &mut bool) {
+    if !plan.active {
+        // Show "Fleet Plan" button in corner
+        egui::Area::new(egui::Id::new("fleet_btn"))
+            .fixed_pos(egui::pos2(10.0, ctx.screen_rect().height() - 140.0))
+            .show(ctx, |ui| {
+                if ui.button(egui::RichText::new("Fleet Plan").size(16.0).color(egui::Color32::from_rgb(100, 200, 255))).clicked() {
+                    plan.active = true;
+                }
+            });
+        return;
+    }
+
+    egui::Window::new("Fleet Planner")
+        .default_pos(egui::pos2(300.0, 100.0))
+        .default_width(600.0)
+        .resizable(false)
+        .show(ctx, |ui| {
+            let range_km = plan.map_half_range / 1000.0;
+            ui.label(egui::RichText::new(format!(
+                "Click to place drones ({}/{}) | Scroll to zoom, right-drag to pan | View: {:.1} km",
+                plan.launch_positions.len(), MAX_FLEET_SIZE, range_km * 2.0
+            )).size(13.0).color(egui::Color32::WHITE));
+
+            let map_size = egui::vec2(560.0, 560.0);
+            let (response, painter) = ui.allocate_painter(
+                map_size,
+                egui::Sense::click_and_drag(),
+            );
+            let rect = response.rect;
+            let center = rect.center();
+
+            let map_cx = plan.map_center[0];
+            let map_cy = plan.map_center[1];
+            let half_range = plan.map_half_range;
+            let map_half = rect.width().min(rect.height()) * 0.5;
+
+            let to_screen = |dh_x: f64, dh_y: f64| -> egui::Pos2 {
+                let sx = ((dh_x - map_cx) / half_range) as f32 * map_half + center.x;
+                let sy = -((dh_y - map_cy) / half_range) as f32 * map_half + center.y;
+                egui::pos2(sx, sy)
+            };
+
+            // Background
+            painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(30, 30, 40));
+
+            // Grid — adaptive spacing based on zoom level
+            let grid_step = if half_range > 20_000.0 { 10_000.0 }
+                else if half_range > 5_000.0 { 5_000.0 }
+                else if half_range > 2_000.0 { 1_000.0 }
+                else if half_range > 500.0 { 500.0 }
+                else if half_range > 100.0 { 100.0 }
+                else { 50.0 };
+            let grid_color = egui::Color32::from_rgba_unmultiplied(80, 80, 100, 80);
+            let grid_min_x = ((map_cx - half_range) / grid_step).ceil() as i64;
+            let grid_max_x = ((map_cx + half_range) / grid_step).floor() as i64;
+            let grid_min_y = ((map_cy - half_range) / grid_step).ceil() as i64;
+            let grid_max_y = ((map_cy + half_range) / grid_step).floor() as i64;
+            for gx in grid_min_x..=grid_max_x {
+                let x = gx as f64 * grid_step;
+                let p0 = to_screen(x, map_cy - half_range);
+                let p1 = to_screen(x, map_cy + half_range);
+                painter.line_segment([p0, p1], egui::Stroke::new(1.0, grid_color));
+            }
+            for gy in grid_min_y..=grid_max_y {
+                let y = gy as f64 * grid_step;
+                let p0 = to_screen(map_cx - half_range, y);
+                let p1 = to_screen(map_cx + half_range, y);
+                painter.line_segment([p0, p1], egui::Stroke::new(1.0, grid_color));
+            }
+
+            // Grid scale label
+            let scale_text = if grid_step >= 1000.0 { format!("{:.0} km grid", grid_step / 1000.0) }
+                else { format!("{:.0} m grid", grid_step) };
+            painter.text(
+                egui::pos2(rect.min.x + 6.0, rect.max.y - 6.0),
+                egui::Align2::LEFT_BOTTOM,
+                scale_text,
+                egui::FontId::proportional(10.0),
+                egui::Color32::from_rgba_unmultiplied(150, 150, 170, 180),
+            );
+
+            // Target marker
+            let tgt = to_screen(guidance::TARGET_POS.x, guidance::TARGET_POS.y);
+            painter.circle_filled(tgt, 6.0, egui::Color32::from_rgb(220, 40, 40));
+            painter.text(egui::pos2(tgt.x + 10.0, tgt.y), egui::Align2::LEFT_CENTER, "TARGET", egui::FontId::proportional(11.0), egui::Color32::from_rgb(220, 40, 40));
+
+            // Launch origin — the original drone spawn at (0, 0)
+            let origin = to_screen(0.0, 0.0);
+            // Crosshair + circle
+            let origin_color = egui::Color32::from_rgb(40, 220, 40);
+            painter.circle_stroke(origin, 8.0, egui::Stroke::new(2.0, origin_color));
+            painter.line_segment(
+                [egui::pos2(origin.x - 12.0, origin.y), egui::pos2(origin.x + 12.0, origin.y)],
+                egui::Stroke::new(1.5, origin_color),
+            );
+            painter.line_segment(
+                [egui::pos2(origin.x, origin.y - 12.0), egui::pos2(origin.x, origin.y + 12.0)],
+                egui::Stroke::new(1.5, origin_color),
+            );
+            painter.text(
+                egui::pos2(origin.x + 14.0, origin.y),
+                egui::Align2::LEFT_CENTER,
+                "LAUNCH SITE",
+                egui::FontId::proportional(11.0),
+                origin_color,
+            );
+
+            // Placed drones
+            for (i, pos) in plan.launch_positions.iter().enumerate() {
+                let sp = to_screen(pos[0], pos[1]);
+                let tc = fleet_trail_color(i);
+                let color = egui::Color32::from_rgb((tc[0] * 255.0) as u8, (tc[1] * 255.0) as u8, (tc[2] * 255.0) as u8);
+                painter.circle_filled(sp, 6.0, color);
+                painter.text(egui::pos2(sp.x + 8.0, sp.y), egui::Align2::LEFT_CENTER, format!("#{}", i + 1), egui::FontId::proportional(12.0), color);
+            }
+
+            // Scroll to zoom
+            let scroll = ui.input(|i| {
+                i.events.iter().filter_map(|e| match e {
+                    egui::Event::MouseWheel { delta, .. } => Some(delta.y),
+                    _ => None,
+                }).sum::<f32>()
+            });
+            if response.hovered() && scroll.abs() > 0.01 {
+                let zoom_factor = if scroll > 0.0 { 0.85 } else { 1.0 / 0.85 };
+                // Zoom toward cursor
+                if let Some(hover_pos) = response.hover_pos() {
+                    let before_x = ((hover_pos.x - center.x) / map_half) as f64 * half_range + map_cx;
+                    let before_y = -((hover_pos.y - center.y) / map_half) as f64 * half_range + map_cy;
+                    plan.map_half_range = (plan.map_half_range * zoom_factor as f64).clamp(50.0, 60_000.0);
+                    let new_hr = plan.map_half_range;
+                    let after_x = ((hover_pos.x - center.x) / map_half) as f64 * new_hr + plan.map_center[0];
+                    let after_y = -((hover_pos.y - center.y) / map_half) as f64 * new_hr + plan.map_center[1];
+                    plan.map_center[0] += before_x - after_x;
+                    plan.map_center[1] += before_y - after_y;
+                } else {
+                    plan.map_half_range = (plan.map_half_range * zoom_factor as f64).clamp(50.0, 60_000.0);
+                }
+            }
+
+            // Right-drag to pan
+            if response.dragged_by(egui::PointerButton::Secondary) {
+                let drag = response.drag_delta();
+                plan.map_center[0] -= (drag.x as f64 / map_half as f64) * half_range;
+                plan.map_center[1] += (drag.y as f64 / map_half as f64) * half_range;
+            }
+
+            // Left-click to place drone
+            if response.clicked_by(egui::PointerButton::Primary) && plan.launch_positions.len() < MAX_FLEET_SIZE {
+                if let Some(click_pos) = response.interact_pointer_pos() {
+                    let dh_x = ((click_pos.x - center.x) / map_half) as f64 * half_range + map_cx;
+                    let dh_y = -((click_pos.y - center.y) / map_half) as f64 * half_range + map_cy;
+                    plan.launch_positions.push([dh_x, dh_y]);
+                }
+            }
+
+            ui.horizontal(|ui| {
+                if ui.button(egui::RichText::new("Clear").size(14.0)).clicked() {
+                    plan.launch_positions.clear();
+                }
+                if !plan.launch_positions.is_empty() {
+                    if ui.button(egui::RichText::new("Launch All").size(14.0).color(egui::Color32::from_rgb(255, 100, 100)).strong()).clicked() {
+                        *launch_all = true;
+                    }
+                }
+                if ui.button(egui::RichText::new("Reset View").size(14.0)).clicked() {
+                    plan.map_center = [25_000.0, 0.0];
+                    plan.map_half_range = 28_000.0;
+                }
+                if ui.button(egui::RichText::new("Close").size(14.0)).clicked() {
+                    plan.active = false;
+                }
+            });
+        });
+}
+
+// ── Fullscreen Map ──────────────────────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+fn draw_fullscreen_map(
+    ctx: &egui::Context,
+    drones: &[DroneInstance],
+    wind: &nalgebra::Vector3<f64>,
+    camera_mode: CameraMode,
+    ground_cam_pos: &Vec3,
+    ground_cam_yaw: f32,
+    primary_idx: usize,
+    map_center: &mut [f64; 2],
+    map_half_range: &mut f64,
+    show_trails: bool,
+) -> Option<[f64; 2]> {
+    let mut clicked_pos: Option<[f64; 2]> = None;
+
+    let screen = ctx.screen_rect();
+    let margin = 10.0;
+    let map_w = screen.width() - margin * 2.0;
+    let map_h = screen.height() - margin * 2.0 - 30.0; // leave room for status bar
+
+    egui::Area::new(egui::Id::new("fullscreen_map"))
+        .fixed_pos(egui::pos2(margin, margin))
+        .order(egui::Order::Background)
+        .interactable(true)
+        .show(ctx, |ui| {
+            let map_size = egui::vec2(map_w, map_h);
+            let (response, painter) = ui.allocate_painter(map_size, egui::Sense::click_and_drag());
+            let rect = response.rect;
+            let center = rect.center();
+            let map_cx = map_center[0];
+            let map_cy = map_center[1];
+            let half_range = *map_half_range;
+            let map_half = rect.width().min(rect.height()) * 0.5;
+
+            let to_screen = |dh_x: f64, dh_y: f64| -> egui::Pos2 {
+                let sx = ((dh_x - map_cx) / half_range) as f32 * map_half + center.x;
+                let sy = -((dh_y - map_cy) / half_range) as f32 * map_half + center.y;
+                egui::pos2(sx, sy)
+            };
+
+            // Background
+            painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(20, 22, 30));
+
+            // Adaptive grid
+            let grid_step = if half_range > 20_000.0 { 10_000.0 }
+                else if half_range > 5_000.0 { 5_000.0 }
+                else if half_range > 2_000.0 { 1_000.0 }
+                else if half_range > 500.0 { 500.0 }
+                else if half_range > 100.0 { 100.0 }
+                else { 50.0 };
+            let grid_color = egui::Color32::from_rgba_unmultiplied(60, 60, 80, 80);
+            let grid_min_x = ((map_cx - half_range) / grid_step).ceil() as i64;
+            let grid_max_x = ((map_cx + half_range) / grid_step).floor() as i64;
+            let grid_min_y = ((map_cy - half_range) / grid_step).ceil() as i64;
+            let grid_max_y = ((map_cy + half_range) / grid_step).floor() as i64;
+            for gx in grid_min_x..=grid_max_x {
+                let x = gx as f64 * grid_step;
+                let p0 = to_screen(x, map_cy - half_range);
+                let p1 = to_screen(x, map_cy + half_range);
+                painter.line_segment([p0, p1], egui::Stroke::new(1.0, grid_color));
+            }
+            for gy in grid_min_y..=grid_max_y {
+                let y = gy as f64 * grid_step;
+                let p0 = to_screen(map_cx - half_range, y);
+                let p1 = to_screen(map_cx + half_range, y);
+                painter.line_segment([p0, p1], egui::Stroke::new(1.0, grid_color));
+            }
+
+            // Scale label
+            let scale_text = if grid_step >= 1000.0 { format!("{:.0} km grid", grid_step / 1000.0) }
+                else { format!("{:.0} m grid", grid_step) };
+            painter.text(
+                egui::pos2(rect.min.x + 8.0, rect.max.y - 6.0),
+                egui::Align2::LEFT_BOTTOM, scale_text,
+                egui::FontId::proportional(12.0),
+                egui::Color32::from_rgba_unmultiplied(150, 150, 180, 200),
+            );
+
+            // Launch site
+            let origin = to_screen(0.0, 0.0);
+            let origin_color = egui::Color32::from_rgb(40, 220, 40);
+            painter.circle_stroke(origin, 6.0, egui::Stroke::new(2.0, origin_color));
+            painter.line_segment([egui::pos2(origin.x - 10.0, origin.y), egui::pos2(origin.x + 10.0, origin.y)], egui::Stroke::new(1.5, origin_color));
+            painter.line_segment([egui::pos2(origin.x, origin.y - 10.0), egui::pos2(origin.x, origin.y + 10.0)], egui::Stroke::new(1.5, origin_color));
+            painter.text(egui::pos2(origin.x + 12.0, origin.y), egui::Align2::LEFT_CENTER, "LAUNCH", egui::FontId::proportional(11.0), origin_color);
+
+            // Target
+            let tgt = to_screen(guidance::TARGET_POS.x, guidance::TARGET_POS.y);
+            let x_size = 6.0_f32;
+            let x_color = egui::Color32::from_rgb(220, 40, 40);
+            painter.line_segment([egui::pos2(tgt.x - x_size, tgt.y - x_size), egui::pos2(tgt.x + x_size, tgt.y + x_size)], egui::Stroke::new(2.0, x_color));
+            painter.line_segment([egui::pos2(tgt.x + x_size, tgt.y - x_size), egui::pos2(tgt.x - x_size, tgt.y + x_size)], egui::Stroke::new(2.0, x_color));
+            painter.text(egui::pos2(tgt.x + 10.0, tgt.y), egui::Align2::LEFT_CENTER, "TGT", egui::FontId::proportional(11.0), x_color);
+
+            // Waypoints
+            let primary_guidance = &drones[primary_idx].guidance;
+            let wp_color = egui::Color32::from_rgb(60, 140, 255);
+            let num_wps = if primary_guidance.waypoints.len() > 1 { primary_guidance.waypoints.len() - 1 } else { 0 };
+            for (i, wp) in primary_guidance.waypoints.iter().take(num_wps).enumerate() {
+                let wp_pos = to_screen(wp.x, wp.y);
+                painter.circle_filled(wp_pos, 3.0, wp_color);
+                painter.text(egui::pos2(wp_pos.x + 6.0, wp_pos.y), egui::Align2::LEFT_CENTER, format!("W{}", i + 1), egui::FontId::proportional(9.0), wp_color);
+            }
+
+            // Trails
+            if show_trails {
+                for d in drones {
+                    let tc = d.trail_color;
+                    let trail_color = egui::Color32::from_rgba_unmultiplied(
+                        (tc[0] * 255.0) as u8, (tc[1] * 255.0) as u8, (tc[2] * 255.0) as u8, 180,
+                    );
+                    let mt = &d.minimap_trail;
+                    if mt.len() >= 2 {
+                        for i in 0..mt.len() - 1 {
+                            let p0 = to_screen(mt[i][0], mt[i][1]);
+                            let p1 = to_screen(mt[i + 1][0], mt[i + 1][1]);
+                            painter.line_segment([p0, p1], egui::Stroke::new(1.5, trail_color));
+                        }
+                    }
+                }
+            }
+
+            // Drone icons
+            for (di, d) in drones.iter().enumerate() {
+                let dp = to_screen(d.flight.position.x, d.flight.position.y);
+                let h = d.flight.heading as f32;
+                let is_primary = di == primary_idx;
+                let tri_size = if is_primary { 10.0_f32 } else { 6.0_f32 };
+                let tc = d.trail_color;
+                let tri_color = egui::Color32::from_rgb(
+                    (tc[0] * 255.0) as u8, (tc[1] * 255.0) as u8, (tc[2] * 255.0) as u8,
+                );
+                let fwd_x = h.cos();
+                let fwd_y = -h.sin();
+                let tip = egui::pos2(dp.x + fwd_x * tri_size, dp.y + fwd_y * tri_size);
+                let left = egui::pos2(dp.x + (-fwd_x * 0.5 + fwd_y * 0.5) * tri_size, dp.y + (-fwd_y * 0.5 - fwd_x * 0.5) * tri_size);
+                let right = egui::pos2(dp.x + (-fwd_x * 0.5 - fwd_y * 0.5) * tri_size, dp.y + (-fwd_y * 0.5 + fwd_x * 0.5) * tri_size);
+                painter.add(egui::Shape::convex_polygon(vec![tip, left, right], tri_color, egui::Stroke::NONE));
+                if is_primary || half_range < 5_000.0 {
+                    painter.text(egui::pos2(dp.x + tri_size + 4.0, dp.y), egui::Align2::LEFT_CENTER,
+                        format!("#{}", di + 1), egui::FontId::proportional(if is_primary { 12.0 } else { 9.0 }), tri_color);
+                }
+            }
+
+            // Ground camera
+            if camera_mode == CameraMode::Ground {
+                let dh_x = ground_cam_pos.x as f64;
+                let dh_y = -(ground_cam_pos.z as f64);
+                let cam_screen = to_screen(dh_x, dh_y);
+                let cam_color = egui::Color32::from_rgb(255, 200, 40);
+                painter.circle_filled(cam_screen, 5.0, cam_color);
+                painter.text(egui::pos2(cam_screen.x + 8.0, cam_screen.y), egui::Align2::LEFT_CENTER, "CAM", egui::FontId::proportional(10.0), cam_color);
+                let wedge_len = 25.0_f32;
+                let fov_half = 30.0_f32.to_radians();
+                for sign in [-1.0_f32, 1.0] {
+                    let angle = ground_cam_yaw + sign * fov_half;
+                    let dx = angle.cos();
+                    let dy = angle.sin();
+                    let end = egui::pos2(cam_screen.x + dx * wedge_len, cam_screen.y + dy * wedge_len);
+                    painter.line_segment([cam_screen, end], egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 200, 40, 100)));
+                }
+            }
+
+            // Wind arrow (top-right corner)
+            let wind_speed = wind.norm();
+            if wind_speed > 0.5 {
+                let compass_center = egui::pos2(rect.max.x - 35.0, rect.min.y + 35.0);
+                let wx = wind.x as f32;
+                let wy = -(wind.y as f32);
+                let wlen = (wx * wx + wy * wy).sqrt();
+                if wlen > 0.01 {
+                    let wnx = wx / wlen;
+                    let wny = wy / wlen;
+                    let arrow_len = (wind_speed as f32 / 25.0 * 18.0).clamp(5.0, 18.0);
+                    let tip = egui::pos2(compass_center.x + wnx * arrow_len, compass_center.y + wny * arrow_len);
+                    let wc = egui::Color32::from_rgb(140, 200, 255);
+                    painter.line_segment([compass_center, tip], egui::Stroke::new(2.0, wc));
+                    painter.text(egui::pos2(compass_center.x, compass_center.y + 22.0), egui::Align2::CENTER_TOP,
+                        format!("{:.0} m/s", wind_speed), egui::FontId::proportional(10.0), wc);
+                }
+            }
+
+            // Status bar
+            let primary = &drones[primary_idx];
+            let dist = primary.guidance.distance_to_target(&primary.flight.position);
+            let info = format!(
+                "M: close map | Scroll: zoom | Right-drag: pan | Click: place ground cam | Drones: {} | Primary #{} | Alt: {:.0}m | Dist: {:.1}km",
+                drones.len(), primary_idx + 1, primary.flight.altitude(), dist / 1000.0
+            );
+            painter.text(
+                egui::pos2(center.x, rect.max.y + 4.0),
+                egui::Align2::CENTER_TOP, info,
+                egui::FontId::proportional(13.0),
+                egui::Color32::from_rgb(180, 180, 200),
+            );
+
+            // Scroll to zoom
+            let scroll = ui.input(|i| {
+                i.events.iter().filter_map(|e| match e {
+                    egui::Event::MouseWheel { delta, .. } => Some(delta.y),
+                    _ => None,
+                }).sum::<f32>()
+            });
+            if response.hovered() && scroll.abs() > 0.01 {
+                let zoom_factor = if scroll > 0.0 { 0.85 } else { 1.0 / 0.85 };
+                if let Some(hover_pos) = response.hover_pos() {
+                    let before_x = ((hover_pos.x - center.x) / map_half) as f64 * half_range + map_cx;
+                    let before_y = -((hover_pos.y - center.y) / map_half) as f64 * half_range + map_cy;
+                    *map_half_range = (*map_half_range * zoom_factor as f64).clamp(50.0, 60_000.0);
+                    let new_hr = *map_half_range;
+                    let after_x = ((hover_pos.x - center.x) / map_half) as f64 * new_hr + map_center[0];
+                    let after_y = -((hover_pos.y - center.y) / map_half) as f64 * new_hr + map_center[1];
+                    map_center[0] += before_x - after_x;
+                    map_center[1] += before_y - after_y;
+                } else {
+                    *map_half_range = (*map_half_range * zoom_factor as f64).clamp(50.0, 60_000.0);
+                }
+            }
+
+            // Right-drag to pan
+            if response.dragged_by(egui::PointerButton::Secondary) {
+                let drag = response.drag_delta();
+                map_center[0] -= (drag.x as f64 / map_half as f64) * half_range;
+                map_center[1] += (drag.y as f64 / map_half as f64) * half_range;
+            }
+
+            // Left-click to place ground camera
+            if response.clicked_by(egui::PointerButton::Primary) {
+                if let Some(click_pos) = response.interact_pointer_pos() {
+                    let dh_x = ((click_pos.x - center.x) / map_half) as f64 * half_range + map_cx;
+                    let dh_y = -((click_pos.y - center.y) / map_half) as f64 * half_range + map_cy;
+                    clicked_pos = Some([dh_x, dh_y]);
+                }
+            }
+        });
+
+    clicked_pos
+}
+
 // ── ApplicationHandler ───────────────────────────────────────────────────────
 
 impl ApplicationHandler for App {
@@ -1495,24 +2247,27 @@ impl ApplicationHandler for App {
             self.ref_building_materials.push(MaterialBind { buffer: buf, bind_group: bg });
         }
 
-        // Drone
+        // Drone mesh (shared geometry)
         let (dv, di) = drone::generate_drone_mesh();
         let dvb = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("Drone VB"), contents: bytemuck::cast_slice(&dv), usage: wgpu::BufferUsages::VERTEX });
         let dib = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("Drone IB"), contents: bytemuck::cast_slice(&di), usage: wgpu::BufferUsages::INDEX });
         self.drone_mesh = Some(GpuMesh { vertex_buffer: dvb, index_buffer: dib, num_indices: di.len() as u32 });
-        let (buf, bg) = pbr.create_material_bind_group(&ctx.device);
-        self.drone_material = Some(MaterialBind { buffer: buf, bind_group: bg });
-        // Drone outline material (red halo for ground mode visibility)
-        let (buf, bg) = pbr.create_material_bind_group(&ctx.device);
-        self.drone_outline_material = Some(MaterialBind { buffer: buf, bind_group: bg });
 
-        // Prop
+        // Prop mesh (shared geometry)
         let (pv, pi) = drone::generate_prop_disc();
         let pvb = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("Prop VB"), contents: bytemuck::cast_slice(&pv), usage: wgpu::BufferUsages::VERTEX });
         let pib = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("Prop IB"), contents: bytemuck::cast_slice(&pi), usage: wgpu::BufferUsages::INDEX });
         self.prop_mesh = Some(GpuMesh { vertex_buffer: pvb, index_buffer: pib, num_indices: pi.len() as u32 });
-        let (buf, bg) = pbr.create_material_bind_group(&ctx.device);
-        self.prop_material = Some(MaterialBind { buffer: buf, bind_group: bg });
+
+        // Create materials for the default drone (drones[0])
+        {
+            let (buf, bg) = pbr.create_material_bind_group(&ctx.device);
+            self.drones[0].drone_material = Some(MaterialBind { buffer: buf, bind_group: bg });
+            let (buf, bg) = pbr.create_material_bind_group(&ctx.device);
+            self.drones[0].drone_outline_material = Some(MaterialBind { buffer: buf, bind_group: bg });
+            let (buf, bg) = pbr.create_material_bind_group(&ctx.device);
+            self.drones[0].prop_material = Some(MaterialBind { buffer: buf, bind_group: bg });
+        }
 
         // Target bullseye outer ring
         let (tov, toi) = terrain::generate_target_outer_ring();
@@ -1594,22 +2349,34 @@ impl ApplicationHandler for App {
                 match logical_key {
                     Key::Named(NamedKey::Escape) => event_loop.exit(),
                     Key::Named(NamedKey::Space) => {
-                        if self.guidance.phase == FlightPhase::PreLaunch {
-                            self.guidance.launch();
-                            // Start persistent audio voices via SharedVoice wrappers
-                            if !self.audio_started {
-                                let ev = Arc::new(Mutex::new(sound::EngineVoice::new()));
-                                if let Ok(mut e) = ev.lock() { e.set_running(true); }
-                                self.audio_engine.play(Box::new(sound::SharedVoice::new(ev.clone())));
-                                self.engine_voice = Some(ev);
-
-                                let wv = Arc::new(Mutex::new(sound::WindVoice::new()));
-                                self.audio_engine.play(Box::new(sound::SharedVoice::new(wv.clone())));
-                                self.wind_voice = Some(wv);
-
-                                self.audio_engine.play(Box::new(sound::BoosterVoice::new(0.0)));
-                                self.audio_started = true;
+                        // Launch all drones
+                        let all_prelaunch = self.drones.iter().all(|d| d.guidance.phase == FlightPhase::PreLaunch);
+                        if all_prelaunch {
+                            // If fleet is planned but not yet spawned, spawn them now
+                            if !self.fleet_plan.launch_positions.is_empty() {
+                                self.pending_fleet_launch = true;
+                            } else {
+                                // Launch default single drone
+                                for d in &mut self.drones {
+                                    d.guidance.launch();
+                                }
+                                if !self.audio_started {
+                                    let ev = Arc::new(Mutex::new(sound::EngineVoice::new()));
+                                    if let Ok(mut e) = ev.lock() { e.set_running(true); }
+                                    self.audio_engine.play(Box::new(sound::SharedVoice::new(ev.clone())));
+                                    self.engine_voice = Some(ev);
+                                    let wv = Arc::new(Mutex::new(sound::WindVoice::new()));
+                                    self.audio_engine.play(Box::new(sound::SharedVoice::new(wv.clone())));
+                                    self.wind_voice = Some(wv);
+                                    self.audio_engine.play(Box::new(sound::BoosterVoice::new(0.0)));
+                                    self.audio_started = true;
+                                }
                             }
+                        }
+                    }
+                    Key::Named(NamedKey::Tab) => {
+                        if self.drones.len() > 1 {
+                            self.primary_drone = (self.primary_drone + 1) % self.drones.len();
                         }
                     }
                     Key::Character(ref c) if c.as_str() == "r" => self.reset(),
@@ -1619,6 +2386,9 @@ impl ApplicationHandler for App {
                         if self.camera_mode == CameraMode::Ground {
                             self.camera_mode = CameraMode::Chase;
                         }
+                    }
+                    Key::Character(ref c) if c.as_str() == "m" => {
+                        self.fullscreen_map = !self.fullscreen_map;
                     }
                     Key::Character(ref c) if c.as_str() == "1" => self.time_scale = 1.0,
                     Key::Character(ref c) if c.as_str() == "2" => self.time_scale = 10.0,
@@ -1672,7 +2442,8 @@ impl ApplicationHandler for App {
                 let frame_dt = raw_dt.min(MAX_FRAME_TIME);
                 self.last_frame = now;
 
-                let effective_scale = if self.guidance.should_auto_slow() {
+                let pi = self.primary_drone.min(self.drones.len().saturating_sub(1));
+                let effective_scale = if self.drones[pi].guidance.should_auto_slow() {
                     self.time_scale.min(1.0)
                 } else {
                     self.time_scale
@@ -1689,52 +2460,142 @@ impl ApplicationHandler for App {
                 // Master volume
                 self.audio_engine.set_volume(self.master_volume);
 
-                // Physics loop
-                if !self.paused && self.guidance.phase != FlightPhase::Impact
-                    && self.guidance.phase != FlightPhase::PreLaunch
-                {
+                // Handle pending fleet launch (spawn drones from plan)
+                if self.pending_fleet_launch {
+                    self.pending_fleet_launch = false;
+                    let positions = self.fleet_plan.launch_positions.clone();
+                    if !positions.is_empty() {
+                        self.drones.clear();
+                        for (i, pos) in positions.iter().enumerate() {
+                            let launch = nalgebra::Vector3::new(pos[0], pos[1], 1.0);
+                            let heading = (guidance::TARGET_POS.x - pos[0]).atan2(guidance::TARGET_POS.y - pos[1]);
+                            let mut di = DroneInstance {
+                                flight: FlightState::new_at(launch, heading),
+                                guidance: Guidance::new_from(launch),
+                                drone_material: None,
+                                prop_material: None,
+                                drone_outline_material: None,
+                                trail_points: Vec::new(),
+                                trail_distance_accum: 0.0,
+                                minimap_trail: Vec::new(),
+                                trail_color: fleet_trail_color(i),
+                                drone_tint: fleet_tint(i),
+                                launch_pos: *pos,
+                            };
+                            // Create materials
+                            if let Some(pbr) = &self.pbr_pipeline {
+                                if let Some(ctx) = &self.render_ctx {
+                                    let (buf, bg) = pbr.create_material_bind_group(&ctx.device);
+                                    di.drone_material = Some(MaterialBind { buffer: buf, bind_group: bg });
+                                    let (buf, bg) = pbr.create_material_bind_group(&ctx.device);
+                                    di.drone_outline_material = Some(MaterialBind { buffer: buf, bind_group: bg });
+                                    let (buf, bg) = pbr.create_material_bind_group(&ctx.device);
+                                    di.prop_material = Some(MaterialBind { buffer: buf, bind_group: bg });
+                                }
+                            }
+                            self.drones.push(di);
+                        }
+                        self.primary_drone = 0;
+                        self.fleet_plan.active = false;
+                        // Launch all
+                        for d in &mut self.drones {
+                            d.guidance.launch();
+                        }
+                        if !self.audio_started {
+                            let ev = Arc::new(Mutex::new(sound::EngineVoice::new()));
+                            if let Ok(mut e) = ev.lock() { e.set_running(true); }
+                            self.audio_engine.play(Box::new(sound::SharedVoice::new(ev.clone())));
+                            self.engine_voice = Some(ev);
+                            let wv = Arc::new(Mutex::new(sound::WindVoice::new()));
+                            self.audio_engine.play(Box::new(sound::SharedVoice::new(wv.clone())));
+                            self.wind_voice = Some(wv);
+                            self.audio_engine.play(Box::new(sound::BoosterVoice::new(0.0)));
+                            self.audio_started = true;
+                        }
+                    }
+                }
+
+                // Physics loop — all drones
+                let any_active = self.drones.iter().any(|d| {
+                    d.guidance.phase != FlightPhase::Impact && d.guidance.phase != FlightPhase::PreLaunch
+                });
+                if !self.paused && any_active {
                     self.accumulator += frame_dt * effective_scale;
                     let mut steps = 0u64;
                     while self.accumulator >= PHYSICS_DT && steps < MAX_STEPS_PER_FRAME {
-                        let (thrust, pitch_cmd, bank_cmd) = self.guidance.update(&self.flight);
-                        flight::step(&mut self.flight, thrust, pitch_cmd, bank_cmd, &self.wind);
+                        let mut all_done = true;
+                        let mut new_impacts = Vec::new();
+                        for (di, d) in self.drones.iter_mut().enumerate() {
+                            if d.guidance.phase == FlightPhase::Impact || d.guidance.phase == FlightPhase::PreLaunch {
+                                continue;
+                            }
+                            all_done = false;
+                            let (thrust, pitch_cmd, bank_cmd) = d.guidance.update(&d.flight);
+                            flight::step(&mut d.flight, thrust, pitch_cmd, bank_cmd, &self.wind);
 
-                        if self.guidance.phase == FlightPhase::Impact {
-                            self.flight.velocity = nalgebra::Vector3::zeros();
-                            break;
+                            // Terrain-aware ground check using visual mesh interpolation
+                            // DH (x,y,z) → render (x,z,-y)
+                            let ground_z = terrain::terrain_height_visual(
+                                d.flight.position.x as f32,
+                                -(d.flight.position.y as f32),
+                            ) as f64;
+                            if d.flight.position.z <= ground_z + 0.1 {
+                                // Clamp to ground surface
+                                d.flight.position.z = ground_z;
+                                d.flight.velocity = nalgebra::Vector3::zeros();
+                                d.guidance.phase = FlightPhase::Impact;
+                                new_impacts.push(di);
+                            } else if d.guidance.phase == FlightPhase::Impact {
+                                d.flight.velocity = nalgebra::Vector3::zeros();
+                            }
+                            // Trail
+                            let speed = d.flight.airspeed();
+                            d.trail_distance_accum += speed * PHYSICS_DT;
+                            if d.trail_distance_accum >= 50.0 {
+                                d.trail_distance_accum = 0.0;
+                                d.trail_points.push((to_render(&d.flight.position), d.trail_color));
+                                if d.trail_points.len() > 10_000 { d.trail_points.remove(0); }
+                                d.minimap_trail.push([d.flight.position.x, d.flight.position.y]);
+                                if d.minimap_trail.len() > 10_000 { d.minimap_trail.remove(0); }
+                            }
                         }
-
+                        // Play impact sound for new impacts
+                        for _di in &new_impacts {
+                            self.audio_engine.play(Box::new(sound::ImpactVoice::new()));
+                        }
+                        if all_done { break; }
                         self.accumulator -= PHYSICS_DT;
                         self.sim_time += PHYSICS_DT;
                         steps += 1;
-
-                        // Trail
-                        let speed = self.flight.airspeed();
-                        self.trail_distance_accum += speed * PHYSICS_DT;
-                        if self.trail_distance_accum >= 50.0 {
-                            self.trail_distance_accum = 0.0;
-                            self.trail_points.push((to_render(&self.flight.position), self.guidance.phase.trail_color()));
-                            if self.trail_points.len() > 10_000 { self.trail_points.remove(0); }
-                            self.minimap_trail.push([self.flight.position.x, self.flight.position.y]);
-                            if self.minimap_trail.len() > 10_000 { self.minimap_trail.remove(0); }
-                        }
                     }
 
-                    // Update persistent voice params once per frame
-                    let airspeed = self.flight.true_airspeed(&self.wind);
-                    let cam_eye = self.camera.eye();
-                    let drone_render = to_render(&self.flight.position);
-                    let dist = (cam_eye - drone_render).length() as f64;
-                    let pan = (drone_render.x - cam_eye.x).atan2((drone_render.z - cam_eye.z).abs() + 1.0);
-                    if let Some(ev) = &self.engine_voice {
-                        if let Ok(mut e) = ev.lock() {
-                            e.update_params(airspeed, dist, pan.clamp(-1.0, 1.0));
-                            if self.engine_muted { e.volume = 0.0; }
+                    // Update persistent voice params from primary drone
+                    let pi = self.primary_drone.min(self.drones.len().saturating_sub(1));
+                    let all_impacted = self.drones.iter().all(|d| d.guidance.phase == FlightPhase::Impact);
+                    if all_impacted {
+                        // Stop engine and wind sounds on impact
+                        if let Some(ev) = &self.engine_voice {
+                            if let Ok(mut e) = ev.lock() { e.set_running(false); e.volume = 0.0; }
                         }
-                    }
-                    if let Some(wv) = &self.wind_voice {
-                        if let Ok(mut w) = wv.lock() {
-                            w.update_params(airspeed, dist, pan.clamp(-1.0, 1.0));
+                        if let Some(wv) = &self.wind_voice {
+                            if let Ok(mut w) = wv.lock() { w.volume = 0.0; }
+                        }
+                    } else {
+                        let airspeed = self.drones[pi].flight.true_airspeed(&self.wind);
+                        let cam_eye = self.camera.eye();
+                        let drone_render = to_render(&self.drones[pi].flight.position);
+                        let dist = (cam_eye - drone_render).length() as f64;
+                        let pan = (drone_render.x - cam_eye.x).atan2((drone_render.z - cam_eye.z).abs() + 1.0);
+                        if let Some(ev) = &self.engine_voice {
+                            if let Ok(mut e) = ev.lock() {
+                                e.update_params(airspeed, dist, pan.clamp(-1.0, 1.0));
+                                if self.engine_muted { e.volume = 0.0; }
+                            }
+                        }
+                        if let Some(wv) = &self.wind_voice {
+                            if let Ok(mut w) = wv.lock() {
+                                w.update_params(airspeed, dist, pan.clamp(-1.0, 1.0));
+                            }
                         }
                     }
                 }
@@ -1812,3 +2673,128 @@ fn main() {
     let mut app = App::new();
     event_loop.run_app(&mut app).expect("Event loop failed");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Headless flight simulation: runs a full mission from launch to impact and
+    /// verifies the drone actually reaches the visual terrain surface.
+    #[test]
+    fn test_headless_flight_to_impact() {
+        let mut state = FlightState::new();
+        let mut guide = Guidance::new();
+        let wind = nalgebra::Vector3::new(8.0, 0.0, 0.0);
+
+        guide.launch();
+
+        let max_steps = 200 * 60 * 30; // 30 minutes at 200 Hz
+        let mut hit_terrain = false;
+        let mut _final_ground_z = 0.0_f64;
+        let mut final_visual_z = 0.0_f64;
+        let mut prev_phase = guide.phase;
+        let mut terminal_print_counter = 0_u32;
+
+        for step in 0..max_steps {
+            if guide.phase == FlightPhase::Impact {
+                break;
+            }
+
+            let (thrust, pitch_cmd, bank_cmd) = guide.update(&state);
+            flight::step(&mut state, thrust, pitch_cmd, bank_cmd, &wind);
+
+            // Terrain check FIRST (before guidance phase-break), same as main loop
+            let render_wx = state.position.x as f32;
+            let render_wz = -(state.position.y as f32);
+            let ground_z_visual = terrain::terrain_height_visual(render_wx, render_wz) as f64;
+
+            if state.position.z <= ground_z_visual + 0.1 {
+                state.position.z = ground_z_visual;
+                state.velocity = nalgebra::Vector3::zeros();
+                guide.phase = FlightPhase::Impact;
+                hit_terrain = true;
+                final_visual_z = ground_z_visual;
+
+                let t = step as f64 / 200.0;
+                println!("IMPACT at T+{:.1}s step {step}:", t);
+                println!("  DH position: ({:.1}, {:.1}, {:.2})", state.position.x, state.position.y, state.position.z);
+                println!("  terrain_height_visual:   {:.2}", ground_z_visual);
+                println!("  drone z vs visual:       {:.2} m", state.position.z - ground_z_visual);
+                break;
+            }
+
+            // Log phase transitions
+            if guide.phase != prev_phase {
+                let t = step as f64 / 200.0;
+                println!("T+{:.1}s: Phase changed to {:?} at pos=({:.0},{:.0},{:.1}) dist_tgt={:.0}",
+                    t, guide.phase, state.position.x, state.position.y, state.position.z,
+                    guide.distance_to_target(&state.position));
+                prev_phase = guide.phase;
+            }
+
+            // Fine-grained terminal phase logging
+            if guide.phase == FlightPhase::Terminal {
+                terminal_print_counter += 1;
+                if terminal_print_counter % 200 == 0 {
+                    let gap = state.position.z - ground_z_visual;
+                    let dist = guide.distance_to_target(&state.position);
+                    println!("  TERMINAL: z={:.1} ground={:.1} gap={:.1}m pitch={:.1}deg vel_z={:.1} dist={:.0}",
+                        state.position.z, ground_z_visual, gap,
+                        state.pitch.to_degrees(), state.velocity.z, dist);
+                }
+            }
+
+            // Coarse logging during cruise
+            if step % (200 * 60) == 0 && step > 0 && guide.phase != FlightPhase::Terminal {
+                let t = step as f64 / 200.0;
+                println!("T+{:.0}s: {:?} pos=({:.0},{:.0},{:.1}) dist={:.0} ground={:.1}",
+                    t, guide.phase, state.position.x, state.position.y, state.position.z,
+                    guide.distance_to_target(&state.position), ground_z_visual);
+            }
+        }
+
+        assert!(hit_terrain, "Drone never hit terrain within 30 min sim time");
+        let gap = (state.position.z - final_visual_z).abs();
+        println!("\nFinal gap between drone and visual terrain: {:.3} m", gap);
+        assert!(gap < 0.2, "Drone should be within 0.2m of visual terrain, got {:.3}m", gap);
+    }
+
+    /// Test that terrain_height_visual matches terrain_height at grid points
+    /// and interpolates smoothly between them.
+    #[test]
+    fn test_terrain_visual_matches_at_grid() {
+        let step = terrain::GRID_STEP;
+        // Sample at a grid point
+        let gx = 1000.0_f32;
+        let gz = 500.0_f32;
+        let exact = terrain::terrain_height(gx * step, gz * step);
+        let visual = terrain::terrain_height_visual(gx * step, gz * step);
+        let diff = (exact - visual).abs();
+        println!("Grid point ({}, {}): exact={:.4}, visual={:.4}, diff={:.6}",
+            gx * step, gz * step, exact, visual, diff);
+        assert!(diff < 0.01, "At grid points, visual should match exact, got diff={}", diff);
+    }
+
+    /// Test that terrain_height vs terrain_height_visual divergence is bounded.
+    #[test]
+    fn test_terrain_visual_divergence() {
+        let mut max_diff = 0.0_f32;
+        let mut sum_diff = 0.0_f32;
+        let n = 1000;
+        for i in 0..n {
+            // Sample at non-grid-aligned points across the terrain
+            let wx = 100.0 + i as f32 * 53.7; // arbitrary stride, not grid-aligned
+            let wz = -200.0 + i as f32 * 37.3;
+            let exact = terrain::terrain_height(wx, wz);
+            let visual = terrain::terrain_height_visual(wx, wz);
+            let diff = (exact - visual).abs();
+            max_diff = max_diff.max(diff);
+            sum_diff += diff;
+        }
+        let avg_diff = sum_diff / n as f32;
+        println!("Terrain exact vs visual over {} samples: max={:.2}m, avg={:.2}m", n, max_diff, avg_diff);
+        // If max_diff is large, the drone would stop visibly above/below the mesh
+        assert!(max_diff < 20.0, "Max divergence too large: {}m", max_diff);
+    }
+}
+

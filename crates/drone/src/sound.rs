@@ -197,7 +197,7 @@ impl Voice for EngineVoice {
 ///
 /// All normalized to cruise speed (51 m/s).
 pub struct WindVoice {
-    volume: f32,
+    pub volume: f32,
     pan_value: f32,
     time: f32,
     // Three independent noise generators for the bands
@@ -368,6 +368,68 @@ impl Voice for BoosterVoice {
     fn is_done(&self) -> bool { self.time > 3.5 }
     fn pan(&self) -> f32 { self.pan_value }
     fn volume(&self) -> f32 { 0.9 }
+    fn time(&self) -> f32 { self.time }
+
+    fn next_stereo(&mut self, sample_rate: f32) -> Option<(f32, f32)> {
+        self.next_sample(sample_rate).map(|s| {
+            let v = s * self.volume();
+            (v, v)
+        })
+    }
+}
+
+/// Impact explosion: quick low-frequency boom + crackle.
+pub struct ImpactVoice {
+    time: f32,
+    noise_state: u32,
+    lp: f64,
+    hp: f64,
+}
+
+impl ImpactVoice {
+    pub fn new() -> Self {
+        Self { time: 0.0, noise_state: 77777, lp: 0.0, hp: 0.0 }
+    }
+
+    fn noise(&mut self) -> f64 {
+        self.noise_state = self.noise_state.wrapping_mul(1103515245).wrapping_add(12345);
+        ((self.noise_state >> 16) as f64 / 32768.0) - 1.0
+    }
+}
+
+impl Voice for ImpactVoice {
+    fn name(&self) -> &'static str { "Impact" }
+
+    fn next_sample(&mut self, sample_rate: f32) -> Option<f32> {
+        if self.time > 2.5 {
+            return None;
+        }
+        let dt = 1.0 / sample_rate as f64;
+        self.time += dt as f32;
+
+        let raw = self.noise();
+
+        // Low-pass for deep boom
+        let lp_alpha = (60.0 * dt * std::f64::consts::TAU).min(1.0);
+        self.lp += lp_alpha * (raw - self.lp);
+
+        // High-pass crackle layer
+        let hp_alpha = (2000.0 * dt * std::f64::consts::TAU).min(1.0);
+        self.hp += hp_alpha * (raw - self.hp);
+        let crackle = raw - self.hp;
+
+        // Envelope: instant attack, exponential decay
+        let env = (-self.time * 3.0).exp() as f64;
+        // Secondary rumble tail
+        let tail = (-self.time * 0.8).exp() as f64 * 0.4;
+
+        let sample = (self.lp * env + self.lp * tail + crackle * env * 0.3) as f32;
+        Some(sample)
+    }
+
+    fn is_done(&self) -> bool { self.time > 2.5 }
+    fn pan(&self) -> f32 { 0.0 }
+    fn volume(&self) -> f32 { 1.0 }
     fn time(&self) -> f32 { self.time }
 
     fn next_stereo(&mut self, sample_rate: f32) -> Option<(f32, f32)> {

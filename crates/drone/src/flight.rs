@@ -84,6 +84,19 @@ impl FlightState {
         }
     }
 
+    /// Create a new drone state at a custom position and heading.
+    pub fn new_at(position: Vector3<f64>, heading: f64) -> Self {
+        Self {
+            position,
+            velocity: Vector3::zeros(),
+            heading,
+            pitch: 10.0_f64.to_radians(),
+            bank: 0.0,
+            fuel_mass: FUEL_INIT,
+            prop_angle: 0.0,
+        }
+    }
+
     /// Total mass (airframe + warhead + remaining fuel).
     pub fn total_mass(&self) -> f64 {
         MASS_EMPTY + MASS_WARHEAD + self.fuel_mass
@@ -284,9 +297,9 @@ pub fn step(
     state.velocity += accel * dt;
     state.position += state.velocity * dt;
 
-    // Ground clamp — don't go below z=0
-    if state.position.z < 0.0 {
-        state.position.z = 0.0;
+    // Ground clamp — don't go below z=-100 (terrain-aware check is in main loop)
+    if state.position.z < -100.0 {
+        state.position.z = -100.0;
         if state.velocity.z < 0.0 {
             state.velocity.z = 0.0;
         }

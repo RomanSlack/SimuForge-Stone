@@ -108,6 +108,36 @@ impl Guidance {
         }
     }
 
+    /// Create guidance from a custom launch position, generating S-curve waypoints toward the target.
+    pub fn new_from(launch_pos: Vector3<f64>) -> Self {
+        let to_target = TARGET_POS - launch_pos;
+        let dist = (to_target.x * to_target.x + to_target.y * to_target.y).sqrt();
+        let dir = Vector3::new(to_target.x / dist, to_target.y / dist, 0.0);
+        let perp = Vector3::new(-dir.y, dir.x, 0.0);
+
+        let fractions = [0.06, 0.20, 0.40, 0.70, 0.90];
+        let offsets = [1500.0, -1000.0, 2000.0, -800.0, 200.0];
+
+        let mut waypoints = Vec::with_capacity(6);
+        for i in 0..5 {
+            let along = launch_pos + dir * dist * fractions[i];
+            let lateral = perp * offsets[i];
+            waypoints.push(Vector3::new(
+                along.x + lateral.x,
+                along.y + lateral.y,
+                CRUISE_ALT,
+            ));
+        }
+        waypoints.push(Vector3::new(TARGET_POS.x, TARGET_POS.y, TARGET_POS.z + 3.0));
+
+        Self {
+            phase: FlightPhase::PreLaunch,
+            mission_time: 0.0,
+            waypoints,
+            waypoint_idx: 0,
+        }
+    }
+
     /// Begin the launch sequence.
     pub fn launch(&mut self) {
         if self.phase == FlightPhase::PreLaunch {
@@ -204,8 +234,9 @@ impl Guidance {
             }
 
             FlightPhase::Terminal => {
-                // Impact: nose-dive into ground
-                if state.position.z <= 0.5 {
+                // Terrain-aware impact is handled in the main loop.
+                // Fallback only at extreme depth (well below any terrain).
+                if state.position.z <= -200.0 {
                     self.phase = FlightPhase::Impact;
                     return (0.0, state.pitch, 0.0);
                 }

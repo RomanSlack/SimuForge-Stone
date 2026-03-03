@@ -295,5 +295,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // Output linear HDR (no tone mapping — composite pass handles that)
-    return vec4<f32>(color, 1.0);
+    // Alpha encodes thermal emission: 1.0 = cold, >1.0 = hot (used by thermal IR composite)
+    return vec4<f32>(color, 1.0 + material.params.z);
 }

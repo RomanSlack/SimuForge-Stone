@@ -14,6 +14,9 @@ pub struct CompositeParams {
     pub ssao_strength: f32,
     /// SSS influence strength.
     pub sss_strength: f32,
+    /// Thermal IR vision mode (0.0 = off, 1.0 = on).
+    pub thermal_mode: f32,
+    pub _pad: [f32; 3],
 }
 
 impl Default for CompositeParams {
@@ -23,6 +26,8 @@ impl Default for CompositeParams {
             gamma: 2.2,
             ssao_strength: 0.5,
             sss_strength: 0.3,
+            thermal_mode: 0.0,
+            _pad: [0.0; 3],
         }
     }
 }
