@@ -140,6 +140,17 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
     (r + m, g + m, b + m)
 }
 
+/// A chunk of drone debris tumbling after impact.
+struct DebrisChunk {
+    position: Vec3,
+    velocity: Vec3,
+    rotation: glam::Quat,
+    angular_vel: Vec3,
+    scale: f32,
+    age: f32,
+    on_ground: bool,
+}
+
 /// Per-drone instance state.
 struct DroneInstance {
     flight: FlightState,
@@ -153,6 +164,8 @@ struct DroneInstance {
     trail_color: [f32; 4],
     drone_tint: [f32; 4],
     launch_pos: [f64; 2],
+    /// Debris chunks spawned on impact.
+    debris: Vec<DebrisChunk>,
 }
 
 /// Fleet planning state.
@@ -208,6 +221,9 @@ struct App {
     camera: OrbitCamera,
     camera_mode: CameraMode,
     chase_cam_pos: Vec3,
+    /// Camera freeze on impact: holds position/target when primary drone hits.
+    impact_cam_frozen: bool,
+    frozen_cam_target: Vec3,
     // Fleet
     drones: Vec<DroneInstance>,
     primary_drone: usize,
@@ -327,6 +343,8 @@ impl App {
             camera,
             camera_mode: CameraMode::Orbit,
             chase_cam_pos: Vec3::new(-20.0, 10.0, 0.0),
+            impact_cam_frozen: false,
+            frozen_cam_target: Vec3::ZERO,
             drones: vec![DroneInstance {
                 flight: FlightState::new(),
                 guidance: Guidance::new(),
@@ -339,6 +357,7 @@ impl App {
                 trail_color: fleet_trail_color(0),
                 drone_tint: drone::DRONE_COLOR,
                 launch_pos: [0.0, 0.0],
+                debris: Vec::new(),
             }],
             primary_drone: 0,
             fleet_plan: FleetPlanState { active: false, launch_positions: Vec::new(), map_center: [25_000.0, 0.0], map_half_range: 28_000.0, brush_count: 1 },
@@ -432,6 +451,7 @@ impl App {
             d.trail_points.clear();
             d.trail_distance_accum = 0.0;
             d.minimap_trail.clear();
+            d.debris.clear();
         }
         self.primary_drone = 0;
         // Keep fleet_plan positions so user can re-launch the same fleet
@@ -454,6 +474,7 @@ impl App {
         self.camera.yaw = -0.3;
         self.camera.pitch = 0.15;
         self.camera_mode = CameraMode::Orbit;
+        self.impact_cam_frozen = false;
         self.ground_cam_pos = Vec3::ZERO;
         self.ground_cam_yaw = 0.0;
         self.ground_cam_pitch = 0.2;
@@ -464,6 +485,12 @@ impl App {
     fn update_camera(&mut self) {
         let pi = self.primary_drone.min(self.drones.len().saturating_sub(1));
         let drone_render = to_render(&self.drones[pi].flight.position);
+
+        // Freeze camera at impact — stop tracking, hold position looking at impact site
+        if self.impact_cam_frozen && self.camera_mode != CameraMode::Ground {
+            self.camera.target = self.frozen_cam_target;
+            return;
+        }
 
         // Restore default FOV when not in ground mode
         if self.camera_mode != CameraMode::Ground {
@@ -988,8 +1015,29 @@ impl App {
             // Rocks
             draw_mesh!(&self.rock_mesh, &self.rock_material);
 
-            // All drones
+            // All drones (skip intact mesh for impacted drones)
             for d in &self.drones {
+                if d.guidance.phase == FlightPhase::Impact {
+                    // Draw debris chunks using drone's material (re-upload per chunk)
+                    if let (Some(mesh), Some(mat)) = (&self.drone_mesh, &d.drone_material) {
+                        for chunk in &d.debris {
+                            let chunk_model = Mat4::from_scale_rotation_translation(
+                                Vec3::splat(chunk.scale),
+                                chunk.rotation,
+                                chunk.position,
+                            );
+                            let mut chunk_mat = MaterialUniform::metal(d.drone_tint)
+                                .with_model(chunk_model.to_cols_array_2d());
+                            chunk_mat.params = [0.8, 0.1, 0.0, 0.0];
+                            ctx.queue.write_buffer(&mat.buffer, 0, bytemuck::bytes_of(&chunk_mat));
+                            pass.set_bind_group(0, &mat.bind_group, &[]);
+                            pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                            pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                            pass.draw_indexed(0..mesh.num_indices, 0, 0..1);
+                        }
+                    }
+                    continue;
+                }
                 if self.camera_mode == CameraMode::Ground && self.show_drone_outlines {
                     draw_mesh!(&self.drone_mesh, &d.drone_outline_material);
                 }
@@ -2605,6 +2653,7 @@ impl ApplicationHandler for App {
                                 trail_color: fleet_trail_color(i),
                                 drone_tint: fleet_tint(i),
                                 launch_pos: *pos,
+                                debris: Vec::new(),
                             };
                             // Create materials
                             if let Some(pbr) = &self.pbr_pipeline {
@@ -2683,12 +2732,49 @@ impl ApplicationHandler for App {
                                 if d.minimap_trail.len() > 10_000 { d.minimap_trail.remove(0); }
                             }
                         }
-                        // Play impact sound + spawn explosion for new impacts
+                        // Play impact sound, spawn explosion + debris for new impacts
                         for &di in &new_impacts {
                             self.audio_engine.play(Box::new(sound::ImpactVoice::new()));
+                            let impact_pos = to_render(&self.drones[di].flight.position);
                             if let Some(ps) = &mut self.particle_system {
-                                let impact_pos = to_render(&self.drones[di].flight.position);
                                 ps.spawn_explosion(impact_pos);
+                            }
+                            // Spawn mesh debris chunks
+                            let impact_vel = &self.drones[di].flight.velocity;
+                            let speed = impact_vel.norm() as f32;
+                            let fwd = self.drones[di].flight.forward_dir();
+                            let fwd_render = Vec3::new(fwd.x as f32, fwd.z as f32, -fwd.y as f32);
+                            let mut rng = (di as u32).wrapping_mul(2654435761).wrapping_add(12345);
+                            let mut rnd = || -> f32 {
+                                rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
+                                ((rng >> 16) as f32 / 32768.0) - 1.0
+                            };
+                            for chunk_i in 0..7 {
+                                let scatter_dir = Vec3::new(rnd(), rnd().abs() * 0.8 + 0.2, rnd()).normalize();
+                                let chunk_speed = speed * 0.3 + (rnd().abs()) * 40.0;
+                                let vel = fwd_render * speed * 0.15 + scatter_dir * chunk_speed;
+                                let ang = Vec3::new(rnd() * 8.0, rnd() * 8.0, rnd() * 8.0);
+                                let s = 0.15 + rnd().abs() * 0.25; // 15-40% scale
+                                self.drones[di].debris.push(DebrisChunk {
+                                    position: impact_pos + scatter_dir * 1.5,
+                                    velocity: vel,
+                                    rotation: glam::Quat::from_euler(
+                                        glam::EulerRot::XYZ,
+                                        rnd() * std::f32::consts::PI,
+                                        rnd() * std::f32::consts::PI,
+                                        rnd() * std::f32::consts::PI,
+                                    ),
+                                    angular_vel: ang,
+                                    scale: s,
+                                    age: 0.0,
+                                    on_ground: false,
+                                });
+                                let _ = chunk_i;
+                            }
+                            // Freeze camera if this is the primary drone
+                            if di == self.primary_drone && !self.impact_cam_frozen {
+                                self.impact_cam_frozen = true;
+                                self.frozen_cam_target = impact_pos;
                             }
                         }
                         if all_done { break; }
@@ -2787,12 +2873,45 @@ impl ApplicationHandler for App {
                 );
                 if let Some(ps) = &mut self.particle_system {
                     ps.update(frame_dt as f32, wind_render);
-                    // Extract camera right/up from view matrix for billboarding
                     let view_mat = self.camera.view_matrix();
                     let cam_right = Vec3::new(view_mat.x_axis.x, view_mat.y_axis.x, view_mat.z_axis.x);
                     let cam_up = Vec3::new(view_mat.x_axis.y, view_mat.y_axis.y, view_mat.z_axis.y);
                     if let Some(ctx) = &self.render_ctx {
                         ps.upload(&ctx.queue, cam_right, cam_up);
+                    }
+                }
+
+                // Update debris chunks (wall-clock dt)
+                let debris_dt = frame_dt as f32;
+                for d in &mut self.drones {
+                    for chunk in &mut d.debris {
+                        if chunk.on_ground { continue; }
+                        chunk.age += debris_dt;
+                        chunk.velocity.y -= 9.81 * debris_dt;
+                        chunk.velocity *= 1.0 - 0.3 * debris_dt; // air drag
+                        chunk.position += chunk.velocity * debris_dt;
+                        // Tumble
+                        let angle = chunk.angular_vel.length() * debris_dt;
+                        if angle > 0.001 {
+                            let axis = chunk.angular_vel.normalize();
+                            chunk.rotation = glam::Quat::from_axis_angle(axis, angle) * chunk.rotation;
+                        }
+                        chunk.angular_vel *= 1.0 - 0.5 * debris_dt;
+                        // Ground bounce
+                        let ground_y = terrain::terrain_height_visual(chunk.position.x, chunk.position.z);
+                        if chunk.position.y < ground_y {
+                            chunk.position.y = ground_y;
+                            if chunk.velocity.y.abs() < 2.0 {
+                                chunk.on_ground = true;
+                                chunk.velocity = Vec3::ZERO;
+                                chunk.angular_vel = Vec3::ZERO;
+                            } else {
+                                chunk.velocity.y = chunk.velocity.y.abs() * 0.2;
+                                chunk.velocity.x *= 0.5;
+                                chunk.velocity.z *= 0.5;
+                                chunk.angular_vel *= 0.4;
+                            }
+                        }
                     }
                 }
 
