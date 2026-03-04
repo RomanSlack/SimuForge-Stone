@@ -306,3 +306,63 @@ pub fn generate_prop_disc() -> (Vec<Vertex>, Vec<u32>) {
 
     (verts, idxs)
 }
+
+/// Generate a random low-poly debris chunk (jagged shard).
+/// `seed` produces a unique shape per chunk.
+/// Returns geometry roughly 0.5-1m across, centered at origin.
+pub fn generate_debris_chunk(seed: u32) -> (Vec<Vertex>, Vec<u32>) {
+    let mut verts = Vec::new();
+    let mut idxs = Vec::new();
+
+    let mut h = seed;
+    let mut rnd = || -> f32 {
+        h = h.wrapping_mul(1103515245).wrapping_add(12345);
+        ((h >> 16) as f32 / 32768.0) - 1.0
+    };
+    // 5-7 random vertices around origin
+    let n_pts = 5 + ((rnd() + 1.0) * 0.5 * 3.0) as usize;
+    let mut pts = Vec::with_capacity(n_pts);
+    for _ in 0..n_pts {
+        pts.push([rnd() * 0.5, rnd() * 0.3, rnd() * 0.4]);
+    }
+
+    // Centroid
+    let mut cx = 0.0_f32; let mut cy = 0.0_f32; let mut cz = 0.0_f32;
+    for p in &pts { cx += p[0]; cy += p[1]; cz += p[2]; }
+    let nf = pts.len() as f32;
+    cx /= nf; cy /= nf; cz /= nf;
+
+    // Top layer: centroid + outer points, fan triangles
+    verts.push(Vertex { position: [cx, cy, cz], normal: [0.0, 1.0, 0.0] });
+    for p in &pts {
+        let dx = p[0] - cx; let dy = p[1] - cy; let dz = p[2] - cz;
+        let len = (dx * dx + dy * dy + dz * dz).sqrt().max(0.001);
+        verts.push(Vertex { position: *p, normal: [dx / len, dy / len, dz / len] });
+    }
+    let np = pts.len() as u32;
+    for i in 0..np {
+        idxs.extend_from_slice(&[0, 1 + i, 1 + (i + 1) % np]);
+    }
+
+    // Bottom layer for thickness
+    let base2 = verts.len() as u32;
+    let thickness = 0.08 + (rnd() + 1.0) * 0.5 * 0.12;
+    verts.push(Vertex { position: [cx, cy - thickness, cz], normal: [0.0, -1.0, 0.0] });
+    for p in &pts {
+        let dx = p[0] - cx; let dz = p[2] - cz;
+        let len = (dx * dx + dz * dz).sqrt().max(0.001);
+        verts.push(Vertex { position: [p[0], p[1] - thickness, p[2]], normal: [dx / len, -0.3, dz / len] });
+    }
+    for i in 0..np {
+        idxs.extend_from_slice(&[base2, base2 + 1 + (i + 1) % np, base2 + 1 + i]);
+    }
+
+    // Side walls
+    for i in 0..np {
+        let t0 = 1 + i; let t1 = 1 + (i + 1) % np;
+        let b0 = base2 + 1 + i; let b1 = base2 + 1 + (i + 1) % np;
+        idxs.extend_from_slice(&[t0, b0, t1, t1, b0, b1]);
+    }
+
+    (verts, idxs)
+}

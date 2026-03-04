@@ -395,7 +395,8 @@ impl ParticleSystem {
 
     /// Update all particles. `dt` is wall-clock seconds.
     /// `wind` is in render-space (Y-up): convert DH wind (x,y,z) → render (x,z,-y).
-    pub fn update(&mut self, dt: f32, wind: Vec3) {
+    /// `ground_y` returns the terrain height at a render-space (x, z) position.
+    pub fn update(&mut self, dt: f32, wind: Vec3, ground_y: impl Fn(f32, f32) -> f32) {
         const GRAVITY: f32 = 9.81;
 
         for explosion in &mut self.explosions {
@@ -424,8 +425,9 @@ impl ParticleSystem {
                     ParticleKind::Sparks => {
                         p.velocity.y -= GRAVITY * dt;
                         p.velocity *= (1.0 - 0.3 * dt).max(0.0);
-                        if p.position.y < 0.0 {
-                            p.position.y = 0.0;
+                        let gy = ground_y(p.position.x, p.position.z);
+                        if p.position.y < gy {
+                            p.position.y = gy;
                             p.velocity.y = p.velocity.y.abs() * 0.3;
                             p.velocity *= 0.5;
                         }
@@ -433,8 +435,9 @@ impl ParticleSystem {
                     ParticleKind::Debris => {
                         p.velocity.y -= GRAVITY * 1.5 * dt;
                         p.velocity *= (1.0 - 0.2 * dt).max(0.0);
-                        if p.position.y < 0.0 {
-                            p.position.y = 0.0;
+                        let gy = ground_y(p.position.x, p.position.z);
+                        if p.position.y < gy {
+                            p.position.y = gy;
                             p.velocity = Vec3::ZERO;
                         }
                     }
@@ -442,6 +445,8 @@ impl ParticleSystem {
                         p.velocity *= (1.0 - 2.5 * dt).max(0.0);
                         p.velocity.y -= GRAVITY * 0.3 * dt;
                         p.size += dt * 8.0;
+                        let gy = ground_y(p.position.x, p.position.z);
+                        if p.position.y < gy { p.position.y = gy; }
                     }
                     ParticleKind::Smoke => {
                         p.velocity *= (1.0 - 1.0 * dt).max(0.0);

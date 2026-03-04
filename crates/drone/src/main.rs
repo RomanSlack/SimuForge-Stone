@@ -149,6 +149,8 @@ struct DebrisChunk {
     scale: f32,
     age: f32,
     on_ground: bool,
+    /// Index into App::debris_meshes for which random shape to use.
+    mesh_idx: usize,
 }
 
 /// Per-drone instance state.
@@ -268,6 +270,8 @@ struct App {
     // GPU meshes — drone (shared geometry, per-drone materials in DroneInstance)
     drone_mesh: Option<GpuMesh>,
     prop_mesh: Option<GpuMesh>,
+    /// Pre-generated debris chunk meshes (7 unique shapes).
+    debris_meshes: Vec<GpuMesh>,
     // Target bullseye
     target_outer_mesh: Option<GpuMesh>,
     target_outer_material: Option<MaterialBind>,
@@ -393,6 +397,7 @@ impl App {
             ref_building_materials: Vec::new(),
             drone_mesh: None,
             prop_mesh: None,
+            debris_meshes: Vec::new(),
             ground_cam_pos: Vec3::new(0.0, 0.0, 0.0),
             ground_cam_yaw: 0.0,
             ground_cam_pitch: 0.2,
@@ -1018,22 +1023,31 @@ impl App {
             // All drones (skip intact mesh for impacted drones)
             for d in &self.drones {
                 if d.guidance.phase == FlightPhase::Impact {
-                    // Draw debris chunks using drone's material (re-upload per chunk)
-                    if let (Some(mesh), Some(mat)) = (&self.drone_mesh, &d.drone_material) {
+                    // Draw debris chunks using random chunk meshes
+                    if let Some(mat) = &d.drone_material {
                         for chunk in &d.debris {
-                            let chunk_model = Mat4::from_scale_rotation_translation(
-                                Vec3::splat(chunk.scale),
-                                chunk.rotation,
-                                chunk.position,
-                            );
-                            let mut chunk_mat = MaterialUniform::metal(d.drone_tint)
-                                .with_model(chunk_model.to_cols_array_2d());
-                            chunk_mat.params = [0.8, 0.1, 0.0, 0.0];
-                            ctx.queue.write_buffer(&mat.buffer, 0, bytemuck::bytes_of(&chunk_mat));
-                            pass.set_bind_group(0, &mat.bind_group, &[]);
-                            pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                            pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                            pass.draw_indexed(0..mesh.num_indices, 0, 0..1);
+                            if let Some(mesh) = self.debris_meshes.get(chunk.mesh_idx) {
+                                let chunk_model = Mat4::from_scale_rotation_translation(
+                                    Vec3::splat(chunk.scale),
+                                    chunk.rotation,
+                                    chunk.position,
+                                );
+                                // Darken tint for burnt/scorched look
+                                let tint = [
+                                    d.drone_tint[0] * 0.4,
+                                    d.drone_tint[1] * 0.3,
+                                    d.drone_tint[2] * 0.3,
+                                    1.0,
+                                ];
+                                let mut chunk_mat = MaterialUniform::metal(tint)
+                                    .with_model(chunk_model.to_cols_array_2d());
+                                chunk_mat.params = [0.95, 0.05, 0.0, 0.0]; // rough, barely metallic
+                                ctx.queue.write_buffer(&mat.buffer, 0, bytemuck::bytes_of(&chunk_mat));
+                                pass.set_bind_group(0, &mat.bind_group, &[]);
+                                pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                                pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                                pass.draw_indexed(0..mesh.num_indices, 0, 0..1);
+                            }
                         }
                     }
                     continue;
@@ -2428,6 +2442,15 @@ impl ApplicationHandler for App {
         let pib = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("Prop IB"), contents: bytemuck::cast_slice(&pi), usage: wgpu::BufferUsages::INDEX });
         self.prop_mesh = Some(GpuMesh { vertex_buffer: pvb, index_buffer: pib, num_indices: pi.len() as u32 });
 
+        // Debris chunk meshes (7 unique random shapes)
+        self.debris_meshes.clear();
+        for seed in 0..7_u32 {
+            let (dv, di) = drone::generate_debris_chunk(seed * 7919 + 1);
+            let vb = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("Debris VB"), contents: bytemuck::cast_slice(&dv), usage: wgpu::BufferUsages::VERTEX });
+            let ib = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("Debris IB"), contents: bytemuck::cast_slice(&di), usage: wgpu::BufferUsages::INDEX });
+            self.debris_meshes.push(GpuMesh { vertex_buffer: vb, index_buffer: ib, num_indices: di.len() as u32 });
+        }
+
         // Create materials for the default drone (drones[0])
         {
             let (buf, bg) = pbr.create_material_bind_group(&ctx.device);
@@ -2768,8 +2791,8 @@ impl ApplicationHandler for App {
                                     scale: s,
                                     age: 0.0,
                                     on_ground: false,
+                                    mesh_idx: chunk_i as usize % 7,
                                 });
-                                let _ = chunk_i;
                             }
                             // Freeze camera if this is the primary drone
                             if di == self.primary_drone && !self.impact_cam_frozen {
@@ -2872,7 +2895,7 @@ impl ApplicationHandler for App {
                     -self.wind.y as f32,
                 );
                 if let Some(ps) = &mut self.particle_system {
-                    ps.update(frame_dt as f32, wind_render);
+                    ps.update(frame_dt as f32, wind_render, |x, z| terrain::terrain_height_visual(x, z));
                     let view_mat = self.camera.view_matrix();
                     let cam_right = Vec3::new(view_mat.x_axis.x, view_mat.y_axis.x, view_mat.z_axis.x);
                     let cam_up = Vec3::new(view_mat.x_axis.y, view_mat.y_axis.y, view_mat.z_axis.y);
