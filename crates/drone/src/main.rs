@@ -20,7 +20,7 @@ use simuforge_render::camera::{CameraUniform, OrbitCamera};
 use simuforge_render::context::RenderContext;
 use simuforge_render::pipelines::composite::{CompositePipeline, CompositeParams};
 use simuforge_render::pipelines::line::{LinePipeline, LineVertex};
-use simuforge_render::pipelines::pbr::{LightUniform, MaterialUniform, PbrPipeline};
+use simuforge_render::pipelines::pbr::{LightUniform, MaterialUniform, PbrPipeline, PbrTexturedPipeline};
 use simuforge_render::pipelines::shadow::ShadowPipeline;
 use simuforge_render::pipelines::ssao::{SsaoPipeline, SsaoParams};
 use simuforge_render::pipelines::sss::{SssPipeline, SssParams};
@@ -29,11 +29,14 @@ use simuforge_audio::AudioEngine;
 
 mod drone;
 mod flight;
+mod geo;
 mod guidance;
 mod particles;
+mod real_terrain;
 mod skybox;
 mod sound;
 mod terrain;
+mod tile_fetch;
 
 use flight::FlightState;
 use guidance::{FlightPhase, Guidance};
@@ -46,7 +49,7 @@ const MAX_FRAME_TIME: f64 = 0.1;
 /// Maximum physics steps per frame.
 const MAX_STEPS_PER_FRAME: u64 = 4000;
 
-/// Path to the HDR skybox.
+/// Path to the HDR skybox (day). Night sky is fully procedural in the shader.
 const HDR_PATH: &str = "assets/hdrs/kloppenheim_06_puresky_4k.hdr";
 
 /// Coordinate swap: DH Z-up physics -> Y-up renderer.
@@ -320,6 +323,14 @@ struct App {
     ssao_bind_group: Option<wgpu::BindGroup>,
     sss_bind_group: Option<wgpu::BindGroup>,
     composite_bind_group: Option<wgpu::BindGroup>,
+    // Night mode + FLIR night vision
+    night_mode: bool,
+    flir_mode: bool,
+    night_brightness: f32,
+    // Real-world terrain (Mapbox tiles)
+    real_terrain: Option<real_terrain::RealTerrainManager>,
+    pbr_textured_pipeline: Option<PbrTexturedPipeline>,
+    shadow_textured_pipeline: Option<wgpu::RenderPipeline>,
 }
 
 impl App {
@@ -433,6 +444,12 @@ impl App {
             ssao_bind_group: None,
             sss_bind_group: None,
             composite_bind_group: None,
+            night_mode: false,
+            flir_mode: false,
+            night_brightness: 0.3,
+            real_terrain: None,
+            pbr_textured_pipeline: None,
+            shadow_textured_pipeline: None,
         }
     }
 
@@ -486,6 +503,17 @@ impl App {
         self.ground_cam_fov = std::f32::consts::FRAC_PI_4;
     }
 
+    /// Query terrain height at render-space (rx, rz).
+    /// Uses real terrain if available, falls back to procedural.
+    fn terrain_height_at(&self, rx: f32, rz: f32) -> f32 {
+        if let Some(rt) = &self.real_terrain {
+            if let Some(h) = rt.terrain_height(rx, rz) {
+                return h;
+            }
+        }
+        terrain::terrain_height_visual(rx, rz)
+    }
+
     /// Update camera based on current mode and drone position.
     fn update_camera(&mut self) {
         let pi = self.primary_drone.min(self.drones.len().saturating_sub(1));
@@ -537,7 +565,7 @@ impl App {
             }
             CameraMode::Ground => {
                 // Ground observer: first-person, always above terrain surface
-                let ground_y = terrain::terrain_height(self.ground_cam_pos.x, self.ground_cam_pos.z);
+                let ground_y = self.terrain_height_at(self.ground_cam_pos.x, self.ground_cam_pos.z);
                 let eye_height = (ground_y + 1.7).max(1.7); // always at least 1.7m above sea level
                 let eye_pos = Vec3::new(self.ground_cam_pos.x, eye_height, self.ground_cam_pos.z);
                 // Look direction from yaw/pitch
@@ -572,13 +600,29 @@ impl App {
         let cam_uniform = CameraUniform::from_camera(&self.camera, ctx.aspect());
         pbr.update_camera(&ctx.queue, &cam_uniform);
 
-        // Light — desert sunlight (toned down to avoid washout)
-        let light_dir = Vec3::new(-0.3, -0.8, -0.5).normalize();
+        // Light — desert sunlight or moonlight depending on night mode
+        let night_blend = if self.night_mode { 1.0_f32 } else { 0.0_f32 };
+        let nb = self.night_brightness; // 0.0 = pitch black, 1.0 = bright moonlit
+        let (light_dir, light_color, light_ambient) = if self.night_mode {
+            (
+                Vec3::new(0.1, -0.3, -0.5).normalize(),
+                [0.6, 0.65, 0.85, 0.3 * nb],       // cool blue moonlight scaled by brightness
+                [0.08, 0.10, 0.18, 0.15 * nb],      // dark blue ambient scaled
+            )
+        } else {
+            (
+                Vec3::new(-0.3, -0.8, -0.5).normalize(),
+                [1.0, 0.95, 0.85, 2.5],
+                [0.45, 0.42, 0.35, 0.3],
+            )
+        };
+        let mut eye_pos_with_night = cam_uniform.eye_pos;
+        eye_pos_with_night[3] = night_blend;
         let light = LightUniform {
             direction: [light_dir.x, light_dir.y, light_dir.z, 0.0],
-            color: [1.0, 0.95, 0.85, 2.5],
-            ambient: [0.45, 0.42, 0.35, 0.3],
-            eye_pos: cam_uniform.eye_pos,
+            color: light_color,
+            ambient: light_ambient,
+            eye_pos: eye_pos_with_night,
         };
         pbr.update_light(&ctx.queue, &light);
 
@@ -592,19 +636,28 @@ impl App {
             ctx.queue.write_buffer(&m.buffer, 0, bytemuck::bytes_of(&mat));
         }
 
+        // Real terrain material (identity model, albedo comes from texture)
+        if let Some(rt) = &self.real_terrain {
+            let mat = MaterialUniform::metal([1.0, 1.0, 1.0, 1.0])
+                .with_model(Mat4::IDENTITY.to_cols_array_2d());
+            ctx.queue.write_buffer(&rt.material_buffer, 0, bytemuck::bytes_of(&mat));
+        }
+
         // Update skybox: compute inverse VP on CPU and upload with exposure
         if let Some(sky) = &self.skybox_pipeline {
             let view = self.camera.view_matrix();
             let proj = self.camera.projection_matrix(ctx.aspect());
             let vp = proj * view;
             let inv_vp = vp.inverse();
-            sky.update(&ctx.queue, inv_vp, self.sky_exposure, self.horizon_dust);
+            let effective_exposure = if self.night_mode { 0.02 * self.night_brightness } else { self.sky_exposure };
+            let effective_dust = if self.night_mode { 0.3 } else { self.horizon_dust };
+            sky.update(&ctx.queue, inv_vp, effective_exposure, effective_dust, night_blend);
         }
 
         // Sandstone hut at target center, sitting on terrain
         let hut_render_x = 50_000.0_f32;
         let hut_render_z = 0.0_f32;
-        let hut_ground_y = terrain::terrain_height_visual(hut_render_x, hut_render_z);
+        let hut_ground_y = self.terrain_height_at(hut_render_x, hut_render_z);
         let building_render = Vec3::new(hut_render_x, hut_ground_y, hut_render_z);
         let building_model = Mat4::from_translation(building_render);
         let roof_model = building_model; // same origin, roof is offset in mesh
@@ -673,8 +726,8 @@ impl App {
             }
         }
         // Upload per-drone materials
-        let thermal_emission = if self.thermal_mode { 1.0_f32 } else { 0.0 };
-        let prop_thermal = if self.thermal_mode { 1.5_f32 } else { 0.0 };
+        let thermal_emission = if self.thermal_mode || self.flir_mode { 1.0_f32 } else { 0.0 };
+        let prop_thermal = if self.thermal_mode || self.flir_mode { 1.5_f32 } else { 0.0 };
         for (i, d) in self.drones.iter().enumerate() {
             if let Some(m) = &d.drone_material {
                 let mut mat = MaterialUniform::metal(d.drone_tint)
@@ -718,10 +771,11 @@ impl App {
             ctx.queue.write_buffer(&m.buffer, 0, bytemuck::bytes_of(&mat));
         }
 
-        // Composite params (thermal mode)
+        // Composite params (thermal / FLIR modes)
         if let Some(composite) = &self.composite_pipeline {
             let cp = CompositeParams {
                 thermal_mode: if self.thermal_mode { 1.0 } else { 0.0 },
+                flir_mode: if self.flir_mode { 1.0 } else { 0.0 },
                 ..CompositeParams::default()
             };
             composite.update_params(&ctx.queue, &cp);
@@ -953,6 +1007,22 @@ impl App {
                 }
                 si += 1;
             }
+
+            // Real terrain tiles (textured vertex layout — switch pipeline)
+            if let Some(shadow_tex_pipe) = &self.shadow_textured_pipeline {
+                if let Some(rt) = &self.real_terrain {
+                    if !rt.tiles.is_empty() {
+                        pass.set_pipeline(shadow_tex_pipe);
+                        // Use slot 0 (identity model) for terrain tiles — they are world-space
+                        pass.set_bind_group(0, &shadow.bind_group, &[ShadowPipeline::dynamic_offset(0)]);
+                        for tile in rt.tiles.values() {
+                            pass.set_vertex_buffer(0, tile.vertex_buffer.slice(..));
+                            pass.set_index_buffer(tile.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                            pass.draw_indexed(0..tile.num_indices, 0, 0..1);
+                        }
+                    }
+                }
+            }
         }
 
         // Pass 3: PBR -> HDR
@@ -991,13 +1061,33 @@ impl App {
                 };
             }
 
-            // Terrain (single draw call for all tiles)
-            if let (Some(vb), Some(ib), Some(mat)) = (&self.terrain_vb, &self.terrain_ib, &self.terrain_material) {
-                if self.terrain_num_indices > 0 {
-                    pass.set_bind_group(0, &mat.bind_group, &[]);
-                    pass.set_vertex_buffer(0, vb.slice(..));
-                    pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..self.terrain_num_indices, 0, 0..1);
+            // Terrain: real terrain tiles (textured) or procedural fallback
+            let has_real_terrain = self.real_terrain.as_ref().map_or(false, |rt| rt.is_active());
+            if has_real_terrain {
+                // Switch to textured pipeline for real terrain tiles
+                if let (Some(tp), Some(rt)) = (&self.pbr_textured_pipeline, &self.real_terrain) {
+                    pass.set_pipeline(&tp.pipeline);
+                    pass.set_bind_group(0, &rt.material_bind_group, &[]);
+                    pass.set_bind_group(1, &pbr.shadow_bind_group, &[]);
+                    for tile in rt.tiles.values() {
+                        pass.set_bind_group(2, &tile.texture_bind_group, &[]);
+                        pass.set_vertex_buffer(0, tile.vertex_buffer.slice(..));
+                        pass.set_index_buffer(tile.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..tile.num_indices, 0, 0..1);
+                    }
+                    // Switch back to standard pipeline for remaining objects
+                    pass.set_pipeline(&pbr.pipeline);
+                    pass.set_bind_group(1, &pbr.shadow_bind_group, &[]);
+                }
+            } else {
+                // Procedural terrain (single draw call for all tiles)
+                if let (Some(vb), Some(ib), Some(mat)) = (&self.terrain_vb, &self.terrain_ib, &self.terrain_material) {
+                    if self.terrain_num_indices > 0 {
+                        pass.set_bind_group(0, &mat.bind_group, &[]);
+                        pass.set_vertex_buffer(0, vb.slice(..));
+                        pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+                        pass.draw_indexed(0..self.terrain_num_indices, 0, 0..1);
+                    }
                 }
             }
 
@@ -1225,6 +1315,9 @@ impl App {
         let mut yolo = self.yolo_tracking;
         let mut trails = self.show_trails;
         let mut outlines = self.show_drone_outlines;
+        let mut night = self.night_mode;
+        let mut flir = self.flir_mode;
+        let mut night_bright = self.night_brightness;
         let primary_flight = &self.drones[pi].flight;
         let primary_guidance = &self.drones[pi].guidance;
         draw_mission_control(
@@ -1234,13 +1327,16 @@ impl App {
             &mut new_wind_speed, &mut new_wind_dir,
             &mut new_master_vol, &mut new_engine_muted,
             &mut thermal, &mut yolo, &mut trails, &mut outlines,
-            self.drones.len(), pi,
+            self.drones.len(), pi, &mut night, &mut flir, &mut night_bright,
         );
         self.camera_mode = cam_mode;
         self.thermal_mode = thermal;
         self.yolo_tracking = yolo;
         self.show_trails = trails;
         self.show_drone_outlines = outlines;
+        self.night_mode = night;
+        self.flir_mode = flir;
+        self.night_brightness = night_bright;
         let minimap_click = draw_minimap(
             &self.egui_ctx, &self.drones,
             &self.wind, self.camera_mode, &self.ground_cam_pos, self.ground_cam_yaw,
@@ -1362,6 +1458,9 @@ fn draw_mission_control(
     show_drone_outlines: &mut bool,
     fleet_size: usize,
     primary_idx: usize,
+    night_mode: &mut bool,
+    flir_mode: &mut bool,
+    night_brightness: &mut f32,
 ) {
     egui::Window::new("Mission Control")
         .default_pos(egui::pos2(10.0, 10.0))
@@ -1407,6 +1506,18 @@ fn draw_mission_control(
 
             // ── Settings ──
             ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Night Mode (N)").size(13.0));
+                ui.checkbox(night_mode, "");
+            });
+            if *night_mode {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("FLIR Vision (V)").size(13.0));
+                    ui.checkbox(flir_mode, "");
+                });
+                ui.label(egui::RichText::new("Night Brightness").size(13.0));
+                ui.add(egui::Slider::new(night_brightness, 0.05..=1.0).text(""));
+            }
             ui.label(egui::RichText::new("Sky Exposure").size(13.0));
             ui.add(egui::Slider::new(sky_exposure, 0.05..=3.0).logarithmic(true).text(""));
 
@@ -2334,6 +2445,7 @@ impl ApplicationHandler for App {
         let composite = CompositePipeline::new(&ctx);
 
         // Skybox (self-contained — has its own uniform buffer for inv_vp + exposure)
+        // Night sky is fully procedural in the shader, no separate HDR needed.
         let skybox = SkyboxPipeline::new(&ctx, HDR_PATH);
 
         // egui
@@ -2364,6 +2476,28 @@ impl ApplicationHandler for App {
         sss_params.strength = 0.0;
         sss.update_params(&ctx.queue, &sss_params);
         composite.update_params(&ctx.queue, &CompositeParams::default());
+
+        // Textured pipelines for real terrain
+        let pbr_textured = PbrTexturedPipeline::new(&ctx, &pbr);
+        let shadow_textured = shadow.create_textured_variant(&ctx);
+        self.pbr_textured_pipeline = Some(pbr_textured);
+        self.shadow_textured_pipeline = Some(shadow_textured);
+
+        // Real-world terrain (if MAPBOX_ACCESS_TOKEN is set)
+        if let Some(mapbox_config) = tile_fetch::MapboxConfig::from_env() {
+            // Origin: Iranian desert (Dasht-e Kavir / Great Salt Desert)
+            let origin = geo::GeoOrigin::from_degrees(34.0, 54.0);
+            let rt = real_terrain::RealTerrainManager::new(
+                &ctx.device,
+                mapbox_config,
+                origin,
+                &pbr,
+            );
+            eprintln!("[terrain] Real-world terrain enabled (Mapbox)");
+            self.real_terrain = Some(rt);
+        } else {
+            eprintln!("[terrain] No MAPBOX_ACCESS_TOKEN — using procedural terrain");
+        }
 
         // --- GPU meshes ---
         use wgpu::util::DeviceExt;
@@ -2551,9 +2685,22 @@ impl ApplicationHandler for App {
                             if !self.fleet_plan.launch_positions.is_empty() {
                                 self.pending_fleet_launch = true;
                             } else {
-                                // Launch default single drone
-                                for d in &mut self.drones {
-                                    d.guidance.launch();
+                                // Adjust spawn height to be above terrain, then launch
+                                {
+                                    let rt_ref = self.real_terrain.as_ref();
+                                    for d in &mut self.drones {
+                                        let rx = d.flight.position.x as f32;
+                                        let rz = -(d.flight.position.y as f32);
+                                        let ground_z = if let Some(rt) = rt_ref {
+                                            rt.terrain_height(rx, rz).unwrap_or_else(|| terrain::terrain_height_visual(rx, rz))
+                                        } else {
+                                            terrain::terrain_height_visual(rx, rz)
+                                        } as f64;
+                                        if d.flight.position.z < ground_z + 1.0 {
+                                            d.flight.position.z = ground_z + 1.0;
+                                        }
+                                        d.guidance.launch();
+                                    }
                                 }
                                 if !self.audio_started {
                                     let ev = Arc::new(Mutex::new(sound::EngineVoice::new()));
@@ -2584,6 +2731,19 @@ impl ApplicationHandler for App {
                     }
                     Key::Character(ref c) if c.as_str() == "m" => {
                         self.fullscreen_map = !self.fullscreen_map;
+                    }
+                    Key::Character(ref c) if c.as_str() == "n" => {
+                        self.night_mode = !self.night_mode;
+                        // Auto-disable FLIR when leaving night mode
+                        if !self.night_mode {
+                            self.flir_mode = false;
+                        }
+                    }
+                    Key::Character(ref c) if c.as_str() == "v" => {
+                        // FLIR night vision — only available in night mode
+                        if self.night_mode {
+                            self.flir_mode = !self.flir_mode;
+                        }
                     }
                     Key::Character(ref c) if c.as_str() == "1" => self.time_scale = 1.0,
                     Key::Character(ref c) if c.as_str() == "2" => self.time_scale = 10.0,
@@ -2662,7 +2822,11 @@ impl ApplicationHandler for App {
                     if !positions.is_empty() {
                         self.drones.clear();
                         for (i, pos) in positions.iter().enumerate() {
-                            let launch = nalgebra::Vector3::new(pos[0], pos[1], 1.0);
+                            // Place drone above terrain at launch position
+                            let ground_z = self.terrain_height_at(
+                                pos[0] as f32, -(pos[1] as f32),
+                            ) as f64;
+                            let launch = nalgebra::Vector3::new(pos[0], pos[1], ground_z + 1.0);
                             let heading = (guidance::TARGET_POS.x - pos[0]).atan2(guidance::TARGET_POS.y - pos[1]);
                             let mut di = DroneInstance {
                                 flight: FlightState::new_at(launch, heading),
@@ -2711,12 +2875,38 @@ impl ApplicationHandler for App {
                     }
                 }
 
+                // Snap pre-launch drones to terrain so they don't float or clip ground
+                {
+                    let rt_ref = self.real_terrain.as_ref();
+                    for d in &mut self.drones {
+                        if d.guidance.phase == FlightPhase::PreLaunch {
+                            let rx = d.flight.position.x as f32;
+                            let rz = -(d.flight.position.y as f32);
+                            let ground_z = if let Some(rt) = rt_ref {
+                                rt.terrain_height(rx, rz).unwrap_or_else(|| terrain::terrain_height_visual(rx, rz))
+                            } else {
+                                terrain::terrain_height_visual(rx, rz)
+                            } as f64;
+                            d.flight.position.z = ground_z + 1.0;
+                        }
+                    }
+                }
+
                 // Physics loop — all drones
                 let any_active = self.drones.iter().any(|d| {
                     d.guidance.phase != FlightPhase::Impact && d.guidance.phase != FlightPhase::PreLaunch
                 });
                 if !self.paused && any_active {
                     self.accumulator += frame_dt * effective_scale;
+                    let rt_ref = self.real_terrain.as_ref();
+                    let height_fn = |rx: f32, rz: f32| -> f32 {
+                        if let Some(rt) = rt_ref {
+                            if let Some(h) = rt.terrain_height(rx, rz) {
+                                return h;
+                            }
+                        }
+                        terrain::terrain_height_visual(rx, rz)
+                    };
                     let mut steps = 0u64;
                     while self.accumulator >= PHYSICS_DT && steps < MAX_STEPS_PER_FRAME {
                         let mut all_done = true;
@@ -2726,15 +2916,13 @@ impl ApplicationHandler for App {
                                 continue;
                             }
                             all_done = false;
-                            let (thrust, pitch_cmd, bank_cmd) = d.guidance.update(&d.flight);
-                            flight::step(&mut d.flight, thrust, pitch_cmd, bank_cmd, &self.wind);
-
-                            // Terrain-aware ground check using visual mesh interpolation
-                            // DH (x,y,z) → render (x,z,-y)
-                            let ground_z = terrain::terrain_height_visual(
+                            // Query terrain height below drone (DH→render: rx=x, rz=-y)
+                            let ground_z = height_fn(
                                 d.flight.position.x as f32,
                                 -(d.flight.position.y as f32),
                             ) as f64;
+                            let (thrust, pitch_cmd, bank_cmd) = d.guidance.update(&d.flight, ground_z);
+                            flight::step(&mut d.flight, thrust, pitch_cmd, bank_cmd, &self.wind);
                             if d.flight.position.z <= ground_z + 0.1 {
                                 // Clamp to ground surface
                                 d.flight.position.z = ground_z;
@@ -2887,6 +3075,15 @@ impl ApplicationHandler for App {
                     }
                 }
 
+                // Update real terrain tile streaming
+                if let (Some(rt), Some(ctx), Some(tp)) = (
+                    &mut self.real_terrain,
+                    &self.render_ctx,
+                    &self.pbr_textured_pipeline,
+                ) {
+                    rt.update(&ctx.device, &ctx.queue, cam.x, cam.z, tp);
+                }
+
                 // Update + upload explosion particles (wall-clock dt for smooth visuals)
                 // Convert DH wind (x,y,z) → render-space (x,z,-y)
                 let wind_render = Vec3::new(
@@ -2894,8 +3091,16 @@ impl ApplicationHandler for App {
                     self.wind.z as f32,
                     -self.wind.y as f32,
                 );
+                let rt_ref2 = self.real_terrain.as_ref();
                 if let Some(ps) = &mut self.particle_system {
-                    ps.update(frame_dt as f32, wind_render, |x, z| terrain::terrain_height_visual(x, z));
+                    ps.update(frame_dt as f32, wind_render, |x, z| {
+                        if let Some(rt) = rt_ref2 {
+                            if let Some(h) = rt.terrain_height(x, z) {
+                                return h;
+                            }
+                        }
+                        terrain::terrain_height_visual(x, z)
+                    });
                     let view_mat = self.camera.view_matrix();
                     let cam_right = Vec3::new(view_mat.x_axis.x, view_mat.y_axis.x, view_mat.z_axis.x);
                     let cam_up = Vec3::new(view_mat.x_axis.y, view_mat.y_axis.y, view_mat.z_axis.y);
@@ -2906,6 +3111,7 @@ impl ApplicationHandler for App {
 
                 // Update debris chunks (wall-clock dt)
                 let debris_dt = frame_dt as f32;
+                let rt_ref3 = self.real_terrain.as_ref();
                 for d in &mut self.drones {
                     for chunk in &mut d.debris {
                         if chunk.on_ground { continue; }
@@ -2921,7 +3127,13 @@ impl ApplicationHandler for App {
                         }
                         chunk.angular_vel *= 1.0 - 0.5 * debris_dt;
                         // Ground bounce
-                        let ground_y = terrain::terrain_height_visual(chunk.position.x, chunk.position.z);
+                        let ground_y = {
+                            let mut h = None;
+                            if let Some(rt) = rt_ref3 {
+                                h = rt.terrain_height(chunk.position.x, chunk.position.z);
+                            }
+                            h.unwrap_or_else(|| terrain::terrain_height_visual(chunk.position.x, chunk.position.z))
+                        };
                         if chunk.position.y < ground_y {
                             chunk.position.y = ground_y;
                             if chunk.velocity.y.abs() < 2.0 {
@@ -2955,7 +3167,39 @@ impl ApplicationHandler for App {
     }
 }
 
+/// Load .env file from the project root (walks up from exe or cwd).
+fn load_dotenv() {
+    // Try cwd first, then walk up to find .env
+    let mut dir = std::env::current_dir().unwrap_or_default();
+    for _ in 0..5 {
+        let candidate = dir.join(".env");
+        if candidate.is_file() {
+            if let Ok(contents) = std::fs::read_to_string(&candidate) {
+                for line in contents.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    if let Some((key, val)) = line.split_once('=') {
+                        let key = key.trim();
+                        let val = val.trim();
+                        // Don't override existing env vars
+                        if std::env::var(key).is_err() {
+                            std::env::set_var(key, val);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+}
+
 fn main() {
+    load_dotenv();
     let event_loop = EventLoop::new().expect("Failed to create event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::new();
@@ -2988,13 +3232,13 @@ mod tests {
                 break;
             }
 
-            let (thrust, pitch_cmd, bank_cmd) = guide.update(&state);
-            flight::step(&mut state, thrust, pitch_cmd, bank_cmd, &wind);
-
             // Terrain check FIRST (before guidance phase-break), same as main loop
             let render_wx = state.position.x as f32;
             let render_wz = -(state.position.y as f32);
             let ground_z_visual = terrain::terrain_height_visual(render_wx, render_wz) as f64;
+
+            let (thrust, pitch_cmd, bank_cmd) = guide.update(&state, ground_z_visual);
+            flight::step(&mut state, thrust, pitch_cmd, bank_cmd, &wind);
 
             if state.position.z <= ground_z_visual + 0.1 {
                 state.position.z = ground_z_visual;

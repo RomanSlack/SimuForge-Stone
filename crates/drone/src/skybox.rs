@@ -1,19 +1,22 @@
-//! Equirectangular HDR skybox with adjustable exposure.
+//! Equirectangular HDR skybox with adjustable exposure and procedural night sky.
 //!
+//! Day: bicubic-sampled HDR environment map.
+//! Night: fully procedural in the shader (stars, milky way, moon).
 //! Inverse view-projection matrix computed on CPU (no shader matrix inverse).
 //! Uses FLOAT32_FILTERABLE for bilinear-filtered HDR sampling.
 
 use simuforge_render::context::RenderContext;
 use wgpu::util::DeviceExt;
 
-/// GPU sky uniforms: inv_vp + exposure + horizon_dust.
+/// GPU sky uniforms: inv_vp + exposure + horizon_dust + night_blend.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct SkyUniforms {
     pub inv_view_proj: [[f32; 4]; 4],
     pub exposure: f32,
     pub horizon_dust: f32,
-    pub _pad: [f32; 2],
+    pub night_blend: f32,
+    pub _pad: f32,
 }
 
 pub struct SkyboxPipeline {
@@ -86,7 +89,8 @@ impl SkyboxPipeline {
             inv_view_proj: glam::Mat4::IDENTITY.to_cols_array_2d(),
             exposure: 0.4,
             horizon_dust: 0.5,
-            _pad: [0.0; 2],
+            night_blend: 0.0,
+            _pad: 0.0,
         };
         let uniform_buffer = ctx.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Sky Uniforms"),
@@ -102,7 +106,6 @@ impl SkyboxPipeline {
         let bgl = ctx.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Skybox BGL"),
             entries: &[
-                // Sky uniforms (inv_vp + exposure)
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
@@ -113,7 +116,6 @@ impl SkyboxPipeline {
                     },
                     count: None,
                 },
-                // HDR texture (filterable float32)
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -124,7 +126,6 @@ impl SkyboxPipeline {
                     },
                     count: None,
                 },
-                // Sampler
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
@@ -177,13 +178,14 @@ impl SkyboxPipeline {
         Self { pipeline, bind_group, uniform_buffer }
     }
 
-    /// Upload inverse VP, exposure, and horizon dust to GPU. Call once per frame before render.
-    pub fn update(&self, queue: &wgpu::Queue, inv_view_proj: glam::Mat4, exposure: f32, horizon_dust: f32) {
+    /// Upload inverse VP, exposure, horizon dust, and night blend to GPU.
+    pub fn update(&self, queue: &wgpu::Queue, inv_view_proj: glam::Mat4, exposure: f32, horizon_dust: f32, night_blend: f32) {
         let uniforms = SkyUniforms {
             inv_view_proj: inv_view_proj.to_cols_array_2d(),
             exposure,
             horizon_dust,
-            _pad: [0.0; 2],
+            night_blend,
+            _pad: 0.0,
         };
         queue.write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
     }

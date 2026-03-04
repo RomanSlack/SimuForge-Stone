@@ -1,7 +1,7 @@
 //! Shadow map depth pass pipeline.
 
 use crate::context::RenderContext;
-use crate::mesh::vertex_buffer_layout;
+use crate::mesh::{textured_vertex_buffer_layout, vertex_buffer_layout};
 
 /// Shadow map resolution.
 pub const SHADOW_MAP_SIZE: u32 = 2048;
@@ -194,5 +194,60 @@ impl ShadowPipeline {
     /// Dynamic offset for the i-th shadow object.
     pub fn dynamic_offset(index: usize) -> u32 {
         (index * UNIFORM_ALIGNMENT) as u32
+    }
+
+    /// Create a shadow pipeline variant that accepts TexturedVertex layout.
+    /// Reuses the same shadow shader (only reads position, ignores UV).
+    /// Shares depth texture, sampler, bind group layout, and matrix buffer.
+    pub fn create_textured_variant(&self, ctx: &RenderContext) -> wgpu::RenderPipeline {
+        let shader =
+            ctx.device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("Shadow Shader (textured variant)"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        include_str!("../shaders/shadow.wgsl").into(),
+                    ),
+                });
+
+        let pipeline_layout =
+            ctx.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("Shadow Textured Pipeline Layout"),
+                    bind_group_layouts: &[&self.bind_group_layout],
+                    push_constant_ranges: &[],
+                });
+
+        ctx.device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Shadow Textured Pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[textured_vertex_buffer_layout()],
+                    compilation_options: Default::default(),
+                },
+                fragment: None,
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: Some(wgpu::Face::Back),
+                    ..Default::default()
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: true,
+                    depth_compare: wgpu::CompareFunction::Less,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState {
+                        constant: 2,
+                        slope_scale: 2.0,
+                        clamp: 0.0,
+                    },
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            })
     }
 }

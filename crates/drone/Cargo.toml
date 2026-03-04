@@ -16,4 +16,5 @@ pollster = "0.4"
 egui = { workspace = true }
 egui-wgpu = { workspace = true }
 egui-winit = { workspace = true }
-image = { version = "0.25", default-features = false, features = ["hdr", "rayon"] }
+image = { version = "0.25", default-features = false, features = ["hdr", "rayon", "png", "jpeg"] }
+ureq = "2"

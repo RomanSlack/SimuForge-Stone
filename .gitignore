@@ -21,3 +21,4 @@ target
 #.idea/
 /assets/models/
 /assets/hdrs/
+.env

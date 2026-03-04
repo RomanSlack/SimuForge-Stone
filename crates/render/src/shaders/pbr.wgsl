@@ -288,9 +288,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Distance fade for terrain: blend to hazy horizon color at tile edges
     if (material.params.w > 0.5) {
         let dist = length(in.world_pos.xyz - camera.eye_pos.xyz);
-        // Fade starts at 3km, fully hazed at 5km
-        let haze_factor = smoothstep(3000.0, 5000.0, dist);
-        let haze_color = vec3<f32>(0.72, 0.68, 0.58); // warm dusty horizon
+        let haze_factor = smoothstep(8000.0, 15000.0, dist);
+        let night_blend = light.eye_pos.w;
+        let day_haze = vec3<f32>(0.72, 0.68, 0.58);
+        let night_haze = vec3<f32>(0.03, 0.04, 0.08);
+        let haze_color = mix(day_haze, night_haze, night_blend);
         color = mix(color, haze_color, haze_factor);
     }
 

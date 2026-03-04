@@ -2,7 +2,7 @@
 
 use crate::camera::CameraUniform;
 use crate::context::{RenderContext, DEPTH_FORMAT, HDR_FORMAT};
-use crate::mesh::vertex_buffer_layout;
+use crate::mesh::{textured_vertex_buffer_layout, vertex_buffer_layout};
 use crate::pipelines::shadow::ShadowPipeline;
 
 /// Light uniform data.
@@ -381,5 +381,133 @@ impl PbrPipeline {
             ],
         });
         (material_buffer, bind_group)
+    }
+}
+
+/// PBR render pipeline for textured terrain (satellite imagery).
+///
+/// Shares group 0 (camera/light/material) and group 1 (shadow) layouts with PbrPipeline.
+/// Adds group 2 for per-tile satellite texture + sampler.
+pub struct PbrTexturedPipeline {
+    pub pipeline: wgpu::RenderPipeline,
+    pub texture_bind_group_layout: wgpu::BindGroupLayout,
+}
+
+impl PbrTexturedPipeline {
+    /// Create the textured PBR pipeline. Shares camera/light/material from `pbr`
+    /// and shadow resources from `shadow`.
+    pub fn new(ctx: &RenderContext, pbr: &PbrPipeline) -> Self {
+        let shader =
+            ctx.device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("PBR Textured Shader"),
+                    source: wgpu::ShaderSource::Wgsl(
+                        include_str!("../shaders/pbr_textured.wgsl").into(),
+                    ),
+                });
+
+        // Group 2: satellite texture + sampler
+        let texture_bind_group_layout =
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("PBR Textured Bind Group Layout (group 2)"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                    ],
+                });
+
+        let pipeline_layout =
+            ctx.device
+                .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                    label: Some("PBR Textured Pipeline Layout"),
+                    bind_group_layouts: &[
+                        &pbr.bind_group_layout,
+                        &pbr.shadow_bind_group_layout,
+                        &texture_bind_group_layout,
+                    ],
+                    push_constant_ranges: &[],
+                });
+
+        let pipeline =
+            ctx.device
+                .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("PBR Textured Pipeline"),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs_main"),
+                        buffers: &[textured_vertex_buffer_layout()],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fs_main"),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: HDR_FORMAT,
+                            blend: Some(wgpu::BlendState::REPLACE),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        front_face: wgpu::FrontFace::Ccw,
+                        cull_mode: Some(wgpu::Face::Back),
+                        ..Default::default()
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: DEPTH_FORMAT,
+                        depth_write_enabled: true,
+                        depth_compare: wgpu::CompareFunction::Less,
+                        stencil: wgpu::StencilState::default(),
+                        bias: wgpu::DepthBiasState::default(),
+                    }),
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview: None,
+                    cache: None,
+                });
+
+        Self {
+            pipeline,
+            texture_bind_group_layout,
+        }
+    }
+
+    /// Create a bind group for a satellite texture tile.
+    pub fn create_texture_bind_group(
+        &self,
+        device: &wgpu::Device,
+        texture_view: &wgpu::TextureView,
+        sampler: &wgpu::Sampler,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Satellite Texture Bind Group"),
+            layout: &self.texture_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(sampler),
+                },
+            ],
+        })
     }
 }

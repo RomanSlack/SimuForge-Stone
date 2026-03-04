@@ -16,7 +16,10 @@ pub struct CompositeParams {
     pub sss_strength: f32,
     /// Thermal IR vision mode (0.0 = off, 1.0 = on).
     pub thermal_mode: f32,
-    pub _pad: [f32; 3],
+    /// FLIR / military night vision mode (0.0 = off, 1.0 = on).
+    /// White-hot grayscale with noise grain, scanlines, vignette.
+    pub flir_mode: f32,
+    pub _pad: [f32; 2],
 }
 
 impl Default for CompositeParams {
@@ -27,7 +30,8 @@ impl Default for CompositeParams {
             ssao_strength: 0.5,
             sss_strength: 0.3,
             thermal_mode: 0.0,
-            _pad: [0.0; 3],
+            flir_mode: 0.0,
+            _pad: [0.0; 2],
         }
     }
 }

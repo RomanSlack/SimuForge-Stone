@@ -8,7 +8,7 @@
 //! GPU alloc/dealloc stalls during cutting (~10MB buffer per frame).
 
 use std::collections::HashMap;
-use simuforge_core::Vertex;
+use simuforge_core::{TexturedVertex, Vertex};
 
 /// CPU-side mesh data for one chunk.
 struct ChunkCpuMesh {
@@ -207,6 +207,34 @@ pub fn vertex_buffer_layout() -> wgpu::VertexBufferLayout<'static> {
                 offset: 12,
                 shader_location: 1,
                 format: wgpu::VertexFormat::Float32x3,
+            },
+        ],
+    }
+}
+
+/// Vertex buffer layout for TexturedVertex struct (position + normal + uv).
+pub fn textured_vertex_buffer_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<TexturedVertex>() as wgpu::BufferAddress,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &[
+            // position
+            wgpu::VertexAttribute {
+                offset: 0,
+                shader_location: 0,
+                format: wgpu::VertexFormat::Float32x3,
+            },
+            // normal
+            wgpu::VertexAttribute {
+                offset: 12,
+                shader_location: 1,
+                format: wgpu::VertexFormat::Float32x3,
+            },
+            // uv
+            wgpu::VertexAttribute {
+                offset: 24,
+                shader_location: 2,
+                format: wgpu::VertexFormat::Float32x2,
             },
         ],
     }

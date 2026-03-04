@@ -125,6 +125,15 @@ pub struct Vertex {
     pub normal: [f32; 3],
 }
 
+/// GPU-uploadable vertex with texture coordinates for textured mesh rendering.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct TexturedVertex {
+    pub position: [f32; 3],
+    pub normal: [f32; 3],
+    pub uv: [f32; 2],
+}
+
 /// GPU-uploadable per-instance transform (model matrix).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]

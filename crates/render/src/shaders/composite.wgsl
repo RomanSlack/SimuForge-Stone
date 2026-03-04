@@ -1,4 +1,4 @@
-// Final compositing with tone mapping and gamma correction
+// Final compositing with tone mapping, thermal IR, and FLIR night vision
 
 struct CompositeParams {
     exposure: f32,
@@ -6,9 +6,9 @@ struct CompositeParams {
     ssao_strength: f32,
     sss_strength: f32,
     thermal_mode: f32,
+    flir_mode: f32,
     _pad0: f32,
     _pad1: f32,
-    _pad2: f32,
 };
 
 @group(0) @binding(0) var scene_tex: texture_2d<f32>;
@@ -62,13 +62,87 @@ fn aces_tonemap(color: vec3<f32>) -> vec3<f32> {
     return clamp((color * (a * color + b)) / (color * (c * color + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
+// Pseudo-random noise for FLIR sensor grain
+fn flir_noise(uv: vec2<f32>) -> f32 {
+    return fract(sin(dot(uv, vec2<f32>(12.9898, 78.233))) * 43758.5453);
+}
+
+// FLIR white-hot: grayscale with hot objects glowing white
+fn flir_white_hot(uv: vec2<f32>, color: vec3<f32>, emission: f32) -> vec3<f32> {
+    let tex_size = vec2<f32>(textureDimensions(scene_tex));
+
+    // Base luminance from scene
+    let lum = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
+
+    // Thermal contribution: hot objects (emission > 0) glow bright
+    // Map scene brightness + thermal emission to FLIR intensity
+    let thermal_intensity = lum * 0.5 + emission * 2.0;
+    let flir_value = clamp(thermal_intensity, 0.0, 1.0);
+
+    // White-hot palette: dark grey base, bright white for hot objects
+    let cold = vec3<f32>(0.08, 0.08, 0.09);
+    let warm = vec3<f32>(0.35, 0.35, 0.37);
+    let hot = vec3<f32>(1.0, 1.0, 0.98);
+    var flir_col: vec3<f32>;
+    if (flir_value < 0.4) {
+        flir_col = mix(cold, warm, flir_value / 0.4);
+    } else {
+        flir_col = mix(warm, hot, (flir_value - 0.4) / 0.6);
+    }
+
+    // Sensor noise grain — fine pixel-level noise
+    let noise_uv = uv * tex_size * 0.5; // noise at half-pixel density
+    let grain = (flir_noise(noise_uv) - 0.5) * 0.06;
+    flir_col += vec3<f32>(grain);
+
+    // Horizontal scanlines — subtle CRT-like effect
+    let scanline_freq = tex_size.y * 0.5;
+    let scanline = sin(uv.y * scanline_freq * 3.14159) * 0.5 + 0.5;
+    let scanline_darken = 1.0 - (1.0 - scanline) * 0.08;
+    flir_col *= scanline_darken;
+
+    // Vignette — darken edges like a real FLIR optic
+    let center = uv - vec2<f32>(0.5);
+    let vignette_dist = length(center) * 1.4;
+    let vignette = 1.0 - smoothstep(0.5, 1.1, vignette_dist);
+    flir_col *= vignette;
+
+    // Slight bloom on hot objects
+    if (emission > 0.3) {
+        let bloom = emission * 0.15;
+        flir_col += vec3<f32>(bloom, bloom, bloom * 0.95);
+    }
+
+    return clamp(flir_col, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let scene = textureSample(scene_tex, tex_sampler, in.uv);
 
-    // Thermal IR mode
+    // ── FLIR night vision mode ──────────────────────────────────────
+    if (params.flir_mode > 0.5) {
+        // Sky pixels: render as dark (cold sky)
+        if (scene.a < 0.01) {
+            // Dark grey sky with slight noise
+            let sky_noise = flir_noise(in.uv * 500.0) * 0.015;
+            return vec4<f32>(0.04 + sky_noise, 0.04 + sky_noise, 0.045 + sky_noise, 1.0);
+        }
+
+        var color = scene.rgb;
+        let ao = textureSample(ssao_tex, tex_sampler, in.uv).r;
+        color = color * mix(1.0, ao, params.ssao_strength);
+        color = color * params.exposure;
+        color = aces_tonemap(color);
+        color = pow(color, vec3<f32>(1.0 / params.gamma));
+
+        let emission = max(scene.a - 1.0, 0.0);
+        let flir = flir_white_hot(in.uv, color, emission);
+        return vec4<f32>(flir, 1.0);
+    }
+
+    // ── Thermal IR mode ─────────────────────────────────────────────
     if (params.thermal_mode > 0.5) {
-        // Sky pixels: render as near-black (cold sky)
         if (scene.a < 0.01) {
             return vec4<f32>(0.02, 0.01, 0.05, 1.0);
         }
@@ -80,15 +154,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         color = aces_tonemap(color);
         color = pow(color, vec3<f32>(1.0 / params.gamma));
 
-        // Luminance from tone-mapped color
         let lum = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
-        // Thermal emission encoded in alpha (>1.0 = hot)
         let emission = max(scene.a - 1.0, 0.0);
         let thermal_value = lum * 0.3 + emission * 0.5;
         return vec4<f32>(thermal_ramp(thermal_value), 1.0);
     }
 
-    // Discard sky pixels (HDR pass outputs alpha=0 where no geometry was drawn)
+    // ── Normal rendering ────────────────────────────────────────────
     if (scene.a < 0.01) {
         discard;
     }

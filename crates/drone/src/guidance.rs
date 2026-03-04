@@ -170,7 +170,9 @@ impl Guidance {
     }
 
     /// Update guidance and return (thrust, pitch_cmd, bank_cmd).
-    pub fn update(&mut self, state: &FlightState) -> (f64, f64, f64) {
+    /// `ground_height`: terrain elevation (DH Z) directly below the drone. Used for
+    /// terrain-relative altitude hold during climb and cruise.
+    pub fn update(&mut self, state: &FlightState, ground_height: f64) -> (f64, f64, f64) {
         if self.phase == FlightPhase::PreLaunch || self.phase == FlightPhase::Impact {
             return (0.0, state.pitch, 0.0);
         }
@@ -178,6 +180,7 @@ impl Guidance {
         self.mission_time += flight::PHYSICS_DT;
 
         let dist_to_target = self.distance_to_target(&state.position);
+        let agl = state.position.z - ground_height;
 
         match self.phase {
             FlightPhase::Launch => {
@@ -198,7 +201,7 @@ impl Guidance {
                 let pitch_cmd = 10.0_f64.to_radians();
                 let bank_cmd = 0.0;
 
-                if state.altitude() >= CRUISE_ALT * 0.9 {
+                if agl >= CRUISE_ALT * 0.9 {
                     self.phase = FlightPhase::Cruise;
                 }
 
@@ -209,7 +212,7 @@ impl Guidance {
                 // Check for terminal phase
                 if dist_to_target < TERMINAL_RANGE {
                     self.phase = FlightPhase::Terminal;
-                    return self.update(state);
+                    return self.update(state, ground_height);
                 }
 
                 let thrust = THRUST_CRUISE;
@@ -238,8 +241,9 @@ impl Guidance {
                     30.0_f64.to_radians(),
                 );
 
-                // Altitude hold via pitch
-                let alt_error = CRUISE_ALT - state.altitude();
+                // Terrain-relative altitude hold: maintain CRUISE_ALT above ground
+                let target_z = ground_height + CRUISE_ALT;
+                let alt_error = target_z - state.position.z;
                 let kp_alt = 0.02;
                 let pitch_cmd = (kp_alt * alt_error).clamp(
                     -10.0_f64.to_radians(),
