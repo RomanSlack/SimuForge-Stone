@@ -13,6 +13,8 @@ cargo run --release <example gcode file>
   Alt+H toggles toolpath visualization on/off
 
 
+mv .env .env.bak && cargo run --release -p simuforge-drone; mv .env.bak .env
+
 
   https://sketchfab.com/3d-models/alexander-the-great-3dprint-daededd6d2ed414c9fafaa61aa2c348e#download
   https://sketchfab.com/3d-models/alexander-the-great-erbach-type-c7eacd05083d436da8bbc67d7a988d63

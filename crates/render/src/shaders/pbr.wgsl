@@ -271,17 +271,20 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // Grid floor pattern (activated when params.w < 0)
+    // |params.w| controls grid fade distance (default 4.0 when params.w == -1.0)
     if (material.params.w < 0.0) {
-        let gx = abs(fract(in.world_pos.x * 10.0 + 0.5) - 0.5);
-        let gz = abs(fract(in.world_pos.z * 10.0 + 0.5) - 0.5);
+        let grid_scale = select(1.0, 0.5, abs(material.params.w) > 1.5);
+        let gx = abs(fract(in.world_pos.x * grid_scale + 0.5) - 0.5);
+        let gz = abs(fract(in.world_pos.z * grid_scale + 0.5) - 0.5);
         let line = min(gx, gz);
-        let grid_alpha = 1.0 - smoothstep(0.0, 0.02, line);
+        let grid_alpha = 1.0 - smoothstep(0.0, 0.015 / grid_scale, line);
         let grid_color = vec3<f32>(0.35, 0.38, 0.42);
-        color = mix(color, grid_color, grid_alpha * 0.5);
+        color = mix(color, grid_color, grid_alpha * 0.4);
 
         // Fade grid at distance for cleaner look
+        let fade_dist = abs(material.params.w);
         let dist = length(in.world_pos.xz - camera.eye_pos.xz);
-        let fade = 1.0 - smoothstep(1.0, 4.0, dist);
+        let fade = 1.0 - smoothstep(fade_dist * 0.25, fade_dist, dist);
         color = mix(albedo * ambient_factor * light.ambient.w * light.ambient.rgb, color, fade);
     }
 
